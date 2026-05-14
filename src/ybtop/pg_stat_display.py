@@ -25,6 +25,17 @@ def _dt_from_iso(s: str) -> Optional[datetime]:
     return d.astimezone(timezone.utc)
 
 
+def _format_generated_at_utc_human(iso_s: str) -> str:
+    """Readable UTC wall time for live TUI titles (from snapshot ``generated_at_utc`` ISO strings)."""
+    raw = str(iso_s or "").strip()
+    if not raw:
+        return "?"
+    dt = _dt_from_iso(raw)
+    if dt is None:
+        return raw
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 def snapshot_interval_seconds(older_iso: str, newer_iso: str) -> float:
     t1 = _dt_from_iso(older_iso)
     t2 = _dt_from_iso(newer_iso)
@@ -201,7 +212,9 @@ def live_top5_statements_table(doc: dict[str, Any], out_dir: Path) -> Any:
         prev_t = str(prev_doc.get("generated_at_utc") or "")
         derived = with_pg_stat_delta_derived(delta_rows, prev_t, gen)
         top = derived[:5]
-        title = f"Top 5 — pg_stat_statements (Δ vs {prev_t})"
+        prev_h = _format_generated_at_utc_human(prev_t)
+        cur_h = _format_generated_at_utc_human(gen)
+        title = f"Top 5 — pg_stat_statements (Δ {prev_h} → {cur_h})"
         fr, keys = _format_pg_rows_for_table(
             top,
             "calls/sec",
