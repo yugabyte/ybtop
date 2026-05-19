@@ -26,6 +26,12 @@ SNAPSHOT_FILE_PREFIX = "ybtop.out."
 DEFAULT_SERVE_HOST = "127.0.0.1"
 DEFAULT_SERVE_PORT = 8765
 
+# Structured logging (watch mode)
+DEFAULT_LOG_FILENAME = "ybtop.log"
+DEFAULT_LOG_LEVEL = "INFO"
+DEFAULT_LOG_MAX_BYTES = 1_048_576
+DEFAULT_LOG_BACKUP_COUNT = 5
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -40,6 +46,11 @@ class Settings:
     snapshot_ash_per_node: int = SNAPSHOT_ASH_PER_NODE
     snapshot_ash_top_tables: int = SNAPSHOT_ASH_TOP_TABLES
     snapshot_collect_table_ddl: bool = False
+    log_enabled: bool = True
+    log_file: Optional[str] = None
+    log_level: str = DEFAULT_LOG_LEVEL
+    log_max_bytes: int = DEFAULT_LOG_MAX_BYTES
+    log_backup_count: int = DEFAULT_LOG_BACKUP_COUNT
 
 
 def load_dsn_from_env_or_none() -> Optional[str]:

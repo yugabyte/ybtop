@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 import time
@@ -18,6 +19,9 @@ from ybtop import __version__
 from ybtop import collect
 from ybtop.config import (
     DEFAULT_ASH_WINDOW_MINUTES,
+    DEFAULT_LOG_BACKUP_COUNT,
+    DEFAULT_LOG_LEVEL,
+    DEFAULT_LOG_MAX_BYTES,
     DEFAULT_REFRESH_INTERVAL_SEC,
     DEFAULT_SERVE_HOST,
     DEFAULT_SERVE_PORT,
@@ -34,6 +38,7 @@ from ybtop.config import (
     resolve_ash_range,
     resolve_seed_dsn,
 )
+from ybtop.log import checkpoint_context, get_logger, init_logging, log_event, resolve_log_path
 from ybtop.pg_stat_display import live_top5_statements_table
 from ybtop.render import crz_ash_summary_rows, live_top5_nodes_by_active_session_sec, table_from_rows
 from ybtop.snapshot_write import (
@@ -68,7 +73,9 @@ def _watch_header_line(*, viewer_url: Optional[str], out_dir: Path) -> Text:
 def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
     console = Console()
     out_dir = Path(settings.snapshot_output_dir)
+    watch_log = get_logger("watch")
     iteration = 0
+    log_event(watch_log, "watch_started", output_dir=str(out_dir.resolve()))
     with Live(
         console=console,
         refresh_per_second=1,
@@ -82,36 +89,62 @@ def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
             started = time.monotonic()
             doc: Any = None
             snapshot_err: Optional[str] = None
-            if iteration == 1:
-                live.update(
-                    Group(
-                        _watch_header_line(viewer_url=viewer_url, out_dir=out_dir),
-                        Text(
-                            "Collecting data for first checkpoint. Please wait...",
-                            style="dim",
-                        ),
+            with checkpoint_context(iteration) as ckpt_summary:
+                log_event(watch_log, "checkpoint_start", checkpoint=iteration)
+                if iteration == 1:
+                    live.update(
+                        Group(
+                            _watch_header_line(viewer_url=viewer_url, out_dir=out_dir),
+                            Text(
+                                "Collecting data for first checkpoint. Please wait...",
+                                style="dim",
+                            ),
+                        )
                     )
+                try:
+                    ash_start, ash_end = resolve_ash_range(settings)
+                    doc = build_snapshot_document(
+                        seed_dsn=settings.seed_dsn,
+                        ash_start=ash_start,
+                        ash_end=ash_end,
+                        statements_per_node=settings.snapshot_statements_per_node,
+                        ash_per_node=settings.snapshot_ash_per_node,
+                        ensure_ycql_extension=(iteration == 1),
+                        ash_top_tables=settings.snapshot_ash_top_tables,
+                        collect_table_ddl=settings.snapshot_collect_table_ddl,
+                    )
+                    write_snapshot_and_update_manifest(output_dir=out_dir, document=doc)
+                    gc_snapshots_and_manifest(
+                        output_dir=out_dir,
+                        retention_hours=settings.snapshot_retention_hours,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    doc = None
+                    snapshot_err = str(exc)
+                    log_event(
+                        watch_log,
+                        "checkpoint_error",
+                        level=logging.ERROR,
+                        error=snapshot_err,
+                        checkpoint=iteration,
+                    )
+                tick_ms = round((time.monotonic() - started) * 1000.0, 2)
+                summary = ckpt_summary.summary_fields(total_ms=tick_ms)
+                if snapshot_err is None:
+                    summary["status"] = "ok"
+                    if doc and isinstance(doc, dict):
+                        summary["node_count"] = len(doc.get("nodes") or [])
+                else:
+                    summary["status"] = "error"
+                    summary["error"] = snapshot_err
+                log_event(watch_log, "checkpoint_summary", **summary)
+                log_event(
+                    watch_log,
+                    "checkpoint_complete",
+                    checkpoint=iteration,
+                    duration_ms=tick_ms,
+                    status=summary.get("status"),
                 )
-            try:
-                ash_start, ash_end = resolve_ash_range(settings)
-                doc = build_snapshot_document(
-                    seed_dsn=settings.seed_dsn,
-                    ash_start=ash_start,
-                    ash_end=ash_end,
-                    statements_per_node=settings.snapshot_statements_per_node,
-                    ash_per_node=settings.snapshot_ash_per_node,
-                    ensure_ycql_extension=(iteration == 1),
-                    ash_top_tables=settings.snapshot_ash_top_tables,
-                    collect_table_ddl=settings.snapshot_collect_table_ddl,
-                )
-                write_snapshot_and_update_manifest(output_dir=out_dir, document=doc)
-                gc_snapshots_and_manifest(
-                    output_dir=out_dir,
-                    retention_hours=settings.snapshot_retention_hours,
-                )
-            except Exception as exc:  # noqa: BLE001
-                doc = None
-                snapshot_err = str(exc)
             utc_now = datetime.now(timezone.utc)
             ts_str = utc_now.strftime("%Y-%m-%d %H:%M:%S")
             table_block: list[Any] = []
@@ -329,6 +362,38 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SERVE_PORT,
         help="HTTP listen port for the embedded viewer.",
     )
+    lg = w.add_argument_group("logging")
+    lg.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help="Structured JSON log file (default: OUTPUT_DIR/ybtop.log).",
+    )
+    lg.add_argument(
+        "--log-level",
+        default=DEFAULT_LOG_LEVEL,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Minimum severity written to the log file.",
+    )
+    lg.add_argument(
+        "--log-max-bytes",
+        type=int,
+        default=DEFAULT_LOG_MAX_BYTES,
+        metavar="BYTES",
+        help="Rotate the log file when it exceeds this size.",
+    )
+    lg.add_argument(
+        "--log-backup-count",
+        type=int,
+        default=DEFAULT_LOG_BACKUP_COUNT,
+        metavar="N",
+        help="Number of rotated log files to retain.",
+    )
+    lg.add_argument(
+        "--no-log-file",
+        action="store_true",
+        help="Disable structured file logging.",
+    )
 
     reset_p = sub.add_parser(
         "reset_pg_stat_statements",
@@ -407,6 +472,11 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
             getattr(args, "snapshot_ash_top_tables", SNAPSHOT_ASH_TOP_TABLES)
         ),
         snapshot_collect_table_ddl=bool(getattr(args, "snapshot_table_ddl", False)),
+        log_enabled=not bool(getattr(args, "no_log_file", False)),
+        log_file=getattr(args, "log_file", None),
+        log_level=str(getattr(args, "log_level", DEFAULT_LOG_LEVEL)),
+        log_max_bytes=int(getattr(args, "log_max_bytes", DEFAULT_LOG_MAX_BYTES)),
+        log_backup_count=int(getattr(args, "log_backup_count", DEFAULT_LOG_BACKUP_COUNT)),
     )
 
 
@@ -421,6 +491,15 @@ def main(argv: Optional[list[str]] = None) -> None:
     settings = _settings_from_args(args)
 
     if args.command == "watch":
+        if settings.log_enabled:
+            init_logging(
+                log_path=resolve_log_path(settings.snapshot_output_dir, settings.log_file),
+                level=settings.log_level,
+                max_bytes=settings.log_max_bytes,
+                backup_count=settings.log_backup_count,
+            )
+        else:
+            init_logging(log_path=None)
         if not args.no_serve:
             from ybtop.serve import start_serve_background
 
