@@ -1,6 +1,6 @@
 # ybtop
 
-Terminal and browser-based observability for [YugabyteDB](https://www.yugabyte.com/) YSQL. Connect to a single YSQL node, **discover the rest of the universe** with `yb_servers()`, pull statement stats, **active session history (ASH)**, and **per-node tablet placement**, and write time-stamped **JSON snapshots** plus a `ybtop.manifest.json` index. A small **static web viewer** (served as static assets with JSON loaded over HTTP) lets you explore snapshots in a browser: statement rankings, ASH groupings, tablet distribution, and optional delta views when a prior snapshot is available. Slice and dice data by query, object (table/index), nodes etc. to detect outliers.
+Terminal and browser-based observability for [YugabyteDB](https://www.yugabyte.com/). Connect to a single node, **discover the rest of the universe** with `yb_servers()`, pull statement stats, **active session history (ASH)**, and **per-node tablet placement**, and write time-stamped **JSON snapshots** plus a `ybtop.manifest.json` index. A small **static web viewer** (served as static assets with JSON loaded over HTTP) lets you explore snapshots in a browser: statement rankings, ASH groupings, tablet distribution, and optional delta views when a prior snapshot is available. Slice and dice data by query, object (table/index), nodes etc. to detect outliers.
 
 ## Install
 
