@@ -27,6 +27,7 @@ from ybtop.config import (
     DEFAULT_YSQL_PORT,
     DEFAULT_YSQL_USER,
     SNAPSHOT_ASH_PER_NODE,
+    SNAPSHOT_ASH_TOP_TABLES,
     SNAPSHOT_STATEMENTS_PER_NODE,
     Settings,
     load_dsn_from_env_or_none,
@@ -100,6 +101,8 @@ def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
                     statements_per_node=settings.snapshot_statements_per_node,
                     ash_per_node=settings.snapshot_ash_per_node,
                     ensure_ycql_extension=(iteration == 1),
+                    ash_top_tables=settings.snapshot_ash_top_tables,
+                    collect_table_ddl=settings.snapshot_collect_table_ddl,
                 )
                 write_snapshot_and_update_manifest(output_dir=out_dir, document=doc)
                 gc_snapshots_and_manifest(
@@ -291,6 +294,24 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="Top N ASH groups per node stored in each snapshot file.",
     )
+    w.add_argument(
+        "--snapshot-ash-top-tables",
+        type=int,
+        default=SNAPSHOT_ASH_TOP_TABLES,
+        metavar="N",
+        help=(
+            "After per-node collection, rank table_id values by ASH samples cluster-wide "
+            "and store the top N (0 disables)."
+        ),
+    )
+    w.add_argument(
+        "--snapshot-table-ddl",
+        action="store_true",
+        help=(
+            "Fetch CREATE TABLE/INDEX DDL for ash_top_tables on the seed connection "
+            "(default: skip DDL collection)."
+        ),
+    )
     v = w.add_argument_group("viewer (HTTP; same as ybtop serve)")
     v.add_argument(
         "--no-serve",
@@ -382,6 +403,10 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
             getattr(args, "snapshot_statements_per_node", SNAPSHOT_STATEMENTS_PER_NODE)
         ),
         snapshot_ash_per_node=int(getattr(args, "snapshot_ash_per_node", SNAPSHOT_ASH_PER_NODE)),
+        snapshot_ash_top_tables=int(
+            getattr(args, "snapshot_ash_top_tables", SNAPSHOT_ASH_TOP_TABLES)
+        ),
+        snapshot_collect_table_ddl=bool(getattr(args, "snapshot_table_ddl", False)),
     )
 
 

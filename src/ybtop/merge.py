@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from decimal import Decimal
-from typing import Any
+from typing import Any, Optional
 
 from ybtop.pg_stat_constants import PG_STAT_DOCDB_OPTIONAL_COLUMNS
+from ybtop.table_schema import resolve_table_engine
 
 
 def _pg_stmt_merge_key(r: dict[str, Any]) -> tuple[str, str]:
@@ -171,6 +172,69 @@ def _namespace_objname(nn: Any, on: Any, aux: Any) -> str:
     if ob:
         return ob
     return ("" if aux is None else str(aux)).strip()
+
+
+def ash_infer_engine_from_row(row: dict[str, Any]) -> Optional[str]:
+    """Classify YSQL vs YCQL from one ASH aggregate row."""
+    comp_raw = row.get("wait_event_component")
+    comp = "" if comp_raw is None else str(comp_raw).strip().upper()
+    if comp == "YCQL":
+        return "YCQL"
+    if comp == "YSQL":
+        return "YSQL"
+    if comp == "TSERVER":
+        dbid = row.get("ysql_dbid")
+        try:
+            dbid_int = 0 if dbid is None else int(dbid)
+        except (TypeError, ValueError):
+            dbid_int = 0
+        return "YCQL" if dbid_int == 0 else "YSQL"
+    return None
+
+
+def _norm_table_id(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def top_ash_table_ids(
+    per_node: Iterable[list[dict[str, Any]]],
+    *,
+    limit: int = 25,
+    tablet_meta: Optional[dict[str, dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    """Rank table_id values by total ASH samples across nodes (table_id must be set)."""
+    if limit <= 0:
+        return []
+    acc: dict[str, dict[str, Any]] = {}
+    for rows in per_node:
+        for r in rows:
+            tid = _norm_table_id(r.get("table_id"))
+            if tid is None:
+                continue
+            samples = int(r.get("samples") or 0)
+            if tid not in acc:
+                acc[tid] = {
+                    "table_id": tid,
+                    "samples": 0,
+                    "engine": None,
+                    "namespace_name": r.get("namespace_name"),
+                    "object_name": r.get("object_name"),
+                }
+            ent = acc[tid]
+            ent["samples"] = int(ent["samples"]) + samples
+            if not ent.get("namespace_name") and r.get("namespace_name"):
+                ent["namespace_name"] = r.get("namespace_name")
+            if not ent.get("object_name") and r.get("object_name"):
+                ent["object_name"] = r.get("object_name")
+    out = sorted(acc.values(), key=lambda x: int(x["samples"]), reverse=True)
+    meta = tablet_meta or {}
+    for ent in out:
+        tid = str(ent["table_id"])
+        ent["engine"] = resolve_table_engine(tid, tablet=meta.get(tid.lower()))
+    return out[:limit]
 
 
 def merge_ash_groups(

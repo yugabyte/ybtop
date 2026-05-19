@@ -16,6 +16,8 @@ from ybtop import queries as Q
 from ybtop.capabilities import detect_capabilities
 from ybtop.config import MANIFEST_FILENAME, SNAPSHOT_FILE_PREFIX
 from ybtop.db import connect
+from ybtop.merge import top_ash_table_ids
+from ybtop.table_schema import collect_table_schemas, lookup_tablet_meta_by_table_id, resolve_table_engine
 from ybtop.topology import discover_ysql_nodes, dsn_for_node, node_id
 
 
@@ -60,6 +62,8 @@ def build_snapshot_document(
     statements_per_node: int,
     ash_per_node: int,
     ensure_ycql_extension: bool = False,
+    ash_top_tables: int = 25,
+    collect_table_ddl: bool = False,
 ) -> dict[str, Any]:
     nodes = discover_ysql_nodes(seed_dsn)
     nids = [node_id(n) for n in nodes]
@@ -103,8 +107,29 @@ def build_snapshot_document(
             )
             tablets_per_node_out[nid] = _serialize_rows(Q.yb_local_tablets_rows(conn))
 
+    top_tables: list[dict[str, Any]] = []
+    table_schemas: dict[str, Any] = {}
+    if ash_top_tables > 0:
+        top_tables = top_ash_table_ids(ash_per_node_out.values(), limit=ash_top_tables)
+        if collect_table_ddl and top_tables:
+            tablet_meta = lookup_tablet_meta_by_table_id(
+                tablets_per_node_out,
+                [str(t["table_id"]) for t in top_tables],
+            )
+            for ent in top_tables:
+                tid = str(ent["table_id"])
+                ent["engine"] = resolve_table_engine(
+                    tid,
+                    tablet=tablet_meta.get(tid.lower()),
+                )
+            raw_schemas = collect_table_schemas(seed_dsn, top_tables, tablet_meta)
+            table_schemas = {
+                tid: json.loads(json.dumps(entry, default=_json_default))
+                for tid, entry in raw_schemas.items()
+            }
+
     now = datetime.now(timezone.utc)
-    return {
+    doc: dict[str, Any] = {
         "format_version": 1,
         "generated_at_utc": now.isoformat(),
         "ash_window": {
@@ -119,6 +144,14 @@ def build_snapshot_document(
         "yb_active_session_history": {"per_node": ash_per_node_out},
         "yb_local_tablets": {"per_node": tablets_per_node_out},
     }
+    if ash_top_tables > 0:
+        doc["ash_top_tables"] = {
+            "limit": ash_top_tables,
+            "tables": top_tables,
+        }
+    if table_schemas:
+        doc["table_schemas"] = {"by_table_id": table_schemas}
+    return doc
 
 
 def _parse_iso_utc(s: str) -> datetime:

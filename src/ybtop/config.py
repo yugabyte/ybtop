@@ -19,6 +19,7 @@ DEFAULT_SNAPSHOT_OUTPUT_DIR = "."
 DEFAULT_SNAPSHOT_RETENTION_HOURS = 3.0
 SNAPSHOT_STATEMENTS_PER_NODE = 200
 SNAPSHOT_ASH_PER_NODE = 1000
+SNAPSHOT_ASH_TOP_TABLES = 25
 MANIFEST_FILENAME = "ybtop.manifest.json"
 SNAPSHOT_FILE_PREFIX = "ybtop.out."
 
@@ -37,6 +38,8 @@ class Settings:
     snapshot_retention_hours: float = DEFAULT_SNAPSHOT_RETENTION_HOURS
     snapshot_statements_per_node: int = SNAPSHOT_STATEMENTS_PER_NODE
     snapshot_ash_per_node: int = SNAPSHOT_ASH_PER_NODE
+    snapshot_ash_top_tables: int = SNAPSHOT_ASH_TOP_TABLES
+    snapshot_collect_table_ddl: bool = False
 
 
 def load_dsn_from_env_or_none() -> Optional[str]:

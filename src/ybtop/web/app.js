@@ -1242,6 +1242,21 @@
     return qualifiedNameFromLocalTablets(doc, tableId);
   }
 
+  /** DDL/schema for a table_id from snapshot table_schemas.by_table_id (exact id match). */
+  function tableSchemaForTableId(doc, tableId) {
+    if (!doc || tableId == null || String(tableId).trim() === "") return null;
+    const root = doc.table_schemas && doc.table_schemas.by_table_id;
+    if (!root || typeof root !== "object") return null;
+    const want = String(tableId).trim();
+    if (root[want]) return root[want];
+    const lower = want.toLowerCase();
+    const keys = Object.keys(root);
+    for (let i = 0; i < keys.length; i += 1) {
+      if (String(keys[i]).trim().toLowerCase() === lower) return root[keys[i]];
+    }
+    return null;
+  }
+
   /** Cloud · region · zone from node_topology for banner subtitle. */
   function ashNodePlacementLine(topo, nodeId) {
     const nid = nodeId != null ? String(nodeId) : "";
@@ -3232,6 +3247,7 @@
       if (tableF) {
         const subRaw = ashSubtitleNsObjectForTableId(doc, tableF);
         const sub = subRaw != null ? String(subRaw).trim() : "";
+        const schemaEnt = tableSchemaForTableId(doc, tableF);
         const bn = el("div", { className: "ash-mode-banner ash-mode-banner--scoped" });
         bn.appendChild(
           el("div", {
@@ -3250,6 +3266,27 @@
           })
         );
         bn.appendChild(row);
+        if (schemaEnt && schemaEnt.engine === "YSQL" && schemaEnt.ddl != null && String(schemaEnt.ddl).trim() !== "") {
+          const ddlRow = el("div", { className: "ash-mode-banner-query-row" });
+          ddlRow.appendChild(el("span", { className: "ash-mode-banner-query-k", textContent: "schema" }));
+          ddlRow.appendChild(
+            el("span", {
+              className: "ash-mode-banner-query-highlight ash-mode-banner-sql",
+              textContent: String(schemaEnt.ddl).trim(),
+            })
+          );
+          bn.appendChild(ddlRow);
+        } else if (schemaEnt && schemaEnt.engine === "YSQL" && schemaEnt.error) {
+          const errRow = el("div", { className: "ash-mode-banner-query-row" });
+          errRow.appendChild(el("span", { className: "ash-mode-banner-query-k", textContent: "schema" }));
+          errRow.appendChild(
+            el("span", {
+              className: "ash-mode-banner-query-highlight ash-mode-banner-query-highlight--empty",
+              textContent: String(schemaEnt.error),
+            })
+          );
+          bn.appendChild(errRow);
+        }
         panelAsh.appendChild(bn);
       }
       if (qF) {
