@@ -32,14 +32,16 @@ pip3 install .
 | Source | Role |
 |--------|------|
 | **`pg_stat_statements`** (plus `pg_database` for `dbname`) | Top **N** statements by total execution time. Includes `queryid` (as text), `query`, `calls`, time metrics, and optionally **rows** and **Yugabyte DocDB** per-statement fields when supported. |
-| **`yb_active_session_history`** | ASH rows in **[ash_window.start, ash_window.end)** (see below). Aggregated in SQL by `query_id`, wait-event dimensions, `ysql_dbid`, etc., with counts as **`samples`**, joined to **`pg_stat_statements`** for the **query text** when present. `query_id` is selected as **text** in snapshots to avoid 64-bit precision issues in JSON/JavaScript. |
+| **`ycql_stat_statements`** (via **`yb_ycql_utils`** extension) | Top **N** YCQL statements per node: `queryid`, `query`, `calls`, `total_time`, `is_prepared`. Extension is created once on the first **`watch`** snapshot (`CREATE EXTENSION IF NOT EXISTS yb_ycql_utils`). |
+| **`yb_active_session_history`** | ASH rows in **[ash_window.start, ash_window.end)** (see below). Aggregated in SQL by `query_id`, wait-event dimensions, `ysql_dbid`, etc., with counts as **`samples`**, joined to **`pg_stat_statements`** for the **query text** when present. `query_id` is selected as **text** in snapshots to avoid 64-bit precision issues in JSON/JavaScript. **`wait_event_aux`** is a 15-character prefix matched in **`yb_local_tablets`**: **`tablet_id`** for most components, **`table_id`** for **`YCQL`**; snapshots store the full **`table_id`** plus resolved namespace / table name when a match exists. |
 | **`yb_local_tablets`** | Per-node **tablet** rows (for tablet distribution UIs in the viewer). |
 | **Capabilities** | At runtime, features such as the ASH time-range function vs time predicate, and optional DocDB columns on `pg_stat_statements`, are detected and queries adapt. |
 
 **What each snapshot file contains (conceptually)**  
-Each **`ybtop.out.YYYYMMDD_HHMMSS.json`** includes: **`generated_at_utc`**, **`ash_window`** (`start_utc` / `end_utc`—the ASH window used for that collection), **seed** info, **node ids**, **`node_topology`**, and three **`per_node`** maps:
+Each **`ybtop.out.YYYYMMDD_HHMMSS.json`** includes: **`generated_at_utc`**, **`ash_window`** (`start_utc` / `end_utc`—the ASH window used for that collection), **seed** info, **node ids**, **`node_topology`**, and four **`per_node`** maps:
 
 - **`pg_stat_statements`** – list of top statements for that node.  
+- **`ycql_stat_statements`** – list of top YCQL statements for that node.  
 - **`yb_active_session_history`** – ASH aggregate rows (samples, wait events, query text, etc.).  
 - **`yb_local_tablets`** – tablet rows for that node.  
 
@@ -52,11 +54,12 @@ Each **`ybtop.out.YYYYMMDD_HHMMSS.json`** includes: **`generated_at_utc`**, **`a
 ## Browser viewer: what you can do and what the columns mean
 
 **Structure**  
-The viewer has three main **tabs** (the URL can include **`?view=pgss`**, **`ash`**, or **`tablets`** so **reload** keeps the same section):
+The viewer has four main **tabs** (the URL can include **`?view=pgss`**, **`ycql`**, **`ash`**, or **`tablets`** so **reload** keeps the same section):
 
 1. **pg_stat_statements** – Merged cluster view: **calls**, **time (ms)**, **time %**, **mean time**, **query**, optional **dbname**, **per-metric / call** for rows and DocDB fields when present, and **queryid**. If the previous manifest entry is loadable, a **delta** mode compares consecutive snapshots. **Query** and **queryid** can link to the **ASH** tab filtered to that **`query_id`**.  
-2. **Active Session History** – Merged ASH: **Active Sessions/sec** (from samples ÷ `ash_window` length), **load %** (share of total samples in the current row set), wait-event and **namespace** / **object** context, **query_id** and **query** when not scoped to a single query. **Full reports** break down samples by **namespace + query**, by **namespace + object + query**, by **database**, by **node**, and by **cloud/region/zone**, etc. With a **query filter** (from a link or **`?view=ash&query=...`**), a banner shows **`query_id`** and the **SQL**; those dimensions can hide redundant **query** / **query_id** columns.  
-3. **Tablet report** – Tablet counts **by table**, **by node**, and by **cloud:region:zone**, using `yb_local_tablets` and topology.
+2. **ycql_stat_statements** – Same layout as YSQL statements (including **time %** and **calls/s** in delta mode) for YCQL: **queryid**, **query**, **calls**, **total_time**, **is_prepared**.  
+3. **Active Session History** – Merged ASH: **Active Sessions/sec** (from samples ÷ `ash_window` length), **load %** (share of total samples in the current row set), wait-event and **namespace** / **object** context, **query_id** and **query** when not scoped to a single query. **Full reports** break down samples by **namespace + query**, by **namespace + object + query**, by **database**, by **node**, and by **cloud/region/zone**, etc. With a **query filter** (from a link or **`?view=ash&query=...`**), a banner shows **`query_id`** and the **SQL**; those dimensions can hide redundant **query** / **query_id** columns.  
+4. **Tablet report** – Tablet counts **by table**, **by node**, and by **cloud:region:zone**, using `yb_local_tablets` and topology.
 
 **Navigation**  
 Use **First / Last / Prev / Next** to move along **`ybtop.manifest.json`**. Deep links to ASH for a given statement use **history** so the **Back** button returns to the previous view.

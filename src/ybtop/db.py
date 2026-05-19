@@ -54,3 +54,10 @@ def fetch_all(
     with conn.cursor() as cur:
         cur.execute(tag_sql(sql), params or ())
         return list(cur.fetchall())
+
+
+def execute_ddl(conn: psycopg.Connection, sql: str) -> None:
+    """Run a DDL statement and commit (e.g. CREATE EXTENSION)."""
+    with conn.cursor() as cur:
+        cur.execute(tag_sql(sql))
+    conn.commit()

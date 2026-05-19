@@ -59,6 +59,7 @@ def build_snapshot_document(
     ash_end: datetime,
     statements_per_node: int,
     ash_per_node: int,
+    ensure_ycql_extension: bool = False,
 ) -> dict[str, Any]:
     nodes = discover_ysql_nodes(seed_dsn)
     nids = [node_id(n) for n in nodes]
@@ -79,8 +80,13 @@ def build_snapshot_document(
     caps = detect_capabilities(seed_dsn)
 
     statements_per_node_out: dict[str, list[dict[str, Any]]] = {}
+    ycql_per_node_out: dict[str, list[dict[str, Any]]] = {}
     ash_per_node_out: dict[str, list[dict[str, Any]]] = {}
     tablets_per_node_out: dict[str, list[dict[str, Any]]] = {}
+
+    if ensure_ycql_extension:
+        with connect(seed_dsn) as conn:
+            Q.ensure_yb_ycql_utils_extension(conn)
 
     for n in nodes:
         nid = node_id(n)
@@ -88,6 +94,9 @@ def build_snapshot_document(
         with connect(dsn) as conn:
             statements_per_node_out[nid] = _serialize_rows(
                 Q.pg_stat_statements_top(conn, statements_per_node, caps)
+            )
+            ycql_per_node_out[nid] = _serialize_rows(
+                Q.ycql_stat_statements_top(conn, statements_per_node)
             )
             ash_per_node_out[nid] = _serialize_rows(
                 Q.ash_aggregated(conn, ash_start, ash_end, caps, outer_limit=ash_per_node)
@@ -106,6 +115,7 @@ def build_snapshot_document(
         "nodes": nids,
         "node_topology": node_topology,
         "pg_stat_statements": {"per_node": statements_per_node_out},
+        "ycql_stat_statements": {"per_node": ycql_per_node_out},
         "yb_active_session_history": {"per_node": ash_per_node_out},
         "yb_local_tablets": {"per_node": tablets_per_node_out},
     }

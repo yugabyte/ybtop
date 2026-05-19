@@ -22,6 +22,48 @@ def _num(v: Any) -> float:
     return float(v)
 
 
+def merge_ycql_stat_statements(per_node: Iterable[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Sum additive counters across nodes; recompute mean time for YCQL statements."""
+    acc: dict[str, dict[str, Any]] = {}
+    for rows in per_node:
+        for r in rows:
+            qid = str(r["queryid"])
+            calls = int(r["calls"])
+            total_ms = _num(r.get("total_time"))
+            prepared = bool(r.get("is_prepared"))
+            if qid not in acc:
+                acc[qid] = {
+                    "queryid": qid,
+                    "query": r.get("query"),
+                    "calls": 0,
+                    "total_time": 0.0,
+                    "is_prepared": False,
+                }
+            a = acc[qid]
+            a["calls"] += calls
+            a["total_time"] += total_ms
+            if prepared:
+                a["is_prepared"] = True
+            if not a.get("query") and r.get("query"):
+                a["query"] = r["query"]
+    out: list[dict[str, Any]] = []
+    for a in acc.values():
+        calls = int(a["calls"])
+        mean = (a["total_time"] / calls) if calls else 0.0
+        out.append(
+            {
+                "calls": a["calls"],
+                "total_ms": round(a["total_time"], 2),
+                "mean_ms": round(mean, 2),
+                "query": a.get("query"),
+                "is_prepared": bool(a["is_prepared"]),
+                "queryid": a["queryid"],
+            }
+        )
+    out.sort(key=lambda x: x["total_ms"], reverse=True)
+    return out
+
+
 def merge_pg_stat_statements(
     per_node: Iterable[list[dict[str, Any]]],
     *,

@@ -99,6 +99,7 @@ def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
                     ash_end=ash_end,
                     statements_per_node=settings.snapshot_statements_per_node,
                     ash_per_node=settings.snapshot_ash_per_node,
+                    ensure_ycql_extension=(iteration == 1),
                 )
                 write_snapshot_and_update_manifest(output_dir=out_dir, document=doc)
                 gc_snapshots_and_manifest(

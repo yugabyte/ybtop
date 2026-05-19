@@ -6,7 +6,7 @@ from typing import Any, Optional
 import psycopg
 
 from ybtop.capabilities import Capabilities
-from ybtop.db import fetch_all
+from ybtop.db import execute_ddl, fetch_all
 from ybtop.pg_stat_constants import PG_STAT_DOCDB_OPTIONAL_COLUMNS
 
 
@@ -29,6 +29,50 @@ def _ash_from_clause(caps: Capabilities) -> str:
         "FROM yb_active_session_history ash\n"
         "        WHERE ash.sample_time >= %(t1)s::timestamptz AND ash.sample_time < %(t2)s::timestamptz"
     )
+
+
+def _ash_is_ycql_component_sql() -> str:
+    return "UPPER(BTRIM(COALESCE(s.wait_event_component::text, ''))) = 'YCQL'"
+
+
+def _ash_namespace_name_select_sql() -> str:
+    """YCQL keyspace comes from yb_local_tablets; other components may fall back to pg_database."""
+    is_ycql = _ash_is_ycql_component_sql()
+    return f"""NULLIF(BTRIM(
+        CASE
+            WHEN {is_ycql} THEN lt.namespace_name::text
+            ELSE COALESCE(lt.namespace_name::text, d.datname::text)
+        END
+    ), '') AS namespace_name"""
+
+
+def _ash_table_id_select_sql() -> str:
+    """Full catalog table_id from yb_local_tablets (never the short wait_event_aux prefix)."""
+    return "NULLIF(BTRIM(lt.table_id::text), '') AS table_id"
+
+
+def _ash_local_tablets_lateral_join_sql() -> str:
+    """
+    Resolve namespace/table from yb_local_tablets.
+
+    Non-YCQL: wait_event_aux is a tablet_id prefix (first 15 chars).
+    YCQL: wait_event_aux is a table_id prefix (first 15 chars); snapshot stores full table_id.
+    """
+    is_ycql = _ash_is_ycql_component_sql()
+    return f"""
+    LEFT JOIN LATERAL (
+        SELECT
+            lt1.namespace_name::text AS namespace_name,
+            lt1.table_name::text AS table_name,
+            lt1.table_id::text AS table_id
+        FROM yb_local_tablets lt1
+        WHERE s.wait_event_aux IS NOT NULL
+          AND (
+            ({is_ycql} AND s.wait_event_aux = SUBSTRING(lt1.table_id::text, 1, 15))
+            OR (NOT ({is_ycql}) AND s.wait_event_aux = SUBSTRING(lt1.tablet_id::text, 1, 15))
+          )
+        LIMIT 1
+    ) lt ON TRUE"""
 
 
 def _pg_stat_rows_and_docdb(caps: Capabilities) -> str:
@@ -98,9 +142,9 @@ def ash_aggregated(
         s.wait_event_aux,
         s.ysql_dbid,
         s.samples,
-        NULLIF(BTRIM(COALESCE(lt.namespace_name::text, d.datname::text)), '') AS namespace_name,
+        {_ash_namespace_name_select_sql()},
         NULLIF(BTRIM(lt.table_name::text), '') AS object_name,
-        lt.table_id::text AS table_id
+        {_ash_table_id_select_sql()}
     FROM (
         SELECT
             query_id,
@@ -120,19 +164,30 @@ def ash_aggregated(
             ysql_dbid
     ) s
     LEFT JOIN pg_database d ON d.oid = s.ysql_dbid
-    LEFT JOIN LATERAL (
-        SELECT
-            lt1.namespace_name::text AS namespace_name,
-            lt1.table_name::text AS table_name,
-            lt1.table_id::text AS table_id
-        FROM yb_local_tablets lt1
-        WHERE s.wait_event_aux IS NOT NULL
-          AND s.wait_event_aux = SUBSTRING(lt1.tablet_id::text, 1, 15)
-        LIMIT 1
-    ) lt ON TRUE
+    {_ash_local_tablets_lateral_join_sql()}
     ORDER BY s.samples DESC{lim_clause};
     """
     return fetch_all(conn, sql, params)
+
+
+def ensure_yb_ycql_utils_extension(conn: psycopg.Connection) -> None:
+    """Load yb_ycql_utils so ``ycql_stat_statements`` is available (idempotent)."""
+    execute_ddl(conn, "CREATE EXTENSION IF NOT EXISTS yb_ycql_utils")
+
+
+def ycql_stat_statements_top(conn: psycopg.Connection, limit: int) -> list[dict[str, Any]]:
+    sql = """
+    SELECT
+        s.queryid::text AS queryid,
+        s.query::text AS query,
+        s.calls::bigint AS calls,
+        s.total_time::float8 AS total_time,
+        s.is_prepared AS is_prepared
+    FROM ycql_stat_statements s
+    ORDER BY s.total_time DESC
+    LIMIT %(limit)s;
+    """
+    return fetch_all(conn, sql, {"limit": limit})
 
 
 def yb_local_tablets_rows(conn: psycopg.Connection) -> list[dict[str, Any]]:

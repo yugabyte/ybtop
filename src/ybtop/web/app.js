@@ -112,7 +112,7 @@
   let ashNodeIdFilter = null;
   let ashTableIdFilter = null;
 
-  const VIEWER_SECTION_IDS = ["pgss", "ash", "tablets"];
+  const VIEWER_SECTION_IDS = ["pgss", "ycql", "ash", "tablets"];
 
   /**
    * subsectionId -> expanded when true; undefined / false => collapsed.
@@ -122,8 +122,11 @@
   const subsectionExpandedState = Object.create(null);
 
   function isSubsectionExpanded(subsectionId) {
-    if (subsectionId === "sec-pgss-main" && subsectionExpandedState[subsectionId] === undefined) {
-      return true; /* pg_stat table + page controls visible on first open */
+    if (
+      (subsectionId === "sec-pgss-main" || subsectionId === "sec-ycql-main") &&
+      subsectionExpandedState[subsectionId] === undefined
+    ) {
+      return true; /* main statements table + pager visible on first open */
     }
     return subsectionExpandedState[subsectionId] === true;
   }
@@ -151,7 +154,7 @@
   function readViewerStateFromUrl() {
     const p = new URLSearchParams(window.location.search);
     const v = p.get("view");
-    if (v === "ash" || v === "tablets" || v === "pgss") {
+    if (v === "ash" || v === "tablets" || v === "pgss" || v === "ycql") {
       activeViewerSection = v;
     } else {
       activeViewerSection = "pgss";
@@ -236,6 +239,7 @@
     nav.textContent = "";
     const items = [
       ["pgss", "pg_stat_statements"],
+      ["ycql", "ycql_stat_statements"],
       ["ash", "Active Session History"],
       ["tablets", "Tablet Report"],
     ];
@@ -381,6 +385,81 @@
     return out;
   }
 
+  function ycqlPreparedTruthy(v) {
+    return v === true || v === "t" || v === "true" || v === 1 || v === "1";
+  }
+
+  function mergeYcqlStatements(perNode) {
+    const acc = new Map();
+    Object.keys(perNode || {}).forEach((nid) => {
+      (perNode[nid] || []).forEach((r) => {
+        const mk = String(r.queryid);
+        if (!acc.has(mk)) {
+          acc.set(mk, {
+            queryid: mk,
+            query: r.query || "",
+            calls: 0,
+            total_exec_time: 0,
+            is_prepared: false,
+          });
+        }
+        const a = acc.get(mk);
+        a.calls += Number(r.calls) || 0;
+        a.total_exec_time += Number(r.total_time) || 0;
+        if (ycqlPreparedTruthy(r.is_prepared)) a.is_prepared = true;
+        if (!a.query && r.query) a.query = r.query;
+      });
+    });
+    const out = Array.from(acc.values()).map((a) => {
+      const calls = a.calls;
+      const mean = calls ? a.total_exec_time / calls : 0;
+      const row = {
+        calls: a.calls,
+        total_ms: Math.round(a.total_exec_time * 100) / 100,
+        mean_ms: Math.round(mean * 100) / 100,
+        query: a.query,
+        is_prepared: !!a.is_prepared,
+        queryid: a.queryid,
+        _deltaSrc: {
+          calls: a.calls,
+          total_exec_time: a.total_exec_time,
+        },
+      };
+      return row;
+    });
+    out.sort((x, y) => y.total_ms - x.total_ms);
+    return out;
+  }
+
+  function ycqlStatStatementColumns() {
+    return [
+      { key: "calls", label: "calls", type: "number", align: "right" },
+      { key: "total_ms", label: "total time (ms)", type: "number", align: "right" },
+      { key: "time_pct", label: "time %", type: "number", align: "right" },
+      { key: "mean_ms", label: "mean time (ms)", type: "number", align: "right" },
+      { key: "query", label: "query" },
+      { key: "is_prepared", label: "is_prepared" },
+      { key: "queryid", label: "queryid" },
+    ];
+  }
+
+  function ycqlStatStatementColumnsDelta() {
+    return [
+      { key: "calls_per_sec", label: "calls/s", type: "number", align: "right" },
+      { key: "total_ms", label: "total time (ms)", type: "number", align: "right" },
+      { key: "time_pct", label: "time %", type: "number", align: "right" },
+      { key: "mean_ms", label: "mean time (ms)", type: "number", align: "right" },
+      { key: "query", label: "query" },
+      { key: "is_prepared", label: "is_prepared" },
+      { key: "queryid", label: "queryid" },
+    ];
+  }
+
+  function formatYcqlPrepared(v) {
+    if (v === null || v === undefined || v === "") return "";
+    return ycqlPreparedTruthy(v) ? "true" : "false";
+  }
+
   /**
    * When several merged rows share the same queryid (different dbname), prefer the highest total_ms
    * so ASH banner metrics align with the dominant statements row.
@@ -404,19 +483,26 @@
     return has;
   }
 
-  /** Sum `calls` on one node for the merged pg_stat row identity (queryid + dbname), matching mergeStatements keys. */
-  function statementCallsOnNodeMatching(perNode, nodeId, pgRow) {
-    const wantQ = normQid(pgRow.queryid);
+  /**
+   * Sum `calls` on one node for a merged statement row.
+   * YSQL: queryid + dbname; YCQL: queryid only.
+   */
+  function statementCallsOnNodeMatching(perNode, nodeId, stmtRow, matchDbname) {
+    const wantQ = normQid(stmtRow.queryid);
     if (wantQ == null) return 0;
     const dn =
-      pgRow.dbname != null && pgRow.dbname !== undefined ? String(pgRow.dbname).trim() : "";
+      matchDbname && stmtRow.dbname != null && stmtRow.dbname !== undefined
+        ? String(stmtRow.dbname).trim()
+        : "";
     const nid = nodeId != null && nodeId !== undefined ? String(nodeId) : "";
     const rows = (perNode || {})[nid] || [];
     let sum = 0;
     rows.forEach((r) => {
       if (normQid(r.queryid) !== wantQ) return;
-      const rdn = r.dbname != null && r.dbname !== undefined ? String(r.dbname).trim() : "";
-      if (rdn !== dn) return;
+      if (matchDbname) {
+        const rdn = r.dbname != null && r.dbname !== undefined ? String(r.dbname).trim() : "";
+        if (rdn !== dn) return;
+      }
       sum += Number(r.calls) || 0;
     });
     return sum;
@@ -426,17 +512,17 @@
    * Per-node positive contributions for the scoped statement: cumulative calls, or Δcalls vs prior when deltaMode.
    * Same “positive weights only” split as ASH load distribution (summarizeAshNodeLoadPct).
    */
-  function pgStatCallsContributorsPerNodeMap(perNode, pgRow, prevPerNode, deltaMode) {
+  function statementCallsContributorsPerNodeMap(perNode, stmtRow, prevPerNode, deltaMode, matchDbname) {
     const keys = new Set(Object.keys(perNode || {}));
     if (deltaMode && prevPerNode) {
       Object.keys(prevPerNode).forEach((k) => keys.add(k));
     }
     const nm = new Map();
     keys.forEach((nid) => {
-      const cur = statementCallsOnNodeMatching(perNode, nid, pgRow);
+      const cur = statementCallsOnNodeMatching(perNode, nid, stmtRow, matchDbname);
       let metric = cur;
       if (deltaMode && prevPerNode) {
-        const prev = statementCallsOnNodeMatching(prevPerNode, nid, pgRow);
+        const prev = statementCallsOnNodeMatching(prevPerNode, nid, stmtRow, matchDbname);
         metric = cur - prev;
       }
       if (metric > 0) nm.set(String(nid), metric);
@@ -494,47 +580,50 @@
   }
 
   /**
-   * Metrics from merged pg_stat_statements for the scoped query_id (same cumulative vs Δ rules as main statements table).
-   * @param ashPerNode ASH per_node map (unfiltered) for cluster node count only.
+   * Metrics from merged pg_stat_statements or ycql_stat_statements for the scoped query_id.
+   * @returns {boolean} true when a matching row was found and metrics were appended
    */
-  function appendAshScopedQueryPgStatLines(noteEl, doc, prevDoc, qF, st, ashPerNode) {
+  function appendAshScopedStatementSourceLines(
+    noteEl,
+    doc,
+    prevDoc,
+    qF,
+    ashPerNode,
+    sourceLabel,
+    perNode,
+    prevPerNode,
+    mergeFn,
+    opts
+  ) {
     const want = normQid(qF);
-    if (want == null || !st) return;
+    if (want == null || !perNode) return false;
 
-    const merged = mergeStatements(st);
-    const prevSt = prevDoc && prevDoc.pg_stat_statements && prevDoc.pg_stat_statements.per_node;
-    const hasRowsCol = pgStatPerNodeHasRowsColumn(st);
+    const matchDbname = !!(opts && opts.matchDbname);
+    const hasRowsCol = matchDbname && pgStatPerNodeHasRowsColumn(perNode);
 
-    let pgRow = null;
+    const merged = mergeFn(perNode);
+    let stmtRow = null;
     let deltaMode = false;
-    if (prevDoc && prevSt) {
+    if (prevDoc && prevPerNode) {
       deltaMode = true;
-      const mergedPrev = mergeStatements(prevSt);
+      const mergedPrev = mergeFn(prevPerNode);
       const deltaRows = deltaPgStatMergedRows(merged, mergedPrev);
       const derived = withPgStatDeltaDerivedRows(
         deltaRows,
         prevDoc.generated_at_utc,
         doc.generated_at_utc
       );
-      pgRow = pickMergedPgStatRowForQueryId(derived, qF);
+      stmtRow = pickMergedPgStatRowForQueryId(derived, qF);
     } else {
-      const withPct = withPgStatTimePercent(merged);
-      pgRow = pickMergedPgStatRowForQueryId(withPct, qF);
+      stmtRow = pickMergedPgStatRowForQueryId(withPgStatTimePercent(merged), qF);
     }
 
-    if (!pgRow) {
-      ashBannerMetricRow(
-        noteEl,
-        "pg_stat_statements",
-        deltaMode
-          ? "No Δ row for this query vs prior (zero change or not in merge)."
-          : "No merged row for this query."
-      );
-      return;
+    if (!stmtRow) {
+      return false;
     }
 
     if (deltaMode) {
-      const cps = pgRow.calls_per_sec;
+      const cps = stmtRow.calls_per_sec;
       ashBannerMetricRow(
         noteEl,
         "calls/s",
@@ -544,19 +633,25 @@
       ashBannerMetricRow(
         noteEl,
         "calls",
-        pgRow.calls != null && pgRow.calls !== "" ? String(pgRow.calls) : ""
+        stmtRow.calls != null && stmtRow.calls !== "" ? String(stmtRow.calls) : ""
       );
     }
 
     const clusterNodes = ashSnapshotClusterNodeCount(doc, ashPerNode || {});
-    const contribMap = pgStatCallsContributorsPerNodeMap(st, pgRow, prevSt, deltaMode);
+    const contribMap = statementCallsContributorsPerNodeMap(
+      perNode,
+      stmtRow,
+      prevPerNode,
+      deltaMode,
+      matchDbname
+    );
     const callsDist = summarizeAshNodeLoadPct(contribMap);
     appendAshBannerCallsDistributionRow(noteEl, clusterNodes, callsDist);
 
-    const tms = formatPgStatMsTwoDecimals(pgRow.total_ms);
+    const tms = formatPgStatMsTwoDecimals(stmtRow.total_ms);
     const pctBracket =
-      pgRow.time_pct != null && pgRow.time_pct !== ""
-        ? `[${Number(pgRow.time_pct).toFixed(2)}%]`
+      stmtRow.time_pct != null && stmtRow.time_pct !== ""
+        ? `[${Number(stmtRow.time_pct).toFixed(2)}%]`
         : "";
     let totalTimeVal = "";
     if (tms && pctBracket) totalTimeVal = `${tms} (ms) ${pctBracket}`;
@@ -564,15 +659,95 @@
     else totalTimeVal = pctBracket;
     ashBannerMetricRow(noteEl, "total time", totalTimeVal);
 
-    const meanMs = formatPgStatMsTwoDecimals(pgRow.mean_ms);
+    const meanMs = formatPgStatMsTwoDecimals(stmtRow.mean_ms);
     ashBannerMetricRow(noteEl, "mean time", meanMs ? `${meanMs} ms` : "");
 
+    if (opts && opts.showIsPrepared) {
+      ashBannerMetricRow(noteEl, "is_prepared", formatYcqlPrepared(stmtRow.is_prepared));
+    }
     if (hasRowsCol) {
       const rawRpc =
-        pgRow.rows_per_call != null && pgRow.rows_per_call !== ""
-          ? pgRow.rows_per_call
-          : pgRow.avg_rows_per_call;
+        stmtRow.rows_per_call != null && stmtRow.rows_per_call !== ""
+          ? stmtRow.rows_per_call
+          : stmtRow.avg_rows_per_call;
       ashBannerMetricRow(noteEl, "rows/call", formatPgStatPerCallMetric(rawRpc));
+    }
+    return true;
+  }
+
+  /** Cumulative merged row for queryid (used to pick pg vs ycql statement source). */
+  function mergedStatementRowForQuery(perNode, mergeFn, qid) {
+    if (!perNode) return null;
+    return pickMergedPgStatRowForQueryId(withPgStatTimePercent(mergeFn(perNode)), qid);
+  }
+
+  /**
+   * Statement summary under the ASH query banner: pg_stat_statements when present, else ycql_stat_statements.
+   * @param ashPerNode ASH per_node map (unfiltered) for cluster node count only.
+   */
+  function appendAshScopedQueryStatementLines(noteEl, doc, prevDoc, qF, ashPerNode) {
+    const pgPer = doc && doc.pg_stat_statements && doc.pg_stat_statements.per_node;
+    const ycqlPer = doc && doc.ycql_stat_statements && doc.ycql_stat_statements.per_node;
+    const prevPg =
+      prevDoc && prevDoc.pg_stat_statements && prevDoc.pg_stat_statements.per_node;
+    const prevYcql =
+      prevDoc && prevDoc.ycql_stat_statements && prevDoc.ycql_stat_statements.per_node;
+
+    const inPg = mergedStatementRowForQuery(pgPer, mergeStatements, qF);
+    const inYcql = mergedStatementRowForQuery(ycqlPer, mergeYcqlStatements, qF);
+
+    if (inPg) {
+      if (
+        !appendAshScopedStatementSourceLines(
+          noteEl,
+          doc,
+          prevDoc,
+          qF,
+          ashPerNode,
+          "pg_stat_statements",
+          pgPer,
+          prevPg,
+          mergeStatements,
+          { matchDbname: true }
+        )
+      ) {
+        ashBannerMetricRow(
+          noteEl,
+          "pg_stat_statements",
+          "No Δ row for this query vs prior (zero change or not in merge)."
+        );
+      }
+      return;
+    }
+    if (inYcql) {
+      if (
+        !appendAshScopedStatementSourceLines(
+          noteEl,
+          doc,
+          prevDoc,
+          qF,
+          ashPerNode,
+          "ycql_stat_statements",
+          ycqlPer,
+          prevYcql,
+          mergeYcqlStatements,
+          { matchDbname: false, showIsPrepared: true }
+        )
+      ) {
+        ashBannerMetricRow(
+          noteEl,
+          "ycql_stat_statements",
+          "No Δ row for this query vs prior (zero change or not in merge)."
+        );
+      }
+      return;
+    }
+    if (pgPer || ycqlPer) {
+      ashBannerMetricRow(
+        noteEl,
+        "statements",
+        "No merged row for this query in pg_stat_statements or ycql_stat_statements."
+      );
     }
   }
 
@@ -1094,38 +1269,55 @@
     return null;
   }
 
+  /** First matching query text from pg_stat_statements or ycql_stat_statements per_node. */
+  function lookupStatementQueryText(doc, qid) {
+    const want = normQid(qid);
+    if (want == null) return null;
+    const sections = [
+      doc && doc.pg_stat_statements && doc.pg_stat_statements.per_node,
+      doc && doc.ycql_stat_statements && doc.ycql_stat_statements.per_node,
+    ];
+    for (let s = 0; s < sections.length; s += 1) {
+      const perNode = sections[s];
+      if (!perNode) continue;
+      const stmtKeys = Object.keys(perNode);
+      for (let i = 0; i < stmtKeys.length; i += 1) {
+        const rows = perNode[stmtKeys[i]] || [];
+        for (let j = 0; j < rows.length; j += 1) {
+          const r = rows[j];
+          if (normQid(r && r.queryid) === want && r.query) return String(r.query);
+        }
+      }
+    }
+    return null;
+  }
+
   function getQueryTextForToolbar(doc, qid) {
     const want = normQid(qid);
     const bg = backgroundAshQueryLabel(want);
     if (bg) return bg;
     const fromAsh = getFirstQueryTextForFilter(doc, qid);
     if (fromAsh) return fromAsh;
-    if (want == null) return null;
-    const st = doc && doc.pg_stat_statements && doc.pg_stat_statements.per_node;
-    if (!st) return null;
-    const stmtKeys = Object.keys(st);
-    for (let i = 0; i < stmtKeys.length; i += 1) {
-      const rows = st[stmtKeys[i]] || [];
-      for (let j = 0; j < rows.length; j += 1) {
-        const r = rows[j];
-        if (normQid(r && r.queryid) === want && r.query) return String(r.query);
-      }
-    }
-    return null;
+    return lookupStatementQueryText(doc, qid);
   }
 
-  /** queryid string → query text from pg_stat_statements.per_node (first hit per id). */
+  /** queryid string → query text from pg_stat_statements and ycql_stat_statements (first hit per id). */
   function buildPgStatQueryTextByQueryId(doc) {
     const map = new Map();
-    const st = doc && doc.pg_stat_statements && doc.pg_stat_statements.per_node;
-    if (!st) return map;
-    Object.keys(st).forEach((nid) => {
-      (st[nid] || []).forEach((r) => {
-        const id =
-          r && r.queryid != null && r.queryid !== undefined ? String(r.queryid).trim() : "";
-        if (!id || map.has(id)) return;
-        const q = r.query != null && r.query !== undefined ? String(r.query).trim() : "";
-        if (q) map.set(id, q);
+    const sections = [
+      doc && doc.pg_stat_statements && doc.pg_stat_statements.per_node,
+      doc && doc.ycql_stat_statements && doc.ycql_stat_statements.per_node,
+    ];
+    sections.forEach((st) => {
+      if (!st) return;
+      Object.keys(st).forEach((nid) => {
+        (st[nid] || []).forEach((r) => {
+          const id =
+            r && r.queryid != null && r.queryid !== undefined ? String(r.queryid).trim() : "";
+          if (!id || map.has(id)) return;
+          const q = r.query != null && r.query !== undefined ? String(r.query).trim() : "";
+          if (q) map.set(id, q);
+        });
       });
     });
     return map;
@@ -2395,6 +2587,9 @@
           } else if (col.key === "total_ms" || col.key === "mean_ms") {
             applyMonoTableCellClass(td, col);
             td.textContent = formatPgStatMsTwoDecimals(v);
+          } else if (col.key === "is_prepared") {
+            applyMonoTableCellClass(td, col);
+            td.textContent = formatYcqlPrepared(v);
           } else if (col.key === "sessions_per_sec") {
             applyMonoTableCellClass(td, col);
             td.textContent = formatAshSessionsPerSec(v);
@@ -2667,6 +2862,9 @@
           } else if (col.key === "total_ms" || col.key === "mean_ms") {
             applyMonoTableCellClass(td, col);
             td.textContent = formatPgStatMsTwoDecimals(v);
+          } else if (col.key === "is_prepared") {
+            applyMonoTableCellClass(td, col);
+            td.textContent = formatYcqlPrepared(v);
           } else if (col.key === "sessions_per_sec") {
             applyMonoTableCellClass(td, col);
             td.textContent = formatAshSessionsPerSec(v);
@@ -2855,6 +3053,7 @@
     lastPrevDoc = prevDoc;
 
     const st = doc.pg_stat_statements && doc.pg_stat_statements.per_node;
+    const ycqlSt = doc.ycql_stat_statements && doc.ycql_stat_statements.per_node;
     const ash = doc.yb_active_session_history && doc.yb_active_session_history.per_node;
     const topo = doc.node_topology || {};
 
@@ -2864,6 +3063,13 @@
       role: "tabpanel",
       id: "panel-pgss",
       "aria-labelledby": "tab-pgss",
+    });
+    const panelYcql = el("div", {
+      className: "app-panel",
+      "data-viewer-section": "ycql",
+      role: "tabpanel",
+      id: "panel-ycql",
+      "aria-labelledby": "tab-ycql",
     });
     const panelAsh = el("div", {
       className: "app-panel",
@@ -2923,6 +3129,65 @@
         el("p", {
           className: "app-panel-empty",
           textContent: "No pg_stat_statements.per_node in this snapshot.",
+        })
+      );
+    }
+
+    if (ycqlSt) {
+      const mergedYcql = mergeYcqlStatements(ycqlSt);
+      const prevYcqlSt =
+        prevDoc && prevDoc.ycql_stat_statements && prevDoc.ycql_stat_statements.per_node;
+      let ycqlTitle = "Top 25 — ycql_stat_statements";
+      let ycqlRows = withPgStatTimePercent(mergedYcql);
+      let ycqlCols = ycqlStatStatementColumns();
+      const ycqlSort = { key: "total_ms", dir: "desc" };
+      if (prevDoc && prevYcqlSt) {
+        const mergedYcqlPrev = mergeYcqlStatements(prevYcqlSt);
+        const prepByKey = new Map(
+          mergedYcql.map((r) => [statementMergeKey(r), !!r.is_prepared])
+        );
+        const deltaYcqlRows = deltaPgStatMergedRows(mergedYcql, mergedYcqlPrev).map((r) => ({
+          ...r,
+          is_prepared: prepByKey.get(statementMergeKey(r)) || false,
+        }));
+        panelYcql.appendChild(
+          pgStatActivityBannerDelta(prevDoc.generated_at_utc, doc.generated_at_utc)
+        );
+        ycqlTitle = "Top 25 — ycql_stat_statements (Δ vs prior snapshot)";
+        ycqlRows = withPgStatDeltaDerivedRows(
+          deltaYcqlRows,
+          prevDoc.generated_at_utc,
+          doc.generated_at_utc
+        );
+        ycqlCols = ycqlStatStatementColumnsDelta();
+      } else {
+        panelYcql.appendChild(pgStatActivityBannerAt(doc.generated_at_utc));
+        if (prevDoc && !prevYcqlSt) {
+          panelYcql.appendChild(
+            el("div", {
+              className: "pgss-activity-note",
+              textContent:
+                "Previous snapshot has no ycql_stat_statements data; showing cumulative totals for this snapshot.",
+            })
+          );
+        }
+      }
+      panelYcql.appendChild(
+        buildSortablePaginatedTable(
+          ycqlTitle,
+          ycqlRows,
+          ycqlCols,
+          25,
+          "sec-ycql-main",
+          ycqlSort,
+          { unifyStatementHeaders: true, pgssAshLinks: true }
+        )
+      );
+    } else {
+      panelYcql.appendChild(
+        el("p", {
+          className: "app-panel-empty",
+          textContent: "No ycql_stat_statements.per_node in this snapshot.",
         })
       );
     }
@@ -2994,8 +3259,7 @@
         const note = el("div", { className: "ash-mode-banner ash-mode-banner--scoped" });
         let ashQueryTitle = `query_id=${qF}`;
         if (st) {
-          const mergedAshTitle = mergeStatements(st);
-          const rowDb = pickMergedPgStatRowForQueryId(mergedAshTitle, qF);
+          const rowDb = mergedStatementRowForQuery(st, mergeStatements, qF);
           if (rowDb && rowDb.dbname) ashQueryTitle += `; dbname=${rowDb.dbname}`;
         }
         note.appendChild(
@@ -3015,7 +3279,7 @@
           })
         );
         note.appendChild(row);
-        appendAshScopedQueryPgStatLines(note, doc, prevDoc, qF, st, ash);
+        appendAshScopedQueryStatementLines(note, doc, prevDoc, qF, ash);
         panelAsh.appendChild(note);
       }
       const ashClusterNodes = ashSnapshotClusterNodeCount(doc, ash);
@@ -3366,6 +3630,7 @@
     }
 
     app.appendChild(panelPgss);
+    app.appendChild(panelYcql);
     app.appendChild(panelAsh);
     app.appendChild(panelTablets);
     buildViewerNav();
