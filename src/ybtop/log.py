@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import logging.handlers
+import threading
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -45,6 +46,7 @@ class CheckpointLog:
     checkpoint: int
     stages_ms: dict[str, float] = field(default_factory=dict)
     scopes: dict[str, ScopeCheckpointLog] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def _scope(self, name: str) -> ScopeCheckpointLog:
         return self.scopes.setdefault(name, ScopeCheckpointLog())
@@ -58,29 +60,29 @@ class CheckpointLog:
         node_total: bool = False,
         scope_total: bool = False,
     ) -> None:
-        if scope_total and not node_id:
-            scope = self._scope(stage)
-            scope.total_ms = (scope.total_ms or 0.0) + duration_ms
-            return
-
         active_scope = _summary_scope_var.get()
-
-        if node_id:
-            bucket = self._scope(active_scope).per_node_ms if active_scope else {}
-            if active_scope is None:
+        with self._lock:
+            if scope_total and not node_id:
+                scope = self._scope(stage)
+                scope.total_ms = (scope.total_ms or 0.0) + duration_ms
                 return
-            node = bucket.setdefault(node_id, NodeCheckpointLog())
-            if node_total:
-                node.total_ms = (node.total_ms or 0.0) + duration_ms
-            else:
-                node.stages_ms[stage] = node.stages_ms.get(stage, 0.0) + duration_ms
-            return
 
-        if active_scope:
-            scope = self._scope(active_scope)
-            scope.stages_ms[stage] = scope.stages_ms.get(stage, 0.0) + duration_ms
-        else:
-            self.stages_ms[stage] = self.stages_ms.get(stage, 0.0) + duration_ms
+            if node_id:
+                if active_scope is None:
+                    return
+                bucket = self._scope(active_scope).per_node_ms
+                node = bucket.setdefault(node_id, NodeCheckpointLog())
+                if node_total:
+                    node.total_ms = (node.total_ms or 0.0) + duration_ms
+                else:
+                    node.stages_ms[stage] = node.stages_ms.get(stage, 0.0) + duration_ms
+                return
+
+            if active_scope:
+                scope = self._scope(active_scope)
+                scope.stages_ms[stage] = scope.stages_ms.get(stage, 0.0) + duration_ms
+            else:
+                self.stages_ms[stage] = self.stages_ms.get(stage, 0.0) + duration_ms
 
     @staticmethod
     def _serialize_per_node(per_node: dict[str, NodeCheckpointLog]) -> dict[str, Any]:

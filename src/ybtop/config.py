@@ -31,6 +31,7 @@ DEFAULT_LOG_FILENAME = "ybtop.log"
 DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_LOG_MAX_BYTES = 1_048_576
 DEFAULT_LOG_BACKUP_COUNT = 5
+DEFAULT_NODE_PARALLELISM = 8
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,7 @@ class Settings:
     log_level: str = DEFAULT_LOG_LEVEL
     log_max_bytes: int = DEFAULT_LOG_MAX_BYTES
     log_backup_count: int = DEFAULT_LOG_BACKUP_COUNT
+    node_parallelism: int = DEFAULT_NODE_PARALLELISM
 
 
 def load_dsn_from_env_or_none() -> Optional[str]:

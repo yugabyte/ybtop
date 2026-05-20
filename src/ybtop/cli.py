@@ -22,6 +22,7 @@ from ybtop.config import (
     DEFAULT_LOG_BACKUP_COUNT,
     DEFAULT_LOG_LEVEL,
     DEFAULT_LOG_MAX_BYTES,
+    DEFAULT_NODE_PARALLELISM,
     DEFAULT_REFRESH_INTERVAL_SEC,
     DEFAULT_SERVE_HOST,
     DEFAULT_SERVE_PORT,
@@ -111,8 +112,9 @@ def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
                         ash_per_node=settings.snapshot_ash_per_node,
                         ensure_ycql_extension=(iteration == 1),
                         ash_top_tables=settings.snapshot_ash_top_tables,
-                        collect_table_ddl=settings.snapshot_collect_table_ddl,
-                    )
+                    collect_table_ddl=settings.snapshot_collect_table_ddl,
+                    node_parallelism=settings.node_parallelism,
+                )
                     write_snapshot_and_update_manifest(output_dir=out_dir, document=doc)
                     gc_snapshots_and_manifest(
                         output_dir=out_dir,
@@ -345,6 +347,16 @@ def build_parser() -> argparse.ArgumentParser:
             "(default: skip DDL collection)."
         ),
     )
+    w.add_argument(
+        "--node-parallelism",
+        type=int,
+        default=DEFAULT_NODE_PARALLELISM,
+        metavar="N",
+        help=(
+            "Max concurrent YSQL nodes when collecting per-node snapshot data "
+            "(pg_stat, ASH, tablets, etc.)."
+        ),
+    )
     v = w.add_argument_group("viewer (HTTP; same as ybtop serve)")
     v.add_argument(
         "--no-serve",
@@ -477,6 +489,7 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         log_level=str(getattr(args, "log_level", DEFAULT_LOG_LEVEL)),
         log_max_bytes=int(getattr(args, "log_max_bytes", DEFAULT_LOG_MAX_BYTES)),
         log_backup_count=int(getattr(args, "log_backup_count", DEFAULT_LOG_BACKUP_COUNT)),
+        node_parallelism=int(getattr(args, "node_parallelism", DEFAULT_NODE_PARALLELISM)),
     )
 
 

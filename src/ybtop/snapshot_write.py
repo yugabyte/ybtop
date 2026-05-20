@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import contextvars
 import glob
 import json
 import os
 import re
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -13,13 +16,13 @@ from typing import Any, Optional
 import psycopg.conninfo
 
 from ybtop import queries as Q
-from ybtop.capabilities import detect_capabilities
-from ybtop.config import MANIFEST_FILENAME, SNAPSHOT_FILE_PREFIX
+from ybtop.capabilities import Capabilities, detect_capabilities
+from ybtop.config import DEFAULT_NODE_PARALLELISM, MANIFEST_FILENAME, SNAPSHOT_FILE_PREFIX
 from ybtop.db import connect
 from ybtop.log import get_logger, log_event, stage_timer, summary_scope
 from ybtop.merge import top_ash_table_ids
 from ybtop.table_schema import collect_table_schemas, lookup_tablet_meta_by_table_id, resolve_table_engine
-from ybtop.topology import discover_ysql_nodes, dsn_for_node, node_id
+from ybtop.topology import YsqlNode, discover_ysql_nodes, dsn_for_node, node_id
 
 _log = get_logger("snapshot")
 
@@ -67,6 +70,7 @@ def build_snapshot_document(
     ensure_ycql_extension: bool = False,
     ash_top_tables: int = 25,
     collect_table_ddl: bool = False,
+    node_parallelism: int = DEFAULT_NODE_PARALLELISM,
 ) -> dict[str, Any]:
     with stage_timer("build_snapshot", _log, scope_total=True):
         with summary_scope("build_snapshot"):
@@ -79,7 +83,120 @@ def build_snapshot_document(
                 ensure_ycql_extension=ensure_ycql_extension,
                 ash_top_tables=ash_top_tables,
                 collect_table_ddl=collect_table_ddl,
+                node_parallelism=node_parallelism,
             )
+
+
+@dataclass(frozen=True)
+class _NodeCollectResult:
+    nid: str
+    pg_stat: list[dict[str, Any]]
+    ycql: list[dict[str, Any]]
+    ash: list[dict[str, Any]]
+    tablets: list[dict[str, Any]]
+
+
+def _collect_one_node(
+    *,
+    seed_dsn: str,
+    node: YsqlNode,
+    node_count: int,
+    caps: Capabilities,
+    ash_start: datetime,
+    ash_end: datetime,
+    ash_window_sec: float,
+    statements_per_node: int,
+    ash_per_node: int,
+) -> _NodeCollectResult:
+    nid = node_id(node)
+    dsn = dsn_for_node(seed_dsn, node)
+    with stage_timer("collect_node", _log, node_id=nid, node_total=True, node_count=node_count):
+        with connect(dsn) as conn:
+            with stage_timer("pg_stat_statements_top", _log, node_id=nid) as st:
+                pg_stat = _serialize_rows(Q.pg_stat_statements_top(conn, statements_per_node, caps))
+                st.row_count = len(pg_stat)
+            with stage_timer("ycql_stat_statements_top", _log, node_id=nid) as st:
+                ycql = _serialize_rows(Q.ycql_stat_statements_top(conn, statements_per_node))
+                st.row_count = len(ycql)
+            with stage_timer(
+                "ash_aggregated",
+                _log,
+                node_id=nid,
+                ash_window_sec=ash_window_sec,
+            ) as st:
+                ash = _serialize_rows(
+                    Q.ash_aggregated(conn, ash_start, ash_end, caps, outer_limit=ash_per_node)
+                )
+                st.row_count = len(ash)
+            with stage_timer("yb_local_tablets_rows", _log, node_id=nid) as st:
+                tablets = _serialize_rows(Q.yb_local_tablets_rows(conn))
+                st.row_count = len(tablets)
+    return _NodeCollectResult(nid=nid, pg_stat=pg_stat, ycql=ycql, ash=ash, tablets=tablets)
+
+
+def _collect_nodes_parallel(
+    *,
+    seed_dsn: str,
+    nodes: list[YsqlNode],
+    caps: Capabilities,
+    ash_start: datetime,
+    ash_end: datetime,
+    ash_window_sec: float,
+    statements_per_node: int,
+    ash_per_node: int,
+    node_parallelism: int,
+) -> tuple[
+    dict[str, list[dict[str, Any]]],
+    dict[str, list[dict[str, Any]]],
+    dict[str, list[dict[str, Any]]],
+    dict[str, list[dict[str, Any]]],
+]:
+    statements_out: dict[str, list[dict[str, Any]]] = {}
+    ycql_out: dict[str, list[dict[str, Any]]] = {}
+    ash_out: dict[str, list[dict[str, Any]]] = {}
+    tablets_out: dict[str, list[dict[str, Any]]] = {}
+    workers = min(max(1, int(node_parallelism)), len(nodes))
+    node_count = len(nodes)
+    collect_kw = {
+        "seed_dsn": seed_dsn,
+        "node_count": node_count,
+        "caps": caps,
+        "ash_start": ash_start,
+        "ash_end": ash_end,
+        "ash_window_sec": ash_window_sec,
+        "statements_per_node": statements_per_node,
+        "ash_per_node": ash_per_node,
+    }
+
+    def _run(node: YsqlNode) -> _NodeCollectResult:
+        return _collect_one_node(node=node, **collect_kw)
+
+    with stage_timer(
+        "collect_nodes",
+        _log,
+        node_count=node_count,
+        node_parallelism=workers,
+    ) as st:
+        if workers == 1:
+            results = [_run(n) for n in nodes]
+        else:
+            results = []
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                # Each worker needs its own Context copy; Context.run() is not re-entrant
+                # across threads on the same Context object.
+                futures = [
+                    pool.submit(contextvars.copy_context().run, _run, n) for n in nodes
+                ]
+                for fut in as_completed(futures):
+                    results.append(fut.result())
+        st.row_count = len(results)
+
+    for r in results:
+        statements_out[r.nid] = r.pg_stat
+        ycql_out[r.nid] = r.ycql
+        ash_out[r.nid] = r.ash
+        tablets_out[r.nid] = r.tablets
+    return statements_out, ycql_out, ash_out, tablets_out
 
 
 def _build_snapshot_document_impl(
@@ -92,6 +209,7 @@ def _build_snapshot_document_impl(
     ensure_ycql_extension: bool = False,
     ash_top_tables: int = 25,
     collect_table_ddl: bool = False,
+    node_parallelism: int = DEFAULT_NODE_PARALLELISM,
 ) -> dict[str, Any]:
     ash_window_sec = round((ash_end - ash_start).total_seconds(), 2)
     with stage_timer("discover_ysql_nodes", _log):
@@ -114,44 +232,24 @@ def _build_snapshot_document_impl(
     with stage_timer("detect_capabilities", _log):
         caps = detect_capabilities(seed_dsn)
 
-    statements_per_node_out: dict[str, list[dict[str, Any]]] = {}
-    ycql_per_node_out: dict[str, list[dict[str, Any]]] = {}
-    ash_per_node_out: dict[str, list[dict[str, Any]]] = {}
-    tablets_per_node_out: dict[str, list[dict[str, Any]]] = {}
-
     if ensure_ycql_extension:
         with stage_timer("ensure_ycql_extension", _log):
             with connect(seed_dsn) as conn:
                 Q.ensure_yb_ycql_utils_extension(conn)
 
-    for n in nodes:
-        nid = node_id(n)
-        dsn = dsn_for_node(seed_dsn, n)
-        with stage_timer("collect_node", _log, node_id=nid, node_total=True, node_count=len(nodes)):
-            with connect(dsn) as conn:
-                with stage_timer("pg_stat_statements_top", _log, node_id=nid) as st:
-                    statements_per_node_out[nid] = _serialize_rows(
-                        Q.pg_stat_statements_top(conn, statements_per_node, caps)
-                    )
-                    st.row_count = len(statements_per_node_out[nid])
-                with stage_timer("ycql_stat_statements_top", _log, node_id=nid) as st:
-                    ycql_per_node_out[nid] = _serialize_rows(
-                        Q.ycql_stat_statements_top(conn, statements_per_node)
-                    )
-                    st.row_count = len(ycql_per_node_out[nid])
-                with stage_timer(
-                    "ash_aggregated",
-                    _log,
-                    node_id=nid,
-                    ash_window_sec=ash_window_sec,
-                ) as st:
-                    ash_per_node_out[nid] = _serialize_rows(
-                        Q.ash_aggregated(conn, ash_start, ash_end, caps, outer_limit=ash_per_node)
-                    )
-                    st.row_count = len(ash_per_node_out[nid])
-                with stage_timer("yb_local_tablets_rows", _log, node_id=nid) as st:
-                    tablets_per_node_out[nid] = _serialize_rows(Q.yb_local_tablets_rows(conn))
-                    st.row_count = len(tablets_per_node_out[nid])
+    statements_per_node_out, ycql_per_node_out, ash_per_node_out, tablets_per_node_out = (
+        _collect_nodes_parallel(
+            seed_dsn=seed_dsn,
+            nodes=nodes,
+            caps=caps,
+            ash_start=ash_start,
+            ash_end=ash_end,
+            ash_window_sec=ash_window_sec,
+            statements_per_node=statements_per_node,
+            ash_per_node=ash_per_node,
+            node_parallelism=node_parallelism,
+        )
+    )
 
     top_tables: list[dict[str, Any]] = []
     table_schemas: dict[str, Any] = {}

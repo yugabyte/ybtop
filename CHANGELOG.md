@@ -10,6 +10,7 @@ All notable functional changes to **ybtop** are listed here by release. Format f
 - **ASH top tables:** After per-node collection, snapshots rank **`table_id`** values cluster-wide by ASH **samples** (default top **25**, **`--snapshot-ash-top-tables`**, `0` disables). Stored under **`ash_top_tables`** in each snapshot JSON.
 - **Optional YSQL DDL extraction:** **`--snapshot-table-ddl`** fetches **`CREATE TABLE`** / **`CREATE INDEX`** definitions (including Yugabyte-specific PK/index details where available via **`pg_catalog`**) for top ASH **YSQL** tables on the seed connection. Results are stored in **`table_schemas.by_table_id`**. Off by default; YCQL DDL is not collected (YSQL connection only).
 - **Structured activity logging:** **`ybtop watch`** writes JSON-lines to **`OUTPUT_DIR/ybtop.log`** by default, with per-checkpoint **`checkpoint_summary`** events and nested stage timings (**`build_snapshot`**, per-node query stages, **`write_snapshot`**, **`gc_snapshots`**). Size-based rotation (**1 MiB**, five backups). Configurable via **`--log-file`**, **`--log-level`**, **`--log-max-bytes`**, **`--log-backup-count`**, or **`--no-log-file`**.
+- **Parallel per-node collection:** **`--node-parallelism`** (default **8**) caps concurrent node connections when fanning out snapshot queries across the cluster.
 
 ### Changed
 
