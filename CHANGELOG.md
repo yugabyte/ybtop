@@ -20,6 +20,7 @@ All notable functional changes to **ybtop** are listed here by release. Format f
 ### Fixed
 
 - **Engine classification for `ash_top_tables`:** YSQL tables are identified from **`table_id`** hex layout (and tablet metadata), not from **`TServer`** ASH rows with **`ysql_dbid = 0`** (which incorrectly labeled many YSQL tables as YCQL).
+- **Parallel per-node collection:** Worker threads each copy **`contextvars`** before running snapshot queries so **`--node-parallelism` > 1** does not fail with **`cannot enter context: … is already entered`** when structured logging stages are active. **`CheckpointLog.record`** is synchronized for concurrent per-node timing updates.
 
 ## [0.1.9] — 2026-04-23
 
