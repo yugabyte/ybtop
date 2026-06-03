@@ -89,18 +89,51 @@
     return `${y}/${mon}/${String(day).padStart(2, "0")} ${String(hh).padStart(2, "0")}:${String(mi).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
   }
 
-  function viewerNavLabelText(index, len, ent, docOrNull) {
+  /**
+   * Stable per-snapshot key: the UTC `YYYYMMDD_HHMMSS` component of the
+   * filename. Used to pin a window in the URL — unlike the manifest index,
+   * it survives new snapshots arriving and old ones being GC'd.
+   */
+  function snapshotTimeKeyFromFile(file) {
+    const m = /^ybtop\.out\.(\d{8}_\d{6})\.json$/i.exec(file || "");
+    return m ? m[1] : null;
+  }
+
+  function viewerNavFileText(ent, docOrNull) {
     const file = (ent && ent.file) || "";
     const human =
       formatSnapshotTakenHuman(docOrNull && docOrNull.generated_at_utc) ||
       formatSnapshotTakenHuman(ent && ent.utc) ||
       snapshotHumanFromFilename(file);
     const suffix = human ? ` [${human}]` : "";
-    return `${index + 1} / ${len} — ${file}${suffix}`;
+    return `— ${file}${suffix}`;
+  }
+
+  // Sync the slider, editable counter, total and file/time label to `index`.
+  // 1-based for humans; skips the jump box while it has focus so it doesn't
+  // fight the user mid-type.
+  function updateNavDisplay(index, len, ent, docOrNull) {
+    const slider = document.getElementById("nav-slider");
+    if (slider) {
+      slider.max = String(len);
+      slider.value = String(index + 1);
+    }
+    const jump = document.getElementById("nav-jump");
+    if (jump) {
+      jump.max = String(len);
+      if (document.activeElement !== jump) jump.value = String(index + 1);
+    }
+    const total = document.getElementById("nav-total");
+    if (total) total.textContent = ` / ${len}`;
+    const fileEl = document.getElementById("nav-file");
+    if (fileEl) fileEl.textContent = ` ${viewerNavFileText(ent, docOrNull)}`;
   }
 
   let manifestEntries = [];
   let currentIndex = -1;
+  /** Snapshot time key parsed from the `t` URL param, or null. Resolved to a
+   * manifest index via indexForWindowKey() once entries are loaded. */
+  let urlWindowKey = null;
   let lastDoc = null;
   /** Prior snapshot (for delta pg_stat), retained for re-rend on tab/URL. */
   let lastPrevDoc = null;
@@ -151,8 +184,16 @@
     });
   }
 
+  /** Manifest index whose file matches the given time key, or -1. */
+  function indexForWindowKey(key) {
+    if (!key) return -1;
+    return manifestEntries.findIndex((e) => snapshotTimeKeyFromFile(e && e.file) === key);
+  }
+
   function readViewerStateFromUrl() {
     const p = new URLSearchParams(window.location.search);
+    const t = p.get("t");
+    urlWindowKey = t != null && String(t).trim() !== "" ? String(t).trim() : null;
     const v = p.get("view");
     if (v === "ash" || v === "tablets" || v === "pgss" || v === "ycql") {
       activeViewerSection = v;
@@ -176,6 +217,14 @@
     const push = options && options.push;
     const p = new URLSearchParams();
     p.set("view", activeViewerSection);
+    // Only pin the window in the URL when it's NOT the newest, so a plain
+    // reload defaults to the latest; stepping back makes reloads sticky. Pin
+    // by the snapshot's filename time key (stable) rather than the manifest
+    // index (shifts as snapshots are added/GC'd).
+    const isLatestWindow = currentIndex >= manifestEntries.length - 1;
+    const ent = currentIndex >= 0 ? manifestEntries[currentIndex] : null;
+    const windowKey = !isLatestWindow && ent ? snapshotTimeKeyFromFile(ent.file) : null;
+    if (windowKey) p.set("t", windowKey);
     if (activeViewerSection === "ash") {
       if (ashQueryIdFilter) p.set("query", ashQueryIdFilter);
       if (ashNodeIdFilter) p.set("node", ashNodeIdFilter);
@@ -186,6 +235,7 @@
     const st = {
       ybtop: true,
       view: activeViewerSection,
+      t: windowKey,
       query: ashQueryIdFilter || null,
       node: ashNodeIdFilter || null,
       table_id: ashTableIdFilter || null,
@@ -3685,8 +3735,9 @@
     if (index < 0 || index >= manifestEntries.length) return;
     currentIndex = index;
     const ent = manifestEntries[index];
-    const label = document.getElementById("nav-label");
-    label.textContent = viewerNavLabelText(index, manifestEntries.length, ent, null);
+    updateNavDisplay(index, manifestEntries.length, ent, null);
+    // Persist the window in the URL (replace, not push) so reloads land here.
+    writeViewerStateToUrl();
 
     document.getElementById("btn-prev").disabled = index <= 0;
     document.getElementById("btn-next").disabled = index >= manifestEntries.length - 1;
@@ -3706,7 +3757,7 @@
       ]);
       app.textContent = "";
       renderDoc(doc, prevDoc);
-      label.textContent = viewerNavLabelText(index, manifestEntries.length, ent, doc);
+      updateNavDisplay(index, manifestEntries.length, ent, doc);
       setStatus("", false);
     } catch (e) {
       const navErr = document.getElementById("app-nav");
@@ -3719,19 +3770,130 @@
     }
   }
 
+  // Shown when an explicit ?t=<time> in the URL matches no manifest entry
+  // (typo, or the snapshot was rotated out). We surface it rather than
+  // silently opening the newest, while leaving the nav controls usable.
+  function showWindowNotFoundError(key) {
+    const app = document.getElementById("app");
+    const navEl = document.getElementById("app-nav");
+    if (navEl) navEl.textContent = "";
+    const len = manifestEntries.length;
+    const slider = document.getElementById("nav-slider");
+    if (slider) slider.max = String(len);
+    const jump = document.getElementById("nav-jump");
+    if (jump) jump.max = String(len);
+    const total = document.getElementById("nav-total");
+    if (total) total.textContent = ` / ${len}`;
+    const fileEl = document.getElementById("nav-file");
+    if (fileEl) fileEl.textContent = "";
+    app.textContent = "";
+    const banner = el("div", { className: "err-banner" });
+    banner.textContent =
+      `No snapshot matches ?t=${key} — the time is invalid or that snapshot has been rotated ` +
+      `out of ybtop.manifest.json. Use First, Last, Prev, Next, or the slider to pick a window.`;
+    app.appendChild(banner);
+    setStatus("Snapshot not found", true);
+  }
+
+  function navPrev() {
+    if (currentIndex > 0) showSnapshotAt(currentIndex - 1);
+  }
+  function navNext() {
+    if (currentIndex < manifestEntries.length - 1) showSnapshotAt(currentIndex + 1);
+  }
+  function navFirst() {
+    if (currentIndex > 0) showSnapshotAt(0);
+  }
+  function navLast() {
+    if (manifestEntries.length > 0 && currentIndex < manifestEntries.length - 1) {
+      showSnapshotAt(manifestEntries.length - 1);
+    }
+  }
+
+  // Parse a 1-based window number, clamp to [1, len], and load that window.
+  function jumpTo1Based(value) {
+    const len = manifestEntries.length;
+    if (!len) return;
+    let n = parseInt(value, 10);
+    if (!Number.isFinite(n)) return;
+    n = Math.max(1, Math.min(len, n));
+    showSnapshotAt(n - 1);
+  }
+
   function wireNav() {
-    document.getElementById("btn-prev").addEventListener("click", () => {
-      if (currentIndex > 0) showSnapshotAt(currentIndex - 1);
-    });
-    document.getElementById("btn-next").addEventListener("click", () => {
-      if (currentIndex < manifestEntries.length - 1) showSnapshotAt(currentIndex + 1);
-    });
-    document.getElementById("btn-first").addEventListener("click", () => {
-      if (currentIndex > 0) showSnapshotAt(0);
-    });
-    document.getElementById("btn-last").addEventListener("click", () => {
-      if (manifestEntries.length > 0 && currentIndex < manifestEntries.length - 1) {
-        showSnapshotAt(manifestEntries.length - 1);
+    document.getElementById("btn-prev").addEventListener("click", navPrev);
+    document.getElementById("btn-next").addEventListener("click", navNext);
+    document.getElementById("btn-first").addEventListener("click", navFirst);
+    document.getElementById("btn-last").addEventListener("click", navLast);
+
+    const slider = document.getElementById("nav-slider");
+    if (slider) {
+      // Dragging: update the counter + file preview without fetching.
+      slider.addEventListener("input", () => {
+        const v = parseInt(slider.value, 10);
+        if (!Number.isFinite(v)) return;
+        const ent = manifestEntries[v - 1];
+        const jump = document.getElementById("nav-jump");
+        if (jump && document.activeElement !== jump) jump.value = String(v);
+        const fileEl = document.getElementById("nav-file");
+        if (fileEl && ent) fileEl.textContent = ` ${viewerNavFileText(ent, null)}`;
+      });
+      // Release: actually load the window the thumb landed on.
+      slider.addEventListener("change", () => jumpTo1Based(slider.value));
+    }
+
+    const jump = document.getElementById("nav-jump");
+    if (jump) {
+      jump.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          jumpTo1Based(jump.value);
+          jump.blur();
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          jump.value = String(currentIndex + 1);
+          jump.blur();
+        }
+      });
+      jump.addEventListener("change", () => jumpTo1Based(jump.value));
+    }
+
+    document.addEventListener("keydown", (e) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const t = e.target;
+      const inInput =
+        t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+      // Inside an input, let typing/arrows/Enter behave normally.
+      if (inInput) return;
+      switch (e.key) {
+        case "ArrowLeft":
+          e.preventDefault();
+          navPrev();
+          break;
+        case "ArrowRight":
+          e.preventDefault();
+          navNext();
+          break;
+        case "Home":
+          e.preventDefault();
+          navFirst();
+          break;
+        case "End":
+          e.preventDefault();
+          navLast();
+          break;
+        case "g":
+        case "G": {
+          e.preventDefault();
+          const j = document.getElementById("nav-jump");
+          if (j) {
+            j.focus();
+            j.select();
+          }
+          break;
+        }
+        default:
+          break;
       }
     });
   }
@@ -3748,6 +3910,13 @@
     wireNav();
     window.addEventListener("popstate", () => {
       readViewerStateFromUrl();
+      // A history entry may point at a different window (e.g. ASH deep-link);
+      // load it rather than just re-rendering the current snapshot.
+      const target = indexForWindowKey(urlWindowKey);
+      if (target >= 0 && target !== currentIndex) {
+        showSnapshotAt(target);
+        return;
+      }
       if (lastDoc) {
         renderDoc(lastDoc, lastPrevDoc);
       } else {
@@ -3770,7 +3939,19 @@
       return;
     }
     readViewerStateFromUrl();
-    showSnapshotAt(manifestEntries.length - 1);
+    // Honor a pinned `t` window from the URL. If `t` is present but matches no
+    // snapshot, surface an error rather than silently opening the newest. With
+    // no `t`, open the newest.
+    if (urlWindowKey) {
+      const pinned = indexForWindowKey(urlWindowKey);
+      if (pinned >= 0) {
+        showSnapshotAt(pinned);
+      } else {
+        showWindowNotFoundError(urlWindowKey);
+      }
+    } else {
+      showSnapshotAt(manifestEntries.length - 1);
+    }
   }
 
   boot();

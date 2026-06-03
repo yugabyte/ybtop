@@ -110,6 +110,86 @@ body {
   color: var(--yb-link);
 }
 
+.nav-slider {
+  flex: 1 1 8rem;
+  max-width: 16rem;
+  min-width: 6rem;
+  margin: 0 0.35rem;
+  align-self: center;
+  accent-color: var(--yb-accent);
+  cursor: pointer;
+}
+
+.nav-jump {
+  width: 3.5rem;
+  padding: 0.2rem 0.35rem;
+  background: var(--yb-accent-dim);
+  color: #fff;
+  border: 1px solid var(--yb-border);
+  border-radius: 4px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* Trim number-input spinners so the counter stays compact. */
+.nav-jump::-webkit-outer-spin-button,
+.nav-jump::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.nav-jump {
+  -moz-appearance: textfield;
+}
+
+.nav-total {
+  margin-left: 0.15rem;
+}
+
+.nav-file {
+  margin-left: 0.15rem;
+}
+
+.hotkey-tip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 1rem;
+  padding: 0.4rem 1rem;
+  background: var(--yb-panel);
+  border-top: 1px solid var(--yb-border);
+  color: var(--yb-muted);
+  font-size: 0.78rem;
+  flex-shrink: 0;
+}
+
+.hotkey-tip-label {
+  font-weight: 600;
+  color: var(--yb-muted);
+}
+
+.hotkey {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  white-space: nowrap;
+}
+
+.hotkey kbd {
+  display: inline-block;
+  min-width: 1.1rem;
+  padding: 0.05rem 0.35rem;
+  background: var(--yb-surface);
+  border: 1px solid var(--yb-border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  color: var(--yb-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  line-height: 1.3;
+  text-align: center;
+}
+
 a.query-ash-deeplink,
 a.ash-queryid-deeplink {
   color: var(--yb-link);
