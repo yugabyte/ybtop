@@ -20,13 +20,26 @@
       <button type="button" id="btn-first" title="Oldest snapshot">First</button>
       <button type="button" id="btn-last" title="Newest snapshot">Last</button>
     </span>
-    <span id="nav-label" class="nav-label"></span>
+    <input type="range" id="nav-slider" class="nav-slider" min="1" max="1" step="1" value="1"
+           title="Scrub to any window (press g to focus the number box)" aria-label="Jump to window" />
+    <span class="nav-label">
+      <input type="number" id="nav-jump" class="nav-jump" min="1" value="1"
+             title="Type a window number and press Enter" aria-label="Window number" />
+      <span id="nav-total" class="nav-total"></span>
+      <span id="nav-file" class="nav-file"></span>
+    </span>
     <span id="status-msg" class="status"></span>
   </header>
   <main class="app-shell">
     <nav id="app-nav" class="app-tabs" role="tablist" aria-label="Data sections"></nav>
     <div id="app" class="app-content"></div>
   </main>
+  <footer class="hotkey-tip" aria-label="Keyboard shortcuts">
+    <span class="hotkey-tip-label">Tip — window navigation:</span>
+    <span class="hotkey"><kbd>←</kbd><kbd>→</kbd> Prev / Next</span>
+    <span class="hotkey"><kbd>Home</kbd><kbd>End</kbd> First / Last</span>
+    <span class="hotkey"><kbd>g</kbd> jump to window #</span>
+  </footer>
   <script src="/static/app.js"></script>
 </body>
 </html>
