@@ -32,24 +32,59 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_file_from(self, base: Path, rel: str) -> None:
+    def _resolve_static(self, base: Path, rel: str) -> Path | None:
         rel = rel.lstrip("/")
         if ".." in rel.split("/"):
             self.send_error(403)
-            return
+            return None
         path = (base / rel).resolve()
         try:
             path.relative_to(base.resolve())
         except ValueError:
             self.send_error(403)
-            return
+            return None
         if not path.is_file():
             self.send_error(404)
+            return None
+        return path
+
+    def _send_file_from(self, base: Path, rel: str) -> None:
+        path = self._resolve_static(base, rel)
+        if path is None:
             return
         ctype, _ = mimetypes.guess_type(str(path))
         if not ctype:
             ctype = "application/octet-stream"
         self._send_bytes(path.read_bytes(), ctype)
+
+    def _send_head_for(self, base: Path, rel: str) -> None:
+        path = self._resolve_static(base, rel)
+        if path is None:
+            return
+        ctype, _ = mimetypes.guess_type(str(path))
+        if not ctype:
+            ctype = "application/octet-stream"
+        size = path.stat().st_size
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path) or "/"
+        if path.startswith("/static/"):
+            self._send_head_for(_web_dir(), path[len("/static/") :])
+            return
+        if path.endswith(".json"):
+            name = path.lstrip("/")
+            if ".." in name or "/" in name.strip("/"):
+                self.send_error(403)
+                return
+            self._send_head_for(type(self).data_dir, name)
+            return
+        self.send_error(404)
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)

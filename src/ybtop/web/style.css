@@ -317,6 +317,122 @@ a.ash-queryid-deeplink:hover {
   min-height: 0;
 }
 
+.window-chart {
+  flex-shrink: 0;
+  background: var(--yb-panel);
+  border-bottom: 1px solid var(--yb-border);
+  padding: 0.35rem 0.75rem 0.4rem;
+}
+
+.window-chart-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+
+.window-chart-title {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--yb-muted);
+}
+
+.window-chart-status {
+  font-size: 0.72rem;
+  color: var(--yb-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.window-chart-toggle {
+  width: 1.35rem;
+  height: 1.35rem;
+  padding: 0;
+  line-height: 1;
+  font-size: 0.6rem;
+  cursor: pointer;
+  border: 1px solid var(--yb-border);
+  border-radius: 4px;
+  background: var(--yb-surface);
+  color: var(--yb-muted);
+}
+
+.window-chart-toggle:hover {
+  color: var(--yb-accent);
+  border-color: var(--yb-accent);
+}
+
+.window-chart-body {
+  overflow: hidden;
+  transition: max-height 0.18s ease;
+}
+
+.window-chart--collapsed .window-chart-body {
+  display: none;
+}
+
+.window-chart-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  height: 56px;
+  width: 100%;
+  background: var(--yb-surface);
+  border: 1px solid var(--yb-border);
+  border-radius: 4px;
+  padding: 2px;
+  overflow: hidden;
+}
+
+.window-chart-bar {
+  flex: 1 1 0;
+  min-width: 1px;
+  height: 100%;
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  display: flex;
+  align-items: flex-end;
+  justify-content: stretch;
+  position: relative;
+}
+
+.window-chart-bar-fill {
+  width: 100%;
+  background: var(--yb-link);
+  opacity: 0.55;
+  min-height: 1px;
+  border-radius: 1px 1px 0 0;
+  transition: opacity 0.1s ease, background 0.1s ease;
+}
+
+.window-chart-bar:hover .window-chart-bar-fill {
+  opacity: 1;
+  background: var(--yb-accent);
+}
+
+.window-chart-bar--current .window-chart-bar-fill {
+  background: var(--yb-accent);
+  opacity: 1;
+  box-shadow: 0 0 0 1px var(--yb-accent) inset;
+}
+
+.window-chart-bar--pending .window-chart-bar-fill {
+  background: var(--yb-border);
+  opacity: 0.6;
+  min-height: 2px;
+  height: 2px;
+}
+
+.window-chart-bar--zero .window-chart-bar-fill {
+  background: var(--yb-muted);
+  opacity: 0.25;
+  min-height: 1px;
+  height: 1px;
+}
+
 .app-tabs {
   display: flex;
   flex-wrap: wrap;

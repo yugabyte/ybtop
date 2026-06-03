@@ -31,6 +31,18 @@
     <span id="status-msg" class="status"></span>
   </header>
   <main class="app-shell">
+    <div id="window-chart" class="window-chart" aria-label="Call rate (calls/s) per window">
+      <div class="window-chart-head">
+        <button type="button" id="window-chart-toggle" class="window-chart-toggle"
+                title="Collapse / expand chart" aria-expanded="true"
+                aria-controls="window-chart-body">▼</button>
+        <span class="window-chart-title">Call frequency</span>
+        <span id="window-chart-status" class="window-chart-status"></span>
+      </div>
+      <div id="window-chart-body" class="window-chart-body">
+        <div id="window-chart-bars" class="window-chart-bars" role="list"></div>
+      </div>
+    </div>
     <nav id="app-nav" class="app-tabs" role="tablist" aria-label="Data sections"></nav>
     <div id="app" class="app-content"></div>
   </main>

@@ -2,6 +2,21 @@
 
 All notable functional changes to **ybtop** are listed here by release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) (newest first).
 
+## [0.1.11] — 2026-06-03
+
+### Added
+
+- **Browser (call-frequency bar chart):** A new bar chart above the tab nav shows the **call rate (calls/s) per window** across the full manifest — **Δcalls** (YSQL `calls` + YCQL `calls`, clamped at ≥ 0 to absorb resets/prunes) divided by the window's duration, so bars stay comparable even when snapshot intervals vary. Bars are clickable to jump to that window; the bar for the current window is highlighted. Hover tooltip shows **`start → end UTC — X calls/s`** (or **cumulative calls** for the first window, which has no prior). Chart is collapsible via a toggle; collapsed state persists in **`localStorage`**. No per-snapshot HTTP fetches: heights come straight from the manifest.
+- **Manifest call totals + size:** `ybtop watch` records **`bytes`**, **`ysql_calls`**, and **`ycql_calls`** for each entry written to **`ybtop.manifest.json`**. Entries written by older versions lack these fields; the viewer treats such windows as having no call data (no bar) rather than charting them as zero.
+- **Browser (manifest polling):** The viewer re-fetches **`ybtop.manifest.json`** every **30 s** and updates the bar chart, slider total, and Prev/Next/Last/jump-box bounds in place. The user stays pinned to their current snapshot by filename (a new arrival does not yank them to the newest); entries that have been GC'd off disk disappear from the chart and nav.
+- **Embedded HTTP server (HEAD):** **`/static/...`** and snapshot JSON paths now support **HEAD** requests, returning **`Content-Length`** without a body.
+- **Browser (quick window navigation):** Jump to any snapshot without stepping through Prev/Next — **drag the slider** across the toolbar, or **click the window number**, type a value, and press **Enter**. Keyboard shortcuts (outside a text box): **←/→** for Prev/Next, **Home/End** for First/Last, **`g`** to focus the window-number box (also shown in a tip at the bottom of the page). Out-of-range numbers clamp to the first/last window. Stepping back from the newest window pins it in the URL by snapshot timestamp (**`?t=YYYYMMDD_HHMMSS`**, from the `ybtop.out.*.json` filename) so a **reload** returns to the same snapshot even as the manifest shifts (new snapshots added, old ones GC'd); on the newest window no `t` is written, so a plain reload always follows the latest. An explicit **`?t=…`** is honored on load; if it matches no snapshot (invalid time, or rotated out of the manifest) the viewer shows a **"snapshot not found"** error rather than silently opening the newest.
+
+### Changed
+
+- **Browser (top toolbar):** The per-snapshot file/time label is replaced by the manifest's **overall span** (e.g. `— 2026-06-03 18:22:59 → 2026-06-03 21:22:51 UTC`). The bar chart and slider tooltips identify the current window instead.
+- **Browser (activity banner):** Compact one-line format **`Activity <date> <start> → <end> UTC (Xm Ys) — <file>`** for delta panels, and **`Activity @ <ts> — <file>`** for cumulative.
+
 ## [0.1.10] — 2026-05-19
 
 ### Added
@@ -11,7 +26,6 @@ All notable functional changes to **ybtop** are listed here by release. Format f
 - **Optional YSQL DDL extraction:** **`--snapshot-table-ddl`** fetches **`CREATE TABLE`** / **`CREATE INDEX`** definitions (including Yugabyte-specific PK/index details where available via **`pg_catalog`**) for top ASH **YSQL** tables on the seed connection. Results are stored in **`table_schemas.by_table_id`**. Off by default; YCQL DDL is not collected (YSQL connection only).
 - **Structured activity logging:** **`ybtop watch`** writes JSON-lines to **`OUTPUT_DIR/ybtop.log`** by default, with per-checkpoint **`checkpoint_summary`** events and nested stage timings (**`build_snapshot`**, per-node query stages, **`write_snapshot`**, **`gc_snapshots`**). Size-based rotation (**1 MiB**, five backups). Configurable via **`--log-file`**, **`--log-level`**, **`--log-max-bytes`**, **`--log-backup-count`**, or **`--no-log-file`**.
 - **Parallel per-node collection:** **`--node-parallelism`** (default **8**) caps concurrent node connections when fanning out snapshot queries across the cluster.
-- **Browser (quick window navigation):** Jump to any snapshot without stepping through Prev/Next — **drag the slider** across the toolbar, or **click the window number**, type a value, and press **Enter**. Keyboard shortcuts (outside a text box): **←/→** for Prev/Next, **Home/End** for First/Last, **`g`** to focus the window-number box (also shown in a tip at the bottom of the page). Out-of-range numbers clamp to the first/last window. Stepping back from the newest window pins it in the URL by snapshot timestamp (**`?t=YYYYMMDD_HHMMSS`**, from the `ybtop.out.*.json` filename) so a **reload** returns to the same snapshot even as the manifest shifts (new snapshots added, old ones GC'd); on the newest window no `t` is written, so a plain reload always follows the latest. An explicit **`?t=…`** is honored on load; if it matches no snapshot (invalid time, or rotated out of the manifest) the viewer shows a **"snapshot not found"** error rather than silently opening the newest.
 
 ### Changed
 

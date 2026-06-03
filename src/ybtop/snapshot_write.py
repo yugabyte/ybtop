@@ -304,6 +304,33 @@ def _build_snapshot_document_impl(
     return doc
 
 
+def _sum_calls_per_node(per_node: Any) -> int:
+    if not isinstance(per_node, dict):
+        return 0
+    total = 0
+    for rows in per_node.values():
+        if not isinstance(rows, list):
+            continue
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            v = r.get("calls")
+            try:
+                total += int(v) if v is not None else 0
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
+def _call_totals_from_doc(doc: dict[str, Any]) -> tuple[int, int]:
+    """(ysql_total_calls, ycql_total_calls). Cumulative since instance start."""
+    pg = doc.get("pg_stat_statements") or {}
+    yc = doc.get("ycql_stat_statements") or {}
+    ysql = _sum_calls_per_node(pg.get("per_node"))
+    ycql = _sum_calls_per_node(yc.get("per_node"))
+    return ysql, ycql
+
+
 def _parse_iso_utc(s: str) -> datetime:
     t = s.strip()
     if t.endswith("Z"):
@@ -361,7 +388,14 @@ def write_snapshot_and_update_manifest(
 
         manifest_path = output_dir / MANIFEST_FILENAME
         rel_name = name
-        entry = {"file": rel_name, "utc": document["generated_at_utc"]}
+        ysql_calls, ycql_calls = _call_totals_from_doc(document)
+        entry = {
+            "file": rel_name,
+            "utc": document["generated_at_utc"],
+            "bytes": snap_bytes,
+            "ysql_calls": ysql_calls,
+            "ycql_calls": ycql_calls,
+        }
 
         entries: list[dict[str, Any]] = []
         if manifest_path.is_file():
