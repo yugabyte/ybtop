@@ -52,7 +52,7 @@ Optional sections (when enabled / applicable):
 - **`ash_top_tables`** – top **`table_id`** values by total ASH **samples** across nodes (default top **25**).  
 - **`table_schemas.by_table_id`** – **YSQL** DDL for those tables/indexes when **`--snapshot-table-ddl`** is set (YCQL schema is not collected via YSQL).  
 
-**`ybtop.manifest.json`** lists snapshot files in order so the **Prev / Next** controls (and the **slider** / window-number box) in the viewer can walk through time.
+**`ybtop.manifest.json`** lists snapshot files in order so the **Prev / Next** controls (and the **call-frequency chart** / window-number box) in the viewer can walk through time.
 
 **Intervals (how often vs what window)**  
 - **Snapshot interval** = **`ybtop watch --interval`**: time between *complete* collection passes and a new `ybtop.out.*.json` (default **60s**).  
@@ -69,7 +69,7 @@ The viewer has four main **tabs** (the URL can include **`?view=pgss`**, **`ycql
 4. **Tablet report** – Tablet counts **by table**, **by node**, and by **cloud:region:zone**, using `yb_local_tablets` and topology.
 
 **Navigation**  
-Use **First / Last / Prev / Next** to move along **`ybtop.manifest.json`**, or jump straight to any window: **drag the slider**, or **click the window number**, type a value, and press **Enter**. Keyboard shortcuts work anywhere outside a text box: **←/→** for Prev/Next, **Home/End** for First/Last, and **`g`** to focus the window-number box. When you step back from the newest window, the current window is pinned in the URL by its snapshot timestamp (**`?t=YYYYMMDD_HHMMSS`**, from the `ybtop.out.*.json` filename) so a **reload** returns to the same snapshot even as new snapshots arrive and old ones are GC'd; on the newest window no `t` is written, so a plain reload always follows the latest. An explicit **`?t=…`** is honored on load; if it matches no snapshot (invalid time, or rotated out of the manifest) the viewer shows a **"snapshot not found"** error instead of silently opening the newest. Deep links to ASH for a given statement use **history** so the **Back** button returns to the previous view.
+Use **First / Last / Prev / Next** to move along **`ybtop.manifest.json`**, or jump straight to any window: **click a bar** in the call-frequency chart, or **click the window number**, type a value, and press **Enter**. Keyboard shortcuts work anywhere outside a text box: **←/→** for Prev/Next, **Home/End** for First/Last, and **`g`** to focus the window-number box. When you step back from the newest window, the current window is pinned in the URL by its snapshot timestamp (**`?t=YYYYMMDD_HHMMSS`**, from the `ybtop.out.*.json` filename) so a **reload** returns to the same snapshot even as new snapshots arrive and old ones are GC'd; on the newest window no `t` is written, so a plain reload always follows the latest. An explicit **`?t=…`** is honored on load; if it matches no snapshot (invalid time, or rotated out of the manifest) the viewer shows a **"snapshot not found"** error instead of silently opening the newest. Deep links to ASH for a given statement use **history** so the **Back** button returns to the previous view.
 
 **Typical column meanings (short)**  
 - **time % / time (ms)**: share of *total* among rows shown, and total execution time (or delta, in delta mode).  

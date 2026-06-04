@@ -99,25 +99,25 @@
     return m ? m[1] : null;
   }
 
-  function viewerNavFileText(ent, docOrNull) {
-    const file = (ent && ent.file) || "";
-    const human =
-      formatSnapshotTakenHuman(docOrNull && docOrNull.generated_at_utc) ||
-      formatSnapshotTakenHuman(ent && ent.utc) ||
-      snapshotHumanFromFilename(file);
-    const suffix = human ? ` [${human}]` : "";
-    return `— ${file}${suffix}`;
+  /** Earliest → latest snapshot UTC across the loaded manifest entries; always shows both dates. */
+  function manifestOverallRangeText() {
+    if (!manifestEntries.length) return "";
+    const first = manifestEntries[0];
+    const last = manifestEntries[manifestEntries.length - 1];
+    const isoStart = (first && first.utc) || "";
+    const isoEnd = (last && last.utc) || "";
+    const d1 = formatSnapshotDatePart(isoStart);
+    const d2 = formatSnapshotDatePart(isoEnd);
+    const t1 = formatSnapshotTimePart(isoStart);
+    const t2 = formatSnapshotTimePart(isoEnd);
+    if (!d1 || !d2 || !t1 || !t2) return "";
+    return `${d1} ${t1} → ${d2} ${t2} UTC`;
   }
 
-  // Sync the slider, editable counter, total and file/time label to `index`.
+  // Sync the editable counter, total and the overall-range label.
   // 1-based for humans; skips the jump box while it has focus so it doesn't
-  // fight the user mid-type.
-  function updateNavDisplay(index, len, ent, docOrNull) {
-    const slider = document.getElementById("nav-slider");
-    if (slider) {
-      slider.max = String(len);
-      slider.value = String(index + 1);
-    }
+  // fight the user mid-type. `ent`/`docOrNull` retained for call-site compatibility.
+  function updateNavDisplay(index, len, _ent, _docOrNull) {
     const jump = document.getElementById("nav-jump");
     if (jump) {
       jump.max = String(len);
@@ -126,7 +126,10 @@
     const total = document.getElementById("nav-total");
     if (total) total.textContent = ` / ${len}`;
     const fileEl = document.getElementById("nav-file");
-    if (fileEl) fileEl.textContent = ` ${viewerNavFileText(ent, docOrNull)}`;
+    if (fileEl) {
+      const range = manifestOverallRangeText();
+      fileEl.textContent = range ? ` — ${range}` : "";
+    }
   }
 
   let manifestEntries = [];
@@ -1055,43 +1058,81 @@
     const parts = [];
     if (days) parts.push(`${days}d`);
     if (hours) parts.push(`${hours}h`);
-    if (mins) parts.push(`${mins}min`);
+    if (mins) parts.push(`${mins}m`);
     if (secs) parts.push(`${secs}s`);
     return parts.join(" ");
   }
 
-  function pgStatActivityBannerAt(tsIso) {
+  /** "2026-06-03 19:01:08" / "19:03:25" from ISO; returns "" on parse failure. */
+  function formatSnapshotDatePart(iso) {
+    const d = new Date(String(iso));
+    if (Number.isNaN(d.getTime())) return "";
+    const y = d.getUTCFullYear();
+    const mo = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const da = String(d.getUTCDate()).padStart(2, "0");
+    return `${y}-${mo}-${da}`;
+  }
+  function formatSnapshotTimePart(iso) {
+    const d = new Date(String(iso));
+    if (Number.isNaN(d.getTime())) return "";
+    const h = String(d.getUTCHours()).padStart(2, "0");
+    const mi = String(d.getUTCMinutes()).padStart(2, "0");
+    const s = String(d.getUTCSeconds()).padStart(2, "0");
+    return `${h}:${mi}:${s}`;
+  }
+
+  function pgStatActivityBannerAt(tsIso, file) {
     const wrap = el("div", { className: "pgss-activity-banner" });
     const strong = el("strong", { className: "pgss-activity-title" });
     strong.appendChild(document.createTextNode("Activity @ "));
     const ts = el("span", { className: "yb-mono pgss-activity-mono" });
     ts.textContent = formatSnapshotTsFixed(tsIso);
     strong.appendChild(ts);
+    if (file) {
+      strong.appendChild(document.createTextNode(" — "));
+      const fn = el("span", { className: "yb-mono pgss-activity-mono" });
+      fn.textContent = String(file);
+      strong.appendChild(fn);
+    }
     wrap.appendChild(strong);
     return wrap;
   }
 
-  function pgStatActivityBannerDelta(iso1, iso2) {
+  function pgStatActivityBannerDelta(iso1, iso2, file) {
     const wrap = el("div", { className: "pgss-activity-banner" });
     const strong = el("strong", { className: "pgss-activity-title" });
-    strong.appendChild(document.createTextNode("Activity for "));
+    strong.appendChild(document.createTextNode("Activity "));
+    const range = el("span", { className: "yb-mono pgss-activity-mono" });
+    const d1 = formatSnapshotDatePart(iso1);
+    const d2 = formatSnapshotDatePart(iso2);
+    const t1 = formatSnapshotTimePart(iso1);
+    const t2 = formatSnapshotTimePart(iso2);
+    if (d1 && d2 && t1 && t2) {
+      range.textContent =
+        d1 === d2
+          ? `${d1} ${t1} → ${t2} UTC`
+          : `${d1} ${t1} → ${d2} ${t2} UTC`;
+    } else {
+      range.textContent = `${formatSnapshotTsFixed(iso1)} → ${formatSnapshotTsFixed(iso2)}`;
+    }
+    strong.appendChild(range);
+    strong.appendChild(document.createTextNode(" ("));
     const dur = el("span", { className: "yb-mono pgss-activity-mono" });
     dur.textContent = formatDurationHuman(iso1, iso2);
     strong.appendChild(dur);
-    strong.appendChild(document.createTextNode(" from "));
-    const t1 = el("span", { className: "yb-mono pgss-activity-mono" });
-    t1.textContent = formatSnapshotTsFixed(iso1);
-    strong.appendChild(t1);
-    strong.appendChild(document.createTextNode(" to "));
-    const t2 = el("span", { className: "yb-mono pgss-activity-mono" });
-    t2.textContent = formatSnapshotTsFixed(iso2);
-    strong.appendChild(t2);
+    strong.appendChild(document.createTextNode(")"));
+    if (file) {
+      strong.appendChild(document.createTextNode(" — "));
+      const fn = el("span", { className: "yb-mono pgss-activity-mono" });
+      fn.textContent = String(file);
+      strong.appendChild(fn);
+    }
     wrap.appendChild(strong);
     return wrap;
   }
 
   /** ASH: same banner layout as delta pg_stat, but the interval is the snapshot’s ash_window, not time between snapshots. */
-  function ashWindowActivityBanner(doc) {
+  function ashWindowActivityBanner(doc, file) {
     const w = doc && doc.ash_window;
     if (
       w &&
@@ -1100,7 +1141,7 @@
       String(w.start_utc) !== "" &&
       String(w.end_utc) !== ""
     ) {
-      return pgStatActivityBannerDelta(w.start_utc, w.end_utc);
+      return pgStatActivityBannerDelta(w.start_utc, w.end_utc, file);
     }
     const wrap = el("div", { className: "pgss-activity-banner" });
     wrap.appendChild(
@@ -3117,6 +3158,11 @@
     lastDoc = doc;
     lastPrevDoc = prevDoc;
 
+    const curFile =
+      currentIndex >= 0 && manifestEntries[currentIndex]
+        ? manifestEntries[currentIndex].file
+        : "";
+
     const st = doc.pg_stat_statements && doc.pg_stat_statements.per_node;
     const ycqlSt = doc.ycql_stat_statements && doc.ycql_stat_statements.per_node;
     const ash = doc.yb_active_session_history && doc.yb_active_session_history.per_node;
@@ -3162,7 +3208,7 @@
         const mergedPrev = mergeStatements(prevSt);
         const deltaRows = deltaPgStatMergedRows(merged, mergedPrev);
         panelPgss.appendChild(
-          pgStatActivityBannerDelta(prevDoc.generated_at_utc, doc.generated_at_utc)
+          pgStatActivityBannerDelta(prevDoc.generated_at_utc, doc.generated_at_utc, curFile)
         );
         pgTitle = "Top 25 — pg_stat_statements (Δ vs prior snapshot)";
         pgRows = withPgStatDeltaDerivedRows(
@@ -3172,7 +3218,7 @@
         );
         pgCols = pgStatStatementColumnsDelta(pgRows, st);
       } else {
-        panelPgss.appendChild(pgStatActivityBannerAt(doc.generated_at_utc));
+        panelPgss.appendChild(pgStatActivityBannerAt(doc.generated_at_utc, curFile));
         if (prevDoc && !prevSt) {
           panelPgss.appendChild(
             el("div", {
@@ -3216,7 +3262,7 @@
           is_prepared: prepByKey.get(statementMergeKey(r)) || false,
         }));
         panelYcql.appendChild(
-          pgStatActivityBannerDelta(prevDoc.generated_at_utc, doc.generated_at_utc)
+          pgStatActivityBannerDelta(prevDoc.generated_at_utc, doc.generated_at_utc, curFile)
         );
         ycqlTitle = "Top 25 — ycql_stat_statements (Δ vs prior snapshot)";
         ycqlRows = withPgStatDeltaDerivedRows(
@@ -3226,7 +3272,7 @@
         );
         ycqlCols = ycqlStatStatementColumnsDelta();
       } else {
-        panelYcql.appendChild(pgStatActivityBannerAt(doc.generated_at_utc));
+        panelYcql.appendChild(pgStatActivityBannerAt(doc.generated_at_utc, curFile));
         if (prevDoc && !prevYcqlSt) {
           panelYcql.appendChild(
             el("div", {
@@ -3258,7 +3304,7 @@
     }
 
     if (ash) {
-      panelAsh.appendChild(ashWindowActivityBanner(doc));
+      panelAsh.appendChild(ashWindowActivityBanner(doc, curFile));
       const qF = ashQueryIdFilter;
       const nodeF = ashNodeIdFilter;
       const tableF = ashTableIdFilter;
@@ -3724,6 +3770,239 @@
     updateAshFilterToolbar();
   }
 
+  /** Manifest carries cumulative per-snapshot call totals. The bar at index i shows the call *rate*
+   * — (calls(i) − calls(i−1)) / window-seconds, clamped ≥ 0 (pg_stat resets/prunes happen and would
+   * otherwise plot huge negative spikes). Snapshot intervals vary, so plotting calls/s rather than the
+   * raw delta keeps bar heights comparable. A bar is "pending" (dim, no height) when its rate can't be
+   * computed: i = 0 has no prior, and entries written by ybtop < 0.1.11 carry no `ysql_calls`/
+   * `ycql_calls` at all — those windows (and the first window after them) are shown pending, not zero. */
+  let windowChartCollapsed = false;
+  const WINDOW_CHART_LS_KEY = "ybtop.window-chart.collapsed";
+
+  function manifestEntryTotalCalls(ent) {
+    if (!ent) return null;
+    const y = Number(ent.ysql_calls);
+    const c = Number(ent.ycql_calls);
+    const haveAny = Number.isFinite(y) || Number.isFinite(c);
+    if (!haveAny) return null;
+    return (Number.isFinite(y) ? y : 0) + (Number.isFinite(c) ? c : 0);
+  }
+
+  function deltaCallsForIndex(i) {
+    if (i <= 0) return null;
+    const cur = manifestEntryTotalCalls(manifestEntries[i]);
+    const prev = manifestEntryTotalCalls(manifestEntries[i - 1]);
+    if (cur == null || prev == null) return null;
+    const d = cur - prev;
+    return d > 0 ? d : 0;
+  }
+
+  /** Seconds spanned by window i (prior snapshot → this one), from manifest `utc` timestamps.
+   * null when either timestamp is missing/unparseable or the span is non-positive. */
+  function windowSecondsForIndex(i) {
+    if (i <= 0) return null;
+    const cur = manifestEntries[i] && manifestEntries[i].utc;
+    const prev = manifestEntries[i - 1] && manifestEntries[i - 1].utc;
+    if (!cur || !prev) return null;
+    const tc = new Date(String(cur)).getTime();
+    const tp = new Date(String(prev)).getTime();
+    if (Number.isNaN(tc) || Number.isNaN(tp)) return null;
+    const sec = (tc - tp) / 1000;
+    return sec > 0 ? sec : null;
+  }
+
+  /** Δcalls per second for window i. Snapshot intervals vary, so the chart plots this rate (not the
+   * raw Δ) to keep bar heights comparable across windows. null when the delta or span is unavailable. */
+  function callRateForIndex(i) {
+    const d = deltaCallsForIndex(i);
+    if (d === null) return null;
+    const sec = windowSecondsForIndex(i);
+    if (sec == null) return null;
+    return d / sec;
+  }
+
+  function formatCount(n) {
+    if (n == null) return "—";
+    const x = Number(n);
+    if (!Number.isFinite(x)) return "—";
+    return x.toLocaleString();
+  }
+
+  /** Compact calls/s: more precision at low rates, rounded thousands-separated at high rates. */
+  function formatRate(n) {
+    if (n == null) return "—";
+    const x = Number(n);
+    if (!Number.isFinite(x)) return "—";
+    if (x === 0) return "0";
+    if (x >= 100) return Math.round(x).toLocaleString();
+    if (x >= 10) return x.toFixed(1);
+    return x.toFixed(2);
+  }
+
+  function loadWindowChartCollapsedFromStorage() {
+    try {
+      const v = window.localStorage && window.localStorage.getItem(WINDOW_CHART_LS_KEY);
+      windowChartCollapsed = v === "1";
+    } catch (_e) {
+      windowChartCollapsed = false;
+    }
+  }
+
+  function saveWindowChartCollapsedToStorage() {
+    try {
+      if (window.localStorage) {
+        window.localStorage.setItem(WINDOW_CHART_LS_KEY, windowChartCollapsed ? "1" : "0");
+      }
+    } catch (_e) {
+      /* ignore */
+    }
+  }
+
+  function applyWindowChartCollapsedClass() {
+    const wrap = document.getElementById("window-chart");
+    if (!wrap) return;
+    wrap.classList.toggle("window-chart--collapsed", windowChartCollapsed);
+    const btn = document.getElementById("window-chart-toggle");
+    if (btn) {
+      btn.textContent = windowChartCollapsed ? "▶" : "▼";
+      btn.setAttribute("aria-expanded", windowChartCollapsed ? "false" : "true");
+    }
+  }
+
+  function renderWindowChart() {
+    const bars = document.getElementById("window-chart-bars");
+    const status = document.getElementById("window-chart-status");
+    if (!bars) return;
+    bars.textContent = "";
+    const n = manifestEntries.length;
+    if (!n) {
+      if (status) status.textContent = "";
+      return;
+    }
+    let resolved = 0;
+    let maxRate = 0;
+    const rates = new Array(n);
+    for (let i = 0; i < n; i += 1) {
+      const r = callRateForIndex(i);
+      rates[i] = r;
+      if (r !== null) {
+        resolved += 1;
+        if (r > maxRate) maxRate = r;
+      }
+    }
+    if (status) {
+      status.textContent = resolved < n - 1 ? `${resolved}/${n - 1}` : "";
+    }
+    const denom = maxRate > 0 ? maxRate : 1;
+    for (let i = 0; i < n; i += 1) {
+      const ent = manifestEntries[i];
+      const rate = rates[i];
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "window-chart-bar";
+      btn.setAttribute("role", "listitem");
+      if (i === currentIndex) btn.classList.add("window-chart-bar--current");
+      const fill = document.createElement("span");
+      fill.className = "window-chart-bar-fill";
+      if (rate === null) {
+        btn.classList.add("window-chart-bar--pending");
+      } else if (rate === 0) {
+        btn.classList.add("window-chart-bar--zero");
+      } else {
+        const pct = Math.max(2, Math.round((rate / denom) * 100));
+        fill.style.height = `${pct}%`;
+      }
+      btn.appendChild(fill);
+      const isoEnd = (ent && ent.utc) || "";
+      const endHuman =
+        formatSnapshotDatePart(isoEnd) && formatSnapshotTimePart(isoEnd)
+          ? `${formatSnapshotDatePart(isoEnd)} ${formatSnapshotTimePart(isoEnd)}`
+          : snapshotHumanFromFilename(ent.file) || ent.file;
+      const prevEnt = i > 0 ? manifestEntries[i - 1] : null;
+      const isoStart = (prevEnt && prevEnt.utc) || "";
+      const startHuman =
+        prevEnt && formatSnapshotDatePart(isoStart) && formatSnapshotTimePart(isoStart)
+          ? `${formatSnapshotDatePart(isoStart)} ${formatSnapshotTimePart(isoStart)}`
+          : prevEnt
+            ? snapshotHumanFromFilename(prevEnt.file)
+            : "";
+      let tip;
+      if (rate === null) {
+        const cum = manifestEntryTotalCalls(ent);
+        tip =
+          cum != null
+            ? `${endHuman} UTC — ${formatCount(cum)} cumulative calls`
+            : `${endHuman} UTC — no call data (snapshot predates call tracking)`;
+      } else {
+        tip = `${startHuman} → ${endHuman} UTC — ${formatRate(rate)} calls/s`;
+      }
+      wireQuickNodeIdTooltip(btn, tip);
+      btn.addEventListener("click", () => {
+        if (i !== currentIndex) showSnapshotAt(i);
+      });
+      bars.appendChild(btn);
+    }
+  }
+
+  function wireWindowChart() {
+    loadWindowChartCollapsedFromStorage();
+    applyWindowChartCollapsedClass();
+    const btn = document.getElementById("window-chart-toggle");
+    if (btn) {
+      btn.addEventListener("click", () => {
+        windowChartCollapsed = !windowChartCollapsed;
+        saveWindowChartCollapsedToStorage();
+        applyWindowChartCollapsedClass();
+      });
+    }
+  }
+
+  const MANIFEST_POLL_INTERVAL_MS = 30_000;
+  let manifestRefreshInFlight = false;
+  let manifestPollTimer = null;
+
+  /**
+   * Re-fetch the manifest, splice new entries in, drop GC'd ones, keep the user pinned to the same
+   * snapshot file when possible (so a new arrival doesn't yank them off the window they're reading).
+   * Chart + nav controls are re-rendered after; the active doc itself is not refetched.
+   */
+  async function refreshManifest() {
+    if (manifestRefreshInFlight) return;
+    manifestRefreshInFlight = true;
+    try {
+      const fresh = await loadManifest();
+      if (!Array.isArray(fresh) || !fresh.length) return;
+      const prevFile =
+        currentIndex >= 0 && manifestEntries[currentIndex]
+          ? manifestEntries[currentIndex].file
+          : null;
+      manifestEntries = fresh;
+      currentIndex = prevFile
+        ? manifestEntries.findIndex((e) => e && e.file === prevFile)
+        : manifestEntries.length - 1;
+      const btnPrev = document.getElementById("btn-prev");
+      const btnNext = document.getElementById("btn-next");
+      const btnFirst = document.getElementById("btn-first");
+      const btnLast = document.getElementById("btn-last");
+      if (btnPrev) btnPrev.disabled = currentIndex <= 0;
+      if (btnNext) btnNext.disabled = currentIndex < 0 || currentIndex >= manifestEntries.length - 1;
+      if (btnFirst) btnFirst.disabled = currentIndex <= 0;
+      if (btnLast) btnLast.disabled = currentIndex < 0 || currentIndex >= manifestEntries.length - 1;
+      const ent = currentIndex >= 0 ? manifestEntries[currentIndex] : null;
+      updateNavDisplay(currentIndex >= 0 ? currentIndex : 0, manifestEntries.length, ent, lastDoc);
+      renderWindowChart();
+    } catch (_e) {
+      /* ignore transient manifest fetch failures; retry on the next tick. */
+    } finally {
+      manifestRefreshInFlight = false;
+    }
+  }
+
+  function startManifestPolling() {
+    if (manifestPollTimer != null) return;
+    manifestPollTimer = setInterval(refreshManifest, MANIFEST_POLL_INTERVAL_MS);
+  }
+
   async function showSnapshotAt(index) {
     const app = document.getElementById("app");
     if (!manifestEntries.length) {
@@ -3743,6 +4022,7 @@
     document.getElementById("btn-next").disabled = index >= manifestEntries.length - 1;
     document.getElementById("btn-first").disabled = index <= 0;
     document.getElementById("btn-last").disabled = index >= manifestEntries.length - 1;
+    renderWindowChart();
 
     app.textContent = "Loading…";
     const navEl = document.getElementById("app-nav");
@@ -3758,6 +4038,7 @@
       app.textContent = "";
       renderDoc(doc, prevDoc);
       updateNavDisplay(index, manifestEntries.length, ent, doc);
+      renderWindowChart();
       setStatus("", false);
     } catch (e) {
       const navErr = document.getElementById("app-nav");
@@ -3778,8 +4059,6 @@
     const navEl = document.getElementById("app-nav");
     if (navEl) navEl.textContent = "";
     const len = manifestEntries.length;
-    const slider = document.getElementById("nav-slider");
-    if (slider) slider.max = String(len);
     const jump = document.getElementById("nav-jump");
     if (jump) jump.max = String(len);
     const total = document.getElementById("nav-total");
@@ -3790,7 +4069,8 @@
     const banner = el("div", { className: "err-banner" });
     banner.textContent =
       `No snapshot matches ?t=${key} — the time is invalid or that snapshot has been rotated ` +
-      `out of ybtop.manifest.json. Use First, Last, Prev, Next, or the slider to pick a window.`;
+      `out of ybtop.manifest.json. Use First, Last, Prev, Next, the call-frequency chart, ` +
+      `or the window number box to pick a window.`;
     app.appendChild(banner);
     setStatus("Snapshot not found", true);
   }
@@ -3825,22 +4105,6 @@
     document.getElementById("btn-next").addEventListener("click", navNext);
     document.getElementById("btn-first").addEventListener("click", navFirst);
     document.getElementById("btn-last").addEventListener("click", navLast);
-
-    const slider = document.getElementById("nav-slider");
-    if (slider) {
-      // Dragging: update the counter + file preview without fetching.
-      slider.addEventListener("input", () => {
-        const v = parseInt(slider.value, 10);
-        if (!Number.isFinite(v)) return;
-        const ent = manifestEntries[v - 1];
-        const jump = document.getElementById("nav-jump");
-        if (jump && document.activeElement !== jump) jump.value = String(v);
-        const fileEl = document.getElementById("nav-file");
-        if (fileEl && ent) fileEl.textContent = ` ${viewerNavFileText(ent, null)}`;
-      });
-      // Release: actually load the window the thumb landed on.
-      slider.addEventListener("change", () => jumpTo1Based(slider.value));
-    }
 
     const jump = document.getElementById("nav-jump");
     if (jump) {
@@ -3908,6 +4172,7 @@
   async function boot() {
     clearYbtopVersionPlaceholder();
     wireNav();
+    wireWindowChart();
     window.addEventListener("popstate", () => {
       readViewerStateFromUrl();
       // A history entry may point at a different window (e.g. ASH deep-link);
@@ -3952,6 +4217,8 @@
     } else {
       showSnapshotAt(manifestEntries.length - 1);
     }
+    renderWindowChart();
+    startManifestPolling();
   }
 
   boot();
