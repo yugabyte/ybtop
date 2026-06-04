@@ -114,15 +114,10 @@
     return `${d1} ${t1} → ${d2} ${t2} UTC`;
   }
 
-  // Sync the slider, editable counter, total and the overall-range label.
+  // Sync the editable counter, total and the overall-range label.
   // 1-based for humans; skips the jump box while it has focus so it doesn't
   // fight the user mid-type. `ent`/`docOrNull` retained for call-site compatibility.
   function updateNavDisplay(index, len, _ent, _docOrNull) {
-    const slider = document.getElementById("nav-slider");
-    if (slider) {
-      slider.max = String(len);
-      slider.value = String(index + 1);
-    }
     const jump = document.getElementById("nav-jump");
     if (jump) {
       jump.max = String(len);
@@ -4064,8 +4059,6 @@
     const navEl = document.getElementById("app-nav");
     if (navEl) navEl.textContent = "";
     const len = manifestEntries.length;
-    const slider = document.getElementById("nav-slider");
-    if (slider) slider.max = String(len);
     const jump = document.getElementById("nav-jump");
     if (jump) jump.max = String(len);
     const total = document.getElementById("nav-total");
@@ -4076,7 +4069,8 @@
     const banner = el("div", { className: "err-banner" });
     banner.textContent =
       `No snapshot matches ?t=${key} — the time is invalid or that snapshot has been rotated ` +
-      `out of ybtop.manifest.json. Use First, Last, Prev, Next, or the slider to pick a window.`;
+      `out of ybtop.manifest.json. Use First, Last, Prev, Next, the call-frequency chart, ` +
+      `or the window number box to pick a window.`;
     app.appendChild(banner);
     setStatus("Snapshot not found", true);
   }
@@ -4111,19 +4105,6 @@
     document.getElementById("btn-next").addEventListener("click", navNext);
     document.getElementById("btn-first").addEventListener("click", navFirst);
     document.getElementById("btn-last").addEventListener("click", navLast);
-
-    const slider = document.getElementById("nav-slider");
-    if (slider) {
-      // Dragging: update the counter + file preview without fetching.
-      slider.addEventListener("input", () => {
-        const v = parseInt(slider.value, 10);
-        if (!Number.isFinite(v)) return;
-        const jump = document.getElementById("nav-jump");
-        if (jump && document.activeElement !== jump) jump.value = String(v);
-      });
-      // Release: actually load the window the thumb landed on.
-      slider.addEventListener("change", () => jumpTo1Based(slider.value));
-    }
 
     const jump = document.getElementById("nav-jump");
     if (jump) {

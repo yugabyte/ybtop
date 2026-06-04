@@ -110,16 +110,6 @@ body {
   color: var(--yb-link);
 }
 
-.nav-slider {
-  flex: 1 1 8rem;
-  max-width: 16rem;
-  min-width: 6rem;
-  margin: 0 0.35rem;
-  align-self: center;
-  accent-color: var(--yb-accent);
-  cursor: pointer;
-}
-
 .nav-jump {
   width: 3.5rem;
   padding: 0.2rem 0.35rem;
