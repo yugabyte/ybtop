@@ -47,6 +47,7 @@ class Settings:
     snapshot_ash_per_node: int = SNAPSHOT_ASH_PER_NODE
     snapshot_ash_top_tables: int = SNAPSHOT_ASH_TOP_TABLES
     snapshot_collect_table_ddl: bool = False
+    snapshot_compress: bool = False
     log_enabled: bool = True
     log_file: Optional[str] = None
     log_level: str = DEFAULT_LOG_LEVEL

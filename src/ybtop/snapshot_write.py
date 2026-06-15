@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextvars
 import glob
+import gzip
 import json
 import os
 import re
@@ -40,7 +41,7 @@ def _serialize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return json.loads(json.dumps(rows, default=_json_default))
 
 
-def _atomic_write_json(path: Path, payload: Any) -> None:
+def _atomic_write_json(path: Path, payload: Any, *, compress: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     data = json.dumps(payload, indent=2, default=_json_default).encode("utf-8")
     fd, tmp = tempfile.mkstemp(
@@ -50,7 +51,10 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
     )
     try:
         with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
+            if compress:
+                fh.write(gzip.compress(data))
+            else:
+                fh.write(data)
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
@@ -360,30 +364,33 @@ def load_snapshot_json(output_dir: Path, filename: str) -> Optional[dict[str, An
     if not path.is_file():
         return None
     try:
+        if filename.endswith(".gz"):
+            return json.loads(gzip.decompress(path.read_bytes()).decode("utf-8"))
         return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError, gzip.BadGzipFile):
         return None
 
 
-def _snapshot_filename_ts(when: datetime) -> str:
-    """UTC timestamp for ybtop.out.YYYYMMDD_HHMMSS.json"""
+def _snapshot_filename_ts(when: datetime, *, compress: bool = False) -> str:
     w = when.astimezone(timezone.utc)
-    return f"{SNAPSHOT_FILE_PREFIX}{w.strftime('%Y%m%d_%H%M%S')}.json"
+    ext = ".json.gz" if compress else ".json"
+    return f"{SNAPSHOT_FILE_PREFIX}{w.strftime('%Y%m%d_%H%M%S')}{ext}"
 
 
 def write_snapshot_and_update_manifest(
     *,
     output_dir: Path,
     document: dict[str, Any],
+    compress: bool = False,
 ) -> Path:
     """Write snapshot JSON and append relative entry to ybtop.manifest.json."""
     with stage_timer("write_snapshot", _log):
         output_dir = output_dir.resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
         ts = _parse_iso_utc(document["generated_at_utc"])
-        name = _snapshot_filename_ts(ts)
+        name = _snapshot_filename_ts(ts, compress=compress)
         snap_path = output_dir / name
-        _atomic_write_json(snap_path, document)
+        _atomic_write_json(snap_path, document, compress=compress)
         snap_bytes = snap_path.stat().st_size
 
         manifest_path = output_dir / MANIFEST_FILENAME
@@ -433,7 +440,6 @@ def gc_snapshots_and_manifest(
     with stage_timer("gc_snapshots", _log, retention_hours=retention_hours):
         output_dir = output_dir.resolve()
         cutoff = (now or datetime.now(timezone.utc)) - timedelta(hours=retention_hours)
-        pattern = str(output_dir / f"{SNAPSHOT_FILE_PREFIX}*.json")
         manifest_path = output_dir / MANIFEST_FILENAME
         deleted = 0
 
@@ -444,7 +450,10 @@ def gc_snapshots_and_manifest(
             except OSError:
                 return None
 
-        for path in glob.glob(pattern):
+        for path in (
+            glob.glob(str(output_dir / f"{SNAPSHOT_FILE_PREFIX}*.json"))
+            + glob.glob(str(output_dir / f"{SNAPSHOT_FILE_PREFIX}*.json.gz"))
+        ):
             p = Path(path)
             mt = file_mtime_utc(p)
             if mt is not None and mt < cutoff:

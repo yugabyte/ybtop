@@ -57,6 +57,19 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
             ctype = "application/octet-stream"
         self._send_bytes(path.read_bytes(), ctype)
 
+    def _send_file_compressed_json(self, base: Path, rel: str) -> None:
+        path = self._resolve_static(base, rel)
+        if path is None:
+            return
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _send_head_for(self, base: Path, rel: str) -> None:
         path = self._resolve_static(base, rel)
         if path is None:
@@ -77,7 +90,7 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
         if path.startswith("/static/"):
             self._send_head_for(_web_dir(), path[len("/static/") :])
             return
-        if path.endswith(".json"):
+        if path.endswith(".json") or path.endswith(".json.gz"):
             name = path.lstrip("/")
             if ".." in name or "/" in name.strip("/"):
                 self.send_error(403)
@@ -106,12 +119,15 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
             self._send_file_from(_web_dir(), rel)
             return
 
-        if path.endswith(".json"):
+        if path.endswith(".json") or path.endswith(".json.gz"):
             name = path.lstrip("/")
             if ".." in name or "/" in name.strip("/"):
                 self.send_error(403)
                 return
-            self._send_file_from(type(self).data_dir, name)
+            if path.endswith(".json.gz"):
+                self._send_file_compressed_json(type(self).data_dir, name)
+            else:
+                self._send_file_from(type(self).data_dir, name)
             return
 
         self.send_error(404)
