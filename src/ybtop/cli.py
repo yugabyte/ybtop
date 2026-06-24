@@ -115,7 +115,7 @@ def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
                     collect_table_ddl=settings.snapshot_collect_table_ddl,
                     node_parallelism=settings.node_parallelism,
                 )
-                    write_snapshot_and_update_manifest(output_dir=out_dir, document=doc)
+                    write_snapshot_and_update_manifest(output_dir=out_dir, document=doc, compress=settings.snapshot_compress)
                     gc_snapshots_and_manifest(
                         output_dir=out_dir,
                         retention_hours=settings.snapshot_retention_hours,
@@ -348,6 +348,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     w.add_argument(
+        "--compress-snapshots",
+        action="store_true",
+        help="Write snapshot files as gzip-compressed JSON (.json.gz) instead of plain JSON.",
+    )
+    w.add_argument(
         "--node-parallelism",
         type=int,
         default=DEFAULT_NODE_PARALLELISM,
@@ -484,6 +489,7 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
             getattr(args, "snapshot_ash_top_tables", SNAPSHOT_ASH_TOP_TABLES)
         ),
         snapshot_collect_table_ddl=bool(getattr(args, "snapshot_table_ddl", False)),
+        snapshot_compress=bool(getattr(args, "compress_snapshots", False)),
         log_enabled=not bool(getattr(args, "no_log_file", False)),
         log_file=getattr(args, "log_file", None),
         log_level=str(getattr(args, "log_level", DEFAULT_LOG_LEVEL)),

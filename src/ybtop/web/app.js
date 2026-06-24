@@ -76,7 +76,7 @@
 
   /** Older manifests may omit `utc`; filename uses UTC `ybtop.out.YYYYMMDD_HHMMSS.json`. */
   function snapshotHumanFromFilename(file) {
-    const m = /^ybtop\.out\.(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.json$/i.exec(file || "");
+    const m = /^ybtop\.out\.(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.json(?:\.gz)?$/i.exec(file || "");
     if (!m) return "";
     const y = Number(m[1]);
     const mo = Number(m[2]);
@@ -95,7 +95,7 @@
    * it survives new snapshots arriving and old ones being GC'd.
    */
   function snapshotTimeKeyFromFile(file) {
-    const m = /^ybtop\.out\.(\d{8}_\d{6})\.json$/i.exec(file || "");
+    const m = /^ybtop\.out\.(\d{8}_\d{6})\.json(?:\.gz)?$/i.exec(file || "");
     return m ? m[1] : null;
   }
 
