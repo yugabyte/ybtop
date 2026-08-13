@@ -209,7 +209,7 @@ def detect_modes(
         return result
 
     # Stage 2 - Valley / significance check on raw (unsmoothed) counts. Keep every valid
-    # adjacent peak pair; peak_pairs[0] is the lowest-latency separation (reported gap).
+    # adjacent peak pair (low→high latency). The report/viewer list all of them in the gap column.
     valid_pairs: list[dict[str, Any]] = []
     for i in range(len(peaks) - 1):
         p1, p2 = int(peaks[i]), int(peaks[i + 1])

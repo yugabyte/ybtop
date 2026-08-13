@@ -148,6 +148,9 @@
   let ashNodeIdFilter = null;
   let ashTableIdFilter = null;
 
+  /** Latency modes tab: include the dip_p column when true (browser-only UI preference). */
+  let latencyShowDipP = true;
+
   const VIEWER_SECTION_IDS = ["pgss", "ycql", "ash", "tablets", "latency"];
 
   /**
@@ -3568,14 +3571,14 @@
       members.forEach((r) => {
         if (r.n_raw_peaks) peakSet.add(r.n_raw_peaks);
       });
-      // Primary peak-pair gap (ms / ratio) across members that reached the peak-pair stage.
+      // Adjacent peak-pair gaps (ms / ratio) across all pairs of every member.
       const gapMs = [];
       const gapRatio = [];
       members.forEach((r) => {
-        if (r.peak_pairs && r.peak_pairs.length) {
-          gapMs.push(r.peak_pairs[0].gap_ms);
-          if (r.peak_pairs[0].gap_ratio != null) gapRatio.push(r.peak_pairs[0].gap_ratio);
-        }
+        (r.peak_pairs || []).forEach((pp) => {
+          if (pp.gap_ms != null) gapMs.push(pp.gap_ms);
+          if (pp.gap_ratio != null) gapRatio.push(pp.gap_ratio);
+        });
       });
       summaries.push({
         template: key,
@@ -3584,6 +3587,8 @@
         best_confidence_tier: best.confidence_tier || "not_flagged",
         queryids: members.map((r) => r.queryid),
         peak_counts: Array.from(peakSet).sort((a, b) => a - b),
+        // Best member's full adjacent-pair list (display); ranges span every pair.
+        peak_pairs: (best.peak_pairs || []).slice(),
         gap_ms_range: gapMs.length ? [Math.min(...gapMs), Math.max(...gapMs)] : null,
         gap_ratio_range: gapRatio.length ? [Math.min(...gapRatio), Math.max(...gapRatio)] : null,
       });
@@ -3646,11 +3651,17 @@
     return `${histFmt(r.latency_min_ms)}-${histFmt(r.latency_max_ms)}ms${rt}`;
   }
 
-  function histGapStr(r) {
-    if (!r.peak_pairs || !r.peak_pairs.length) return "";
-    const pp = r.peak_pairs[0];
+  function histFormatPeakPair(pp) {
+    if (!pp) return "";
     const rt = pp.gap_ratio != null ? `(x${histFmt(pp.gap_ratio, 1)})` : "";
     return `${histFmt(pp.peak1_ms)}->${histFmt(pp.peak2_ms)}ms${rt}`;
+  }
+
+  /** All valid adjacent mode splits, comma-separated (low→high latency). */
+  function histGapStr(r) {
+    const pairs = (r && r.peak_pairs) || [];
+    if (!pairs.length) return "";
+    return pairs.map(histFormatPeakPair).join(", ");
   }
 
   function renderLatencyPanel(panel, doc, prevDoc) {
@@ -3719,16 +3730,37 @@
     flagWrap.appendChild(flagChk);
     flagWrap.appendChild(el("span", { textContent: "flagged only" }));
     controls.appendChild(flagWrap);
+
+    const dipWrap = el("label", { className: "latency-control" });
+    const dipChk = el("input", { type: "checkbox" });
+    dipChk.checked = !!latencyShowDipP;
+    dipWrap.appendChild(dipChk);
+    dipWrap.appendChild(el("span", { textContent: "show dip_p" }));
+    controls.appendChild(dipWrap);
     panel.appendChild(controls);
 
     const legend = el("div", { className: "latency-legend" });
     legend.appendChild(
       el("div", {
         className: "latency-legend-title",
-        textContent: "Reading spread vs. gap",
+        textContent: "Reading the columns",
       })
     );
     [
+      [
+        "bc",
+        "Bimodality coefficient (Sarle): (skew\u00b2 + 1) / kurtosis over log\u2082 latency midpoints. " +
+          "A uniform distribution is ~0.556; values above that threshold (~0.555) pass the " +
+          "prescreen as possibly multimodal. Higher bc means a more two-humped shape, but bc " +
+          "alone is not the confirmation \u2014 peaks + valley (and dip_p when available) decide.",
+      ],
+      [
+        "dip_p",
+        "Hartigan dip-test p-value against unimodality (lower = stronger evidence of multiple " +
+          "modes). Used for confidence tiers when a precomputed sidecar is present " +
+          "(very_high \u2264 0.001, high \u2264 0.01). In pure browser detection this column is empty " +
+          "(\u2014) because the dip test does not run client-side \u2014 use the show dip_p toggle to hide it.",
+      ],
       [
         "peaks",
         "How many latency modes (speed classes) survived smoothing. 2+ is what makes a " +
@@ -3742,12 +3774,12 @@
       ],
       [
         "gap",
-        "The split itself, shown as fast peak \u2192 slow peak with (\u00d7 slow\u00f7fast) \u2014 the " +
-          "two dominant modes from peaks. Example: 5\u219280ms (\u00d716) means the slow " +
-          "\u201cpersonality\u201d runs ~16\u00d7 slower than the fast one. This is the number that says " +
-          "\u201cfast calls vs. slow calls,\u201d and the ratio hints at the cause (a ~2\u00d7 gap looks " +
-          "like cache hit/miss; a 10\u2013100\u00d7 gap looks more like retries, leader/follower reads, " +
-          "or cross-AZ hops).",
+        "Each adjacent mode split, shown as fast peak \u2192 slow peak with (\u00d7 slow\u00f7fast), " +
+          "comma-separated when there are 3+ modes (low\u2192high latency). Example: " +
+          "5\u219280ms (\u00d716), 80\u2192400ms (\u00d75) means three speed classes with those two " +
+          "separations. The ratio hints at the cause (a ~2\u00d7 gap looks like cache hit/miss; a " +
+          "10\u2013100\u00d7 gap looks more like retries, leader/follower reads, or cross-AZ hops). " +
+          "This is distinct from spread (overall min\u2013max range).",
       ],
     ].forEach(([k, v]) => {
       const row = el("div", { className: "latency-legend-row" });
@@ -3792,14 +3824,18 @@
         { key: "rank", label: "rank", type: "number", align: "right" },
         { key: "calls", label: "calls", type: "number", align: "right" },
         { key: "bc", label: "bc", type: "number", align: "right" },
-        { key: "dip_p", label: "dip_p", align: "right" },
+      ];
+      if (latencyShowDipP) {
+        cols.push({ key: "dip_p", label: "dip_p", align: "right" });
+      }
+      cols.push(
         { key: "peaks", label: "peaks", type: "number", align: "right" },
         { key: "spread", label: "spread" },
         { key: "gap", label: "gap" },
         { key: "tmpl", label: "tmpl" },
         { key: "queryid", label: "queryid" },
-        { key: "query", label: "query" },
-      ];
+        { key: "query", label: "query" }
+      );
       tableHolder.textContent = "";
       const total = analysis.results.length;
       const flaggedN = analysis.results.filter((r) => r.flag).length;
@@ -3819,11 +3855,7 @@
           best_tier: g.best_confidence_tier,
           members: g.member_count,
           peaks: (g.peak_counts || []).join(",") || "",
-          gap: g.gap_ms_range
-            ? g.gap_ms_range[0] === g.gap_ms_range[1]
-              ? `${histFmt(g.gap_ms_range[0])}ms`
-              : `${histFmt(g.gap_ms_range[0])}-${histFmt(g.gap_ms_range[1])}ms`
-            : "",
+          gap: histGapStr(g),
           queryids: (g.queryids || []).join(", "),
           template: g.template,
         }));
@@ -3857,6 +3889,10 @@
     });
     flagChk.addEventListener("change", () => {
       state.flaggedOnly = flagChk.checked;
+      rerender();
+    });
+    dipChk.addEventListener("change", () => {
+      latencyShowDipP = dipChk.checked;
       rerender();
     });
     rerender();

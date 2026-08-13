@@ -168,8 +168,23 @@ def _fmt_num(v: Any, digits: int = 2) -> str:
         return str(v)
 
 
+def _format_peak_pair(pp: dict[str, Any]) -> str:
+    """One adjacent mode split: 'p1->p2ms(xR)'."""
+    s = f"{_fmt_num(pp.get('peak1_ms'))}->{_fmt_num(pp.get('peak2_ms'))}ms"
+    if pp.get("gap_ratio") is not None:
+        s += f"(x{_fmt_num(pp.get('gap_ratio'), 1)})"
+    return s
+
+
+def _format_peak_pairs(pairs: Any) -> str:
+    """All valid adjacent mode splits, comma-separated (low→high latency)."""
+    if not pairs:
+        return ""
+    return ", ".join(_format_peak_pair(pp) for pp in pairs)
+
+
 def _spread_suffix(r: dict[str, Any]) -> str:
-    """'peaks=.. spread=lo-hims(xR) gap=p1->p2ms(xGR)' -- gap from the primary peak pair."""
+    """'peaks=.. spread=lo-hims(xR) gap=p1->p2ms(xGR)[, p2->p3ms(...)]' — every valid peak pair."""
     parts: list[str] = []
     n_peaks = r.get("n_raw_peaks")
     if n_peaks is not None:
@@ -182,13 +197,9 @@ def _spread_suffix(r: dict[str, Any]) -> str:
         if ratio is not None:
             spread += f"(x{_fmt_num(ratio, 0)})"
         parts.append(spread)
-    pairs = r.get("peak_pairs")
-    if pairs:
-        pp = pairs[0]
-        gap = f"gap={_fmt_num(pp.get('peak1_ms'))}->{_fmt_num(pp.get('peak2_ms'))}ms"
-        if pp.get("gap_ratio") is not None:
-            gap += f"(x{_fmt_num(pp.get('gap_ratio'), 1)})"
-        parts.append(gap)
+    gap = _format_peak_pairs(r.get("peak_pairs"))
+    if gap:
+        parts.append(f"gap={gap}")
     return (" " + " ".join(parts)) if parts else ""
 
 
@@ -227,18 +238,22 @@ def _row_line(r: dict[str, Any]) -> str:
 def _group_line(g: dict[str, Any]) -> str:
     peaks = ",".join(str(p) for p in (g.get("peak_counts") or [])) or "-"
     gap = ""
-    gr = g.get("gap_ms_range")
-    ratio = g.get("gap_ratio_range")
-    if gr:
-        gtxt = _fmt_num(gr[0]) if gr[0] == gr[1] else f"{_fmt_num(gr[0])}-{_fmt_num(gr[1])}"
-        rtxt = ""
-        if ratio:
-            rtxt = (
-                f"(x{_fmt_num(ratio[0], 1)})"
-                if ratio[0] == ratio[1]
-                else f"(x{_fmt_num(ratio[0], 1)}-{_fmt_num(ratio[1], 1)})"
-            )
-        gap = f" gap={gtxt}ms{rtxt}"
+    pairs_txt = _format_peak_pairs(g.get("peak_pairs"))
+    if pairs_txt:
+        gap = f" gap={pairs_txt}"
+    else:
+        gr = g.get("gap_ms_range")
+        ratio = g.get("gap_ratio_range")
+        if gr:
+            gtxt = _fmt_num(gr[0]) if gr[0] == gr[1] else f"{_fmt_num(gr[0])}-{_fmt_num(gr[1])}"
+            rtxt = ""
+            if ratio:
+                rtxt = (
+                    f"(x{_fmt_num(ratio[0], 1)})"
+                    if ratio[0] == ratio[1]
+                    else f"(x{_fmt_num(ratio[0], 1)}-{_fmt_num(ratio[1], 1)})"
+                )
+            gap = f" gap={gtxt}ms{rtxt}"
     tmpl = " ".join(str(g.get("template") or "").split())
     if len(tmpl) > 120:
         tmpl = tmpl[:117] + "..."

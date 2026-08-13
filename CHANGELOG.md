@@ -11,6 +11,11 @@ All notable functional changes to **ybtop** are listed here by release. Format f
 - **Browser (Latency modes tab):** When a snapshot carries `latency_histograms`, the viewer shows a **Latency modes** tab with the same cumulative/delta convention as the statement tabs (delta vs prior snapshot when available). Runs Stages 0-2 plus template grouping in the browser with min-tier / flagged-only filters. The Hartigan dip test is not available in the browser, so shape-flagged rows are reported as **`unconfirmed`**; run `ybtop histogram` for dip-test confirmation and FDR-corrected tiers.
 - **Precomputed analysis sidecars (offline dip-confirmed browser view):** **`ybtop watch --snapshot-latency-analysis`** (implies `--snapshot-latency-histograms`) writes an **`ybtop.latency.<ts>.json`** sidecar next to each snapshot — the full report (cumulative **and** delta vs prior) including the **dip test** and **FDR** — and records it on the manifest entry (`latency_analysis`). The **Latency modes** tab prefers this sidecar when present, showing real `dip_p` and confirmed tiers with a **dip-confirmed** badge (no statistics run in the browser); it falls back to the in-browser Stages 0-2 detector otherwise. Because the sidecar contains only precomputed numbers, no GPL-licensed detector code (numpy/scipy/**diptest**) ships with ybtop or the viewer — the optional `[histogram]` extra runs only at analysis time. Sidecars are pruned alongside their snapshots by retention GC. Collection/analysis is best-effort: if the extra is not installed, `watch` logs a one-time note and keeps writing snapshots.
 
+### Changed
+
+- **Latency gap column lists every adjacent mode split:** when 3+ peaks are detected, **`gap`** (CLI + Latency modes tab) shows all valid peak pairs comma-separated (low→high latency), e.g. `2→20ms(×10), 20→200ms(×10)`, instead of only the lowest-latency pair. Template summaries use the best member's full pair list; cross-member `gap_*_range` aggregates every pair.
+- **Latency modes legend + dip_p toggle (browser):** the Latency modes legend now also explains **`bc`** (bimodality coefficient) and **`dip_p`** (Hartigan dip-test p-value). A **show dip_p** control hides or shows the `dip_p` column without changing analysis.
+
 ## [0.1.11] — 2026-06-03
 
 ### Added

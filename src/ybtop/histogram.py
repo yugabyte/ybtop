@@ -313,15 +313,16 @@ def group_by_query_template(results: list[dict[str, Any]]) -> list[dict[str, Any
         peak_counts = sorted(
             {int(r["n_raw_peaks"]) for r in members if r.get("n_raw_peaks")}
         )
-        # Primary peak-pair gap (ms / ratio) across members that reached the peak-pair stage.
+        # Adjacent peak-pair gaps (ms / ratio) across all pairs of every member that
+        # reached the peak-pair stage — used for cross-member range summaries.
         gap_ms_vals: list[float] = []
         gap_ratio_vals: list[float] = []
         for r in members:
-            pairs = r.get("peak_pairs")
-            if pairs:
-                gap_ms_vals.append(float(pairs[0]["gap_ms"]))
-                if pairs[0].get("gap_ratio") is not None:
-                    gap_ratio_vals.append(float(pairs[0]["gap_ratio"]))
+            for pp in r.get("peak_pairs") or []:
+                if pp.get("gap_ms") is not None:
+                    gap_ms_vals.append(float(pp["gap_ms"]))
+                if pp.get("gap_ratio") is not None:
+                    gap_ratio_vals.append(float(pp["gap_ratio"]))
         summaries.append(
             {
                 "template": key,
@@ -330,6 +331,8 @@ def group_by_query_template(results: list[dict[str, Any]]) -> list[dict[str, Any
                 "best_confidence_tier": best.get("confidence_tier", "not_flagged"),
                 "queryids": [r.get("queryid") for r in members],
                 "peak_counts": peak_counts,
+                # Best member's full adjacent-pair list (display); ranges span every pair.
+                "peak_pairs": list(best.get("peak_pairs") or []),
                 "gap_ms_range": [min(gap_ms_vals), max(gap_ms_vals)] if gap_ms_vals else None,
                 "gap_ratio_range": (
                     [min(gap_ratio_vals), max(gap_ratio_vals)] if gap_ratio_vals else None
