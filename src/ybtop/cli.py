@@ -33,7 +33,6 @@ from ybtop.config import (
     DEFAULT_YSQL_USER,
     SNAPSHOT_ASH_PER_NODE,
     SNAPSHOT_ASH_TOP_TABLES,
-    SNAPSHOT_LATENCY_HISTOGRAMS_PER_NODE,
     SNAPSHOT_STATEMENTS_PER_NODE,
     Settings,
     load_dsn_from_env_or_none,
@@ -161,7 +160,6 @@ def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
                         ash_top_tables=settings.snapshot_ash_top_tables,
                     collect_table_ddl=settings.snapshot_collect_table_ddl,
                     latency_histograms=settings.snapshot_latency_histograms,
-                    latency_histograms_per_node=settings.snapshot_latency_histograms_per_node,
                     node_parallelism=settings.node_parallelism,
                 )
                     snap_path = write_snapshot_and_update_manifest(output_dir=out_dir, document=doc, compress=settings.snapshot_compress)
@@ -410,17 +408,10 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Collect per-statement yb_latency_histogram values into each snapshot (opt-in; "
             "enables the 'ybtop histogram' analysis and the viewer's Latency modes tab). "
-            "No-op on clusters without the yb_latency_histogram column."
-        ),
-    )
-    w.add_argument(
-        "--snapshot-latency-histograms-per-node",
-        type=int,
-        default=SNAPSHOT_LATENCY_HISTOGRAMS_PER_NODE,
-        metavar="N",
-        help=(
-            "Top N statements (by call count) per node whose latency histograms are stored "
-            "when --snapshot-latency-histograms is set."
+            "Pulled with the existing top-N-by-total-time pg_stat_statements query "
+            "(--snapshot-statements-per-node); NULL histograms coalesce to empty jsonb and "
+            "are omitted from the latency_histograms section. No-op on clusters without the "
+            "yb_latency_histogram column."
         ),
     )
     w.add_argument(
@@ -608,13 +599,6 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         snapshot_latency_histograms=bool(getattr(args, "snapshot_latency_histograms", False))
         or bool(getattr(args, "snapshot_latency_analysis", False)),
         snapshot_latency_analysis=bool(getattr(args, "snapshot_latency_analysis", False)),
-        snapshot_latency_histograms_per_node=int(
-            getattr(
-                args,
-                "snapshot_latency_histograms_per_node",
-                SNAPSHOT_LATENCY_HISTOGRAMS_PER_NODE,
-            )
-        ),
         snapshot_compress=bool(getattr(args, "compress_snapshots", False)),
         log_enabled=not bool(getattr(args, "no_log_file", False)),
         log_file=getattr(args, "log_file", None),

@@ -62,7 +62,7 @@ Optional sections (when enabled / applicable):
 
 - **`ash_top_tables`** – top **`table_id`** values by total ASH **samples** across nodes (default top **25**).  
 - **`table_schemas.by_table_id`** – **YSQL** DDL for those tables/indexes when **`--snapshot-table-ddl`** is set (YCQL schema is not collected via YSQL).  
-- **`latency_histograms.per_node`** – per statement (top **N** by call count), the **`yb_latency_histogram`** normalized to a flat `{bucket_label: count}` map, plus `queryid`, `query`, `dbname`, and `calls`, when **`--snapshot-latency-histograms`** is set. Counts are cumulative; `ybtop histogram` and the viewer compute deltas by subtracting consecutive snapshots.  
+- **`latency_histograms.per_node`** – per statement from the same top-N-by-total-time **`pg_stat_statements`** set (**`--snapshot-statements-per-node`**), the **`yb_latency_histogram`** normalized to a flat `{bucket_label: count}` map, plus `queryid`, `query`, `dbname`, and `calls`, when **`--snapshot-latency-histograms`** is set. NULL histograms coalesce to empty jsonb and are omitted. Counts are cumulative; `ybtop histogram` and the viewer compute deltas by subtracting consecutive snapshots.  
 
 - **`ybtop.latency.<ts>.json`** (sidecar) – present when the snapshot was captured with **`--snapshot-latency-analysis`**: the precomputed dip-confirmed report (`cumulative` + `delta`, unfiltered) that the viewer's **Latency modes** tab loads for offline confirmed tiers. Referenced from the manifest entry's **`latency_analysis`** field and pruned alongside its snapshot by retention GC.  
 

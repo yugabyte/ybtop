@@ -82,18 +82,35 @@ def normalize_latency_histogram(raw: Any) -> dict[str, int]:
 
 
 def _normalize_latency_histogram_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build latency-histogram section rows from a pg_stat_statements pull.
+
+    Empty histograms (NULL coalesced to ``{}`` at query time, or otherwise empty / all-zero
+    after normalization) are dropped so later merge/delta/detection ignore them.
+    """
     out: list[dict[str, Any]] = []
     for r in rows:
+        buckets = {
+            label: cnt
+            for label, cnt in normalize_latency_histogram(r.get("yb_latency_histogram")).items()
+            if cnt > 0
+        }
+        if not buckets:
+            continue
         out.append(
             {
                 "queryid": r.get("queryid"),
                 "query": r.get("query"),
                 "dbname": r.get("dbname"),
                 "calls": int(r.get("calls") or 0),
-                "yb_latency_histogram": normalize_latency_histogram(r.get("yb_latency_histogram")),
+                "yb_latency_histogram": buckets,
             }
         )
     return out
+
+
+def _strip_latency_histogram_column(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop ``yb_latency_histogram`` from statement rows before storing pg_stat_statements."""
+    return [{k: v for k, v in r.items() if k != "yb_latency_histogram"} for r in rows]
 
 
 def _atomic_write_json(path: Path, payload: Any, *, compress: bool = False) -> None:
@@ -130,7 +147,6 @@ def build_snapshot_document(
     ash_top_tables: int = 25,
     collect_table_ddl: bool = False,
     latency_histograms: bool = False,
-    latency_histograms_per_node: int = 100,
     node_parallelism: int = DEFAULT_NODE_PARALLELISM,
 ) -> dict[str, Any]:
     with stage_timer("build_snapshot", _log, scope_total=True):
@@ -145,7 +161,6 @@ def build_snapshot_document(
                 ash_top_tables=ash_top_tables,
                 collect_table_ddl=collect_table_ddl,
                 latency_histograms=latency_histograms,
-                latency_histograms_per_node=latency_histograms_per_node,
                 node_parallelism=node_parallelism,
             )
 
@@ -172,16 +187,27 @@ def _collect_one_node(
     statements_per_node: int,
     ash_per_node: int,
     collect_latency_histograms: bool,
-    latency_histograms_per_node: int,
 ) -> _NodeCollectResult:
     nid = node_id(node)
     dsn = dsn_for_node(seed_dsn, node)
     latency_histograms: list[dict[str, Any]] = []
+    want_hist = collect_latency_histograms and caps.pg_stat_latency_histogram
     with stage_timer("collect_node", _log, node_id=nid, node_total=True, node_count=node_count):
         with connect(dsn) as conn:
             with stage_timer("pg_stat_statements_top", _log, node_id=nid) as st:
-                pg_stat = _serialize_rows(Q.pg_stat_statements_top(conn, statements_per_node, caps))
-                st.row_count = len(pg_stat)
+                pg_stat_raw = _serialize_rows(
+                    Q.pg_stat_statements_top(
+                        conn,
+                        statements_per_node,
+                        caps,
+                        include_latency_histogram=want_hist,
+                    )
+                )
+                st.row_count = len(pg_stat_raw)
+            if want_hist:
+                # Same top-N-by-time pull; empty COALESCE'd histograms are dropped.
+                latency_histograms = _normalize_latency_histogram_rows(pg_stat_raw)
+            pg_stat = _strip_latency_histogram_column(pg_stat_raw)
             with stage_timer("ycql_stat_statements_top", _log, node_id=nid) as st:
                 ycql = _serialize_rows(Q.ycql_stat_statements_top(conn, statements_per_node))
                 st.row_count = len(ycql)
@@ -198,16 +224,6 @@ def _collect_one_node(
             with stage_timer("yb_local_tablets_rows", _log, node_id=nid) as st:
                 tablets = _serialize_rows(Q.yb_local_tablets_rows(conn))
                 st.row_count = len(tablets)
-            if collect_latency_histograms and caps.pg_stat_latency_histogram:
-                with stage_timer("pg_stat_latency_histograms_top", _log, node_id=nid) as st:
-                    latency_histograms = _normalize_latency_histogram_rows(
-                        _serialize_rows(
-                            Q.pg_stat_latency_histograms_top(
-                                conn, latency_histograms_per_node, caps
-                            )
-                        )
-                    )
-                    st.row_count = len(latency_histograms)
     return _NodeCollectResult(
         nid=nid,
         pg_stat=pg_stat,
@@ -229,7 +245,6 @@ def _collect_nodes_parallel(
     statements_per_node: int,
     ash_per_node: int,
     collect_latency_histograms: bool,
-    latency_histograms_per_node: int,
     node_parallelism: int,
 ) -> tuple[
     dict[str, list[dict[str, Any]]],
@@ -255,7 +270,6 @@ def _collect_nodes_parallel(
         "statements_per_node": statements_per_node,
         "ash_per_node": ash_per_node,
         "collect_latency_histograms": collect_latency_histograms,
-        "latency_histograms_per_node": latency_histograms_per_node,
     }
 
     def _run(node: YsqlNode) -> _NodeCollectResult:
@@ -302,7 +316,6 @@ def _build_snapshot_document_impl(
     ash_top_tables: int = 25,
     collect_table_ddl: bool = False,
     latency_histograms: bool = False,
-    latency_histograms_per_node: int = 100,
     node_parallelism: int = DEFAULT_NODE_PARALLELISM,
 ) -> dict[str, Any]:
     ash_window_sec = round((ash_end - ash_start).total_seconds(), 2)
@@ -347,7 +360,6 @@ def _build_snapshot_document_impl(
         statements_per_node=statements_per_node,
         ash_per_node=ash_per_node,
         collect_latency_histograms=latency_histograms,
-        latency_histograms_per_node=latency_histograms_per_node,
         node_parallelism=node_parallelism,
     )
 
@@ -403,7 +415,8 @@ def _build_snapshot_document_impl(
         doc["table_schemas"] = {"by_table_id": table_schemas}
     if latency_histograms:
         doc["latency_histograms"] = {
-            "limit": latency_histograms_per_node,
+            # Same top-N-by-total-time set as pg_stat_statements; empty histograms omitted.
+            "limit": statements_per_node,
             "supported": bool(caps.pg_stat_latency_histogram),
             "per_node": latency_histograms_per_node_out,
         }
