@@ -3168,7 +3168,7 @@
   // Latency-histogram multimodality (browser port of histogram.py / histogram_detect.py).
   // Stages 0-2 + template grouping run here; the Hartigan dip test (Stage 3) needs the
   // native diptest package and is skipped in the browser, so shape-flagged rows land in the
-  // "unconfirmed" tier. The Python CLI (ybtop histogram) runs the dip test when installed.
+  // "unconfirmed" tier. Capture with watch --snapshot-latency-analysis for dip-confirmed sidecars.
   // Thresholds are kept identical to the Python detector.
   // ------------------------------------------------------------------------------------
   const HIST_TIER_RANK = {
@@ -3600,7 +3600,7 @@
   }
 
   function analyzeLatencyDoc(doc, prevDoc) {
-    // Prefer a precomputed (dip-confirmed) sidecar when watch/histogram --write produced one:
+    // Prefer a precomputed (dip-confirmed) sidecar when watch --snapshot-latency-analysis produced one:
     // it already carries real dip_p / FDR-corrected tiers, so the browser needs no statistics.
     const pre = doc && doc._latencyAnalysis;
     if (pre && (pre.cumulative || pre.delta)) {
@@ -3693,7 +3693,7 @@
         textContent: offline
           ? "Showing results precomputed by ybtop from this snapshot, including the " +
             "confirmatory Hartigan dip test and Benjamini-Hochberg FDR correction, so tiers " +
-            "match 'ybtop histogram'. No statistics run in the browser." +
+            "match watch --snapshot-latency-analysis. No statistics run in the browser." +
             (analysis.diptest
               ? ""
               : " (This sidecar was written without the diptest package, so shape-flagged " +
@@ -3701,8 +3701,8 @@
           : "Browser detection runs Stages 0-2 (bimodality coefficient, peak finding, valley " +
             "check) + query-template grouping. The confirmatory Hartigan dip test is not " +
             "available in the browser, so shape-flagged queries are reported as 'unconfirmed'. " +
-            "Run 'ybtop histogram' (or watch --snapshot-latency-analysis) for dip-test " +
-            "confirmation and FDR-corrected tiers.",
+            "Capture with watch --snapshot-latency-analysis (and pip install 'ybtop[histogram]') " +
+            "for dip-test confirmation and FDR-corrected tiers.",
       })
     );
     panel.appendChild(banner);
@@ -4806,7 +4806,7 @@
         prevName ? fetchJson(prevName).catch(() => null) : Promise.resolve(null),
         analysisName ? fetchJson(analysisName).catch(() => null) : Promise.resolve(null),
       ]);
-      // Precomputed (dip-confirmed) latency report, when watch/histogram --write produced one.
+      // Precomputed (dip-confirmed) latency report, when watch --snapshot-latency-analysis produced one.
       if (doc && analysis) doc._latencyAnalysis = analysis;
       app.textContent = "";
       renderDoc(doc, prevDoc);

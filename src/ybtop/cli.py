@@ -407,7 +407,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Collect per-statement yb_latency_histogram values into each snapshot (opt-in; "
-            "enables the 'ybtop histogram' analysis and the viewer's Latency modes tab). "
+            "enables the viewer's Latency modes tab, and dip-confirmed sidecars when "
+            "--snapshot-latency-analysis is also set). "
             "Pulled with the existing top-N-by-total-time pg_stat_statements query "
             "(--snapshot-statements-per-node); NULL histograms coalesce to empty jsonb and "
             "are omitted from the latency_histograms section. No-op on clusters without the "
@@ -521,35 +522,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SERVE_PORT,
         help="Listen port for HTTP.",
     )
-
-    hist_p = sub.add_parser(
-        "histogram",
-        help=(
-            "Offline latency-histogram multimodality analysis of the latest snapshot's "
-            "cumulative totals (no database). Requires snapshots captured with watch "
-            "--snapshot-latency-histograms. For delta analysis and interactive filtering, use "
-            "the viewer's Latency modes tab."
-        ),
-        formatter_class=fmt,
-        epilog=(
-            "Confidence tiers (strongest first): very_high (dip p<=0.001), high (p<=0.01), "
-            "moderate (p<=0.05), unconfirmed (shape-flagged, dip test unavailable). Rows below "
-            "the 'high' tier are hidden. Install the optional detector with: "
-            "pip install 'ybtop[histogram]'."
-        ),
-    )
-    hist_p.add_argument(
-        "--data-dir",
-        default=DEFAULT_SNAPSHOT_OUTPUT_DIR,
-        help="Directory containing ybtop.manifest.json and ybtop.out.*.json.",
-    )
-    hist_p.add_argument(
-        "--min-calls",
-        type=int,
-        default=30,
-        metavar="N",
-        help="Ignore statements with fewer than N calls in the snapshot.",
-    )
     return p
 
 
@@ -615,12 +587,6 @@ def main(argv: Optional[list[str]] = None) -> None:
         from ybtop.serve import run_serve
 
         run_serve(data_dir=args.data_dir, host=args.bind, port=args.port)
-        return
-
-    if args.command == "histogram":
-        from ybtop.histogram_report import run_histogram
-
-        run_histogram(data_dir=args.data_dir, min_calls=args.min_calls)
         return
 
     settings = _settings_from_args(args)

@@ -26,9 +26,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Latency-histogram multimodality detection ("ybtop histogram" / viewer Latency modes tab).
-# diptest adds the confirmatory Hartigan dip test; without it, shape-flagged rows are
-# reported as "unconfirmed" (same behavior as the browser viewer).
+# Latency-histogram multimodality detection for watch --snapshot-latency-analysis
+# sidecars (viewer Latency modes tab). diptest adds the confirmatory Hartigan dip test;
+# without it, shape-flagged rows are reported as "unconfirmed".
 histogram = [
   "numpy>=1.21",
   "scipy>=1.7",
