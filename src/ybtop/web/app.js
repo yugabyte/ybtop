@@ -152,13 +152,8 @@
   let ashNodeIdFilter = null;
   let ashTableIdFilter = null;
 
-  /**
-   * Recurring-template visibility (per panel). Flipping a toggle re-renders from the retained snapshot.
-   */
-  let pgssShowRecurringTemplates = false;
-  let ycqlShowRecurringTemplates = false;
-  let ashShowRecurringTemplates = false;
-  let latencyShowRecurringTemplates = false;
+  /** Recurring-template table; gated on Merge similar SQL. Shared across statement / ASH / Latency. */
+  let showRecurringTemplates = false;
   /**
    * Viewer-wide: when true, query templates collapse IN-lists, VALUES row-lists, $N binds,
    * and per-call comments via normalizeQueryTemplate. When false, each distinct SQL string is its
@@ -176,6 +171,51 @@
   let latencyFlaggedOnly = false;
 
   const VIEWER_SECTION_IDS = ["pgss", "ycql", "ash", "tablets", "latency"];
+  const LATENCY_MIN_TIERS = ["very_high", "high", "moderate", "unconfirmed", "all"];
+  const LATENCY_MIN_TIER_DEFAULT = "high";
+
+  function urlParamIsTrue(p, key) {
+    const v = p.get(key);
+    return v === "t" || v === "true" || v === "1";
+  }
+
+  function urlParamIsFalse(p, key) {
+    const v = p.get(key);
+    return v === "f" || v === "false" || v === "0";
+  }
+
+  /**
+   * Merge similar SQL as a user preference. While a canonical-family ASH report
+   * forces the live switch on, the held value is what belongs in the URL and in
+   * copied links — `canonicalize=t` already means grouping is on for that view.
+   */
+  function mergeSimilarSqlForUrl() {
+    return mergeSimilarSqlSavedForFamily !== null
+      ? mergeSimilarSqlSavedForFamily
+      : mergeSimilarSql;
+  }
+
+  /** Non-default UI toggles. Omitted when they match the viewer defaults. */
+  function applyViewerToggleParams(p) {
+    const mergePref = mergeSimilarSqlForUrl();
+    if (mergePref) p.set("merge", "t");
+    if (mergePref && showRecurringTemplates) p.set("templates", "t");
+    if (latencyFlaggedOnly) p.set("flagged", "t");
+    if (!latencyShowDipP) p.set("dip_p", "f");
+    if (latencyMinTier && latencyMinTier !== LATENCY_MIN_TIER_DEFAULT) {
+      p.set("min_tier", latencyMinTier);
+    }
+  }
+
+  function readViewerToggleParams(p) {
+    mergeSimilarSql = urlParamIsTrue(p, "merge");
+    showRecurringTemplates = mergeSimilarSql && urlParamIsTrue(p, "templates");
+    latencyFlaggedOnly = urlParamIsTrue(p, "flagged");
+    latencyShowDipP = !urlParamIsFalse(p, "dip_p");
+    const mt = p.get("min_tier");
+    latencyMinTier =
+      mt != null && LATENCY_MIN_TIERS.indexOf(mt) >= 0 ? mt : LATENCY_MIN_TIER_DEFAULT;
+  }
 
   /**
    * subsectionId -> expanded when true; undefined / false => collapsed.
@@ -251,6 +291,7 @@
     ashNodeIdFilter = n != null && String(n).trim() !== "" ? String(n).trim() : null;
     const tb = p.get("table_id");
     ashTableIdFilter = tb != null && String(tb).trim() !== "" ? String(tb).trim() : null;
+    readViewerToggleParams(p);
     if (activeViewerSection !== "ash") {
       ashQueryIdFilter = null;
       ashCanonicalizeFilter = false;
@@ -304,8 +345,10 @@
       if (ashNodeIdFilter) p.set("node", ashNodeIdFilter);
       if (ashTableIdFilter) p.set("table_id", ashTableIdFilter);
     }
+    applyViewerToggleParams(p);
     const qs = p.toString();
     const newUrl = `${window.location.pathname}${qs ? "?" + qs : ""}${window.location.hash || ""}`;
+    const mergePref = mergeSimilarSqlForUrl();
     const st = {
       ybtop: true,
       view: activeViewerSection,
@@ -315,6 +358,11 @@
       dbname: ashCanonicalDbnameFilter || null,
       node: ashNodeIdFilter || null,
       table_id: ashTableIdFilter || null,
+      merge: mergePref,
+      templates: !!(mergePref && showRecurringTemplates),
+      flagged: latencyFlaggedOnly,
+      dip_p: latencyShowDipP,
+      min_tier: latencyMinTier,
     };
     if (push) {
       history.pushState(st, "", newUrl);
@@ -1730,6 +1778,7 @@
         p.set("dbname", String(opts.dbname).trim());
       }
     }
+    applyViewerToggleParams(p);
     return `${window.location.pathname}?${p.toString()}`;
   }
 
@@ -1744,6 +1793,7 @@
     const p = new URLSearchParams();
     p.set("view", "ash");
     p.set("node", String(nodeId));
+    applyViewerToggleParams(p);
     return `${window.location.pathname}?${p.toString()}`;
   }
 
@@ -1751,6 +1801,7 @@
     const p = new URLSearchParams();
     p.set("view", "ash");
     p.set("table_id", String(tableId));
+    applyViewerToggleParams(p);
     return `${window.location.pathname}?${p.toString()}`;
   }
 
@@ -4457,11 +4508,9 @@
       // Family ASH still needs Merge on; do not record this click as the value to restore.
       syncMergeSimilarSqlForFamilyScope();
       if (!mergeSimilarSql) {
-        pgssShowRecurringTemplates = false;
-        ycqlShowRecurringTemplates = false;
-        ashShowRecurringTemplates = false;
-        latencyShowRecurringTemplates = false;
+        showRecurringTemplates = false;
       }
+      writeViewerStateToUrl();
       if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
     });
     wrap.appendChild(chk);
@@ -4679,9 +4728,10 @@
     panel.appendChild(controls);
     panel.appendChild(buildMergeSimilarSqlControl());
     panel.appendChild(
-      buildShowRecurringTemplatesControl(mergeSimilarSql && latencyShowRecurringTemplates, (v) => {
-        latencyShowRecurringTemplates = v;
-        rerender();
+      buildShowRecurringTemplatesControl(mergeSimilarSql && showRecurringTemplates, (v) => {
+        showRecurringTemplates = v;
+        writeViewerStateToUrl();
+        if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
       })
     );
 
@@ -4816,7 +4866,7 @@
       );
 
       groupHolder.textContent = "";
-      if (latencyShowRecurringTemplates && recurring.length) {
+      if (showRecurringTemplates && recurring.length) {
         const grpRows = recurring.map((g) => ({
           best_tier: g.best_confidence_tier,
           peaks: (g.peak_counts || []).join(",") || "",
@@ -4853,15 +4903,18 @@
     tierSel.addEventListener("change", () => {
       latencyMinTier = tierSel.value;
       state.minTier = latencyMinTier;
+      writeViewerStateToUrl();
       rerender();
     });
     flagChk.addEventListener("change", () => {
       latencyFlaggedOnly = flagChk.checked;
       state.flaggedOnly = latencyFlaggedOnly;
+      writeViewerStateToUrl();
       rerender();
     });
     dipChk.addEventListener("change", () => {
       latencyShowDipP = dipChk.checked;
+      writeViewerStateToUrl();
       rerender();
     });
     rerender();
@@ -4970,14 +5023,15 @@
 
       panelPgss.appendChild(buildMergeSimilarSqlControl());
       panelPgss.appendChild(
-        buildShowRecurringTemplatesControl(mergeSimilarSql && pgssShowRecurringTemplates, (v) => {
-          pgssShowRecurringTemplates = v;
+        buildShowRecurringTemplatesControl(mergeSimilarSql && showRecurringTemplates, (v) => {
+          showRecurringTemplates = v;
+          writeViewerStateToUrl();
           if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
         })
       );
 
       const pgSummary = mergeSimilarSql ? statementTemplateSummaryRows(baseRows) : [];
-      if (pgssShowRecurringTemplates && pgSummary.length) {
+      if (showRecurringTemplates && pgSummary.length) {
         panelPgss.appendChild(
           buildSortableTable(
             `Recurring query templates (${pgSummary.length})`,
@@ -5103,14 +5157,15 @@
         )
       );
       panelYcql.appendChild(
-        buildShowRecurringTemplatesControl(mergeSimilarSql && ycqlShowRecurringTemplates, (v) => {
-          ycqlShowRecurringTemplates = v;
+        buildShowRecurringTemplatesControl(mergeSimilarSql && showRecurringTemplates, (v) => {
+          showRecurringTemplates = v;
+          writeViewerStateToUrl();
           if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
         })
       );
 
       const ycqlSummary = mergeSimilarSql ? statementTemplateSummaryRows(baseRows) : [];
-      if (ycqlShowRecurringTemplates && ycqlSummary.length) {
+      if (showRecurringTemplates && ycqlSummary.length) {
         panelYcql.appendChild(
           buildSortableTable(
             `Recurring query templates (${ycqlSummary.length})`,
@@ -5404,8 +5459,9 @@
       if (!qF) {
         panelAsh.appendChild(buildMergeSimilarSqlControl());
         panelAsh.appendChild(
-          buildShowRecurringTemplatesControl(mergeSimilarSql && ashShowRecurringTemplates, (v) => {
-            ashShowRecurringTemplates = v;
+          buildShowRecurringTemplatesControl(mergeSimilarSql && showRecurringTemplates, (v) => {
+            showRecurringTemplates = v;
+            writeViewerStateToUrl();
             if (lastDoc) renderDoc(lastDoc, lastPrevDoc);
           })
         );
@@ -5414,7 +5470,7 @@
               (r) => String(r.query_template || "").trim() !== "" && (Number(r.members) || 1) > 1
             )
           : [];
-        if (ashShowRecurringTemplates && ashTemplateSummary.length) {
+        if (showRecurringTemplates && ashTemplateSummary.length) {
           panelAsh.appendChild(
             buildSortableTable(
               `Recurring query templates (${ashTemplateSummary.length})`,
@@ -5753,6 +5809,7 @@
     if (docHasLatencyHistograms(doc)) app.appendChild(panelLatency);
     buildViewerNav();
     updateAshFilterToolbar();
+    writeViewerStateToUrl();
   }
 
   /** Manifest carries cumulative per-snapshot call totals. The bar at index i shows the call *rate*
@@ -6166,10 +6223,20 @@
       readViewerStateFromUrl();
       // A history entry may point at a different window (e.g. ASH deep-link);
       // load it rather than just re-rendering the current snapshot.
-      const target = indexForWindowKey(urlWindowKey);
-      if (target >= 0 && target !== currentIndex) {
-        showSnapshotAt(target);
-        return;
+      // No `t` means "follow the newest" — do not leave an older window on
+      // screen and then let renderDoc pin that older time onto this entry.
+      const newest = manifestEntries.length ? manifestEntries.length - 1 : -1;
+      if (!urlWindowKey) {
+        if (newest >= 0 && currentIndex !== newest) {
+          showSnapshotAt(newest);
+          return;
+        }
+      } else {
+        const target = indexForWindowKey(urlWindowKey);
+        if (target >= 0 && target !== currentIndex) {
+          showSnapshotAt(target);
+          return;
+        }
       }
       if (lastDoc) {
         renderDoc(lastDoc, lastPrevDoc);
