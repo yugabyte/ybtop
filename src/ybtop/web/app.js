@@ -820,9 +820,11 @@
     if (prevDoc && prevPerNode) {
       deltaMode = true;
       const mergedPrev = mergeFn(prevPerNode);
-      const currentRows = canonicalFamily ? collapseStatementsByTemplate(merged) : merged;
-      const previousRows = canonicalFamily ? collapseStatementsByTemplate(mergedPrev) : mergedPrev;
-      const deltaRows = deltaPgStatMergedRows(currentRows, previousRows);
+      // Per-queryid deltas first, then fold by template (see collapseStatementsByTemplate).
+      const perStatementDeltas = deltaPgStatMergedRows(merged, mergedPrev);
+      const deltaRows = canonicalFamily
+        ? collapseStatementsByTemplate(perStatementDeltas)
+        : perStatementDeltas;
       const derived = withPgStatDeltaDerivedRows(
         deltaRows,
         prevDoc.generated_at_utc,
@@ -1106,16 +1108,19 @@
       });
       raw.push(row);
     });
-    const filtered = raw.filter((r) => {
-      if (r.calls !== 0 || r.total_ms !== 0) return true;
-      if (r.rows != null && r.rows !== 0) return true;
-      return PG_STAT_DOCDB_KEYS.some(
-        (k) =>
-          Object.prototype.hasOwnProperty.call(r, `${k}_per_call`) && Number(r[`${k}_per_call`]) !== 0
-      );
-    });
+    const filtered = raw.filter(pgStatDeltaRowHasActivity);
     filtered.sort((a, b) => b.total_ms - a.total_ms);
     return filtered;
+  }
+
+  /** Delta row still has activity: calls, time, rows, or any DocDB per-call metric. */
+  function pgStatDeltaRowHasActivity(r) {
+    if (r.calls !== 0 || r.total_ms !== 0) return true;
+    if (r.rows != null && r.rows !== 0) return true;
+    return PG_STAT_DOCDB_KEYS.some(
+      (k) =>
+        Object.prototype.hasOwnProperty.call(r, `${k}_per_call`) && Number(r[`${k}_per_call`]) !== 0
+    );
   }
 
   function pgStatStatementColumnsDelta(merged, perNode) {
@@ -4205,12 +4210,12 @@
   // browser and CLI use the same rules, so a template collapses the same way in every panel.
 
   /**
-   * Collapse merged statement rows (pg_stat / ycql shape, carrying `_deltaSrc`) into one row per
-   * query template (and dbname, when present). Aggregates the raw totals so the row keeps the exact
-   * same shape as mergeStatements() output (including a fresh `_deltaSrc` and recomputed per-call
-   * fields), which lets it flow through the existing delta / time-% pipeline unchanged. The stable
-   * identity (`queryid` = the template text, `dbname` preserved) makes delta keying line up across
-   * snapshots.
+   * Collapse statement rows (cumulative rows carrying `_deltaSrc`, or per-statement delta rows)
+   * into one row per query template (and dbname, when present). Aggregates the raw totals so the
+   * row keeps the same shape as mergeStatements() output (fresh `_deltaSrc`, recomputed per-call
+   * fields). The collapsed row's `queryid` is the template text, which is NOT stable across
+   * snapshots (each node keeps the text that first created its entry), so in delta mode subtract
+   * per queryid first and collapse the deltas, never collapse per snapshot and subtract by text.
    */
   function collapseStatementsByTemplate(mergedRows) {
     const hasRows = (mergedRows || []).some((r) => Object.prototype.hasOwnProperty.call(r, "rows"));
@@ -5052,23 +5057,13 @@
       let pgCols;
       if (grouped) {
         if (isDelta) {
-          const collapsedCur = collapseStatementsByTemplate(merged);
-          const collapsedPrev = collapseStatementsByTemplate(mergeStatements(prevSt));
-          const memberByKey = new Map(
-            collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_member_count])
-          );
-          const primaryByKey = new Map(
-            collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_primary_queryid])
-          );
+          // Per-queryid deltas (baseRows) first, then fold by template — see
+          // collapseStatementsByTemplate for why the reverse order is wrong.
           pgRows = withPgStatDeltaDerivedRows(
-            deltaPgStatMergedRows(collapsedCur, collapsedPrev),
+            collapseStatementsByTemplate(baseRows).filter(pgStatDeltaRowHasActivity),
             prevDoc.generated_at_utc,
             doc.generated_at_utc
           );
-          pgRows.forEach((r) => {
-            r._tmpl_member_count = memberByKey.get(statementMergeKey(r)) || 1;
-            r._tmpl_primary_queryid = primaryByKey.get(statementMergeKey(r)) || null;
-          });
           applyCanonicalizedQueryText(pgRows);
           pgCols = groupedStatementDisplayColumns(pgStatStatementColumnsDelta(pgRows, st));
           pgTitle = "Top 25 — pg_stat_statements (Δ vs prior snapshot)";
@@ -5183,29 +5178,12 @@
       let ycqlCols;
       if (grouped) {
         if (isDelta) {
-          const collapsedCur = collapseStatementsByTemplate(mergedYcql);
-          const collapsedPrev = collapseStatementsByTemplate(mergeYcqlStatements(prevYcqlSt));
-          const prepByKey = new Map(
-            collapsedCur.map((r) => [statementMergeKey(r), !!r.is_prepared])
-          );
-          const memberByKey = new Map(
-            collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_member_count])
-          );
-          const primaryByKey = new Map(
-            collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_primary_queryid])
-          );
+          // As for YSQL: per-queryid deltas first, then fold by template.
           ycqlRows = withPgStatDeltaDerivedRows(
-            deltaPgStatMergedRows(collapsedCur, collapsedPrev).map((r) => ({
-              ...r,
-              is_prepared: prepByKey.get(statementMergeKey(r)) || false,
-            })),
+            collapseStatementsByTemplate(baseRows).filter(pgStatDeltaRowHasActivity),
             prevDoc.generated_at_utc,
             doc.generated_at_utc
           );
-          ycqlRows.forEach((r) => {
-            r._tmpl_member_count = memberByKey.get(statementMergeKey(r)) || 1;
-            r._tmpl_primary_queryid = primaryByKey.get(statementMergeKey(r)) || null;
-          });
           applyCanonicalizedQueryText(ycqlRows);
           ycqlCols = groupedStatementDisplayColumns(ycqlStatStatementColumnsDelta());
           ycqlTitle = "Top 25 — ycql_stat_statements (Δ vs prior snapshot)";
