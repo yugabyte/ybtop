@@ -94,6 +94,7 @@ The collapsing is `normalize_query_template`. The CLI and the browser use the sa
 | Step | Before | After |
 | --- | --- | --- |
 | Strip per-call comments | `SELECT /*rewritten_pid='42'*/ id FROM orders WHERE id = $1` | `SELECT id FROM orders WHERE id = $1` |
+| Strip `--` line comments (quote-aware) | `/*traceparent='00-…'*/ -- POST /invoices/authorize ⏎ SELECT id FROM orders WHERE id = $1` | `SELECT id FROM orders WHERE id = $1` |
 | Preserve planner hints (`/*+ … */`) | `SELECT /*+ IndexScan(orders) */ id FROM orders WHERE id = $1` | unchanged (hint kept) |
 | Collapse value-list `IN (...)` | `… WHERE id IN (1, 2, 3)` or `… WHERE id IN ($1, $2, $3)` | `… WHERE id IN (...)` |
 | Leave subquery `IN` alone | `… WHERE id IN (SELECT id FROM archive)` | unchanged |

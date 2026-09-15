@@ -4106,6 +4106,73 @@
   // change the chosen plan and must keep templates distinct. Kept identical to Python
   // _REWRITE_COMMENT_RE.
   const HIST_REWRITE_COMMENT_RE = /\/\*(?!\+)[\s\S]*?\*\//g;
+  // Strip `-- ...` line comments (per-call APM/route tags) after the block-comment step.
+  // Quote-aware: `--` inside strings ('' and E'' escapes), quoted identifiers, dollar-quoted
+  // bodies or a kept `/*+ */` hint stays; `foo$bar$` is an identifier, not a dollar quote.
+  // Kept identical to Python _strip_line_comments.
+  const HIST_DOLLAR_TAG_RE = /\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/y;
+  function stripLineComments(s) {
+    if (s.indexOf("--") < 0) return s;
+    const n = s.length;
+    const isIdent = (ch) => /[A-Za-z0-9_]/.test(ch);
+    let out = "";
+    let i = 0;
+    while (i < n) {
+      const c = s[i];
+      if (c === "'") {
+        const isE =
+          i > 0 && (s[i - 1] === "E" || s[i - 1] === "e") && !(i > 1 && isIdent(s[i - 2]));
+        let j = i + 1;
+        while (j < n) {
+          if (isE && s[j] === "\\") {
+            j += 2;
+            continue;
+          }
+          if (s[j] === "'") break;
+          j += 1;
+        }
+        const end = Math.min(j + 1, n);
+        out += s.slice(i, end);
+        i = end;
+        continue;
+      }
+      if (c === '"') {
+        const k = s.indexOf('"', i + 1);
+        const end = k < 0 ? n : k + 1;
+        out += s.slice(i, end);
+        i = end;
+        continue;
+      }
+      if (c === "$" && !(i > 0 && isIdent(s[i - 1]))) {
+        HIST_DOLLAR_TAG_RE.lastIndex = i;
+        const m = HIST_DOLLAR_TAG_RE.exec(s);
+        if (m) {
+          const tag = m[0];
+          const k = s.indexOf(tag, i + tag.length);
+          const end = k < 0 ? n : k + tag.length;
+          out += s.slice(i, end);
+          i = end;
+          continue;
+        }
+      }
+      if (c === "/" && s[i + 1] === "*") {
+        const k = s.indexOf("*/", i + 2);
+        const end = k < 0 ? n : k + 2;
+        out += s.slice(i, end);
+        i = end;
+        continue;
+      }
+      if (c === "-" && s[i + 1] === "-") {
+        let k = i + 2;
+        while (k < n && s[k] !== "\n" && s[k] !== "\r") k += 1;
+        i = k;
+        continue;
+      }
+      out += c;
+      i += 1;
+    }
+    return out;
+  }
   // Collapse only value-list `IN (...)` (literals / `$N`), never a subquery `IN (SELECT ...)`.
   const HIST_IN_LIST_RE = /\bIN\s*\((?!\s*SELECT\b)[^)]*\)/gi;
   // Bulk VALUES row-list — collapse `VALUES (...),(...),...` (any row count, one level of nested
@@ -4114,13 +4181,22 @@
   const HIST_VALUES_LIST_RE = /\bVALUES\s*\((?:[^()]|\([^()]*\))*\)(?:\s*,\s*\((?:[^()]|\([^()]*\))*\))*/gi;
   const HIST_PLACEHOLDER_RE = /\$\d+/g;
 
+  // Pure; ASH re-normalizes the same few hundred texts for thousands of rows, so cache (bounded).
+  const TEMPLATE_CACHE_MAX = 5000;
+  const templateCache = new Map();
   function normalizeQueryTemplate(query) {
     if (!query) return "";
-    let q = String(query).replace(HIST_REWRITE_COMMENT_RE, "");
+    const raw = String(query);
+    const cached = templateCache.get(raw);
+    if (cached !== undefined) return cached;
+    let q = raw.replace(HIST_REWRITE_COMMENT_RE, "");
+    q = stripLineComments(q);
     q = q.replace(HIST_IN_LIST_RE, "IN (...)");
     q = q.replace(HIST_VALUES_LIST_RE, "VALUES (...)");
     q = q.replace(HIST_PLACEHOLDER_RE, "$N");
     q = q.replace(/\s+/g, " ").trim();
+    if (templateCache.size >= TEMPLATE_CACHE_MAX) templateCache.clear();
+    templateCache.set(raw, q);
     return q;
   }
 

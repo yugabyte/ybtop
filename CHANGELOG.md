@@ -4,6 +4,10 @@ All notable functional changes to **ybtop** are listed here by release. Format f
 
 ## [Unreleased]
 
+### Changed
+
+- **Query-template normalization (CLI + viewer):** `--` line comments are now stripped as well as `/* … */` (planner hints `/*+ … */` are still kept). The pass is quote-aware: `--` inside strings, quoted identifiers, dollar-quoted bodies or hints is left alone. CQL `//` comments are not handled.
+
 ### Fixed
 
 - **Viewer, Merge similar SQL in delta mode:** grouped rows showed lifetime totals instead of the window delta whenever a statement's stored text differed between snapshots (e.g. a per-call `-- route` comment). Deltas are now taken per `queryid` before folding by template. Applies to the YSQL/YCQL Top 25 and the family ASH banner, whose per-node call split dropped nodes for the same reason.

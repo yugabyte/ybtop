@@ -273,6 +273,69 @@ def apply_bh_correction(results: list[dict[str, Any]], q: float = 0.05) -> dict[
 # Strip /* ... */ comments except planner hints (pg_hint_plan / YSQL /*+ ... */), which can
 # change the chosen plan and must keep templates distinct.
 _REWRITE_COMMENT_RE = re.compile(r"/\*(?!\+).*?\*/", re.S)
+# Dollar-quote tag ($$ or $tag$) for the line-comment scanner below.
+_DOLLAR_TAG_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+_IDENT_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_")
+
+
+def _strip_line_comments(s: str) -> str:
+    """Drop ``-- ...`` line comments (per-call APM/route tags); runs after the block-comment step.
+
+    Quote-aware: ``--`` inside strings (``''`` and ``E''`` escapes), quoted identifiers,
+    dollar-quoted bodies or a kept ``/*+ */`` hint stays; ``foo$bar$`` is an identifier, not a
+    dollar quote. Kept identical to the browser's stripLineComments.
+    """
+    if "--" not in s:
+        return s
+    n = len(s)
+    out: list[str] = []
+    i = 0
+    while i < n:
+        c = s[i]
+        if c == "'":
+            is_e = i > 0 and s[i - 1] in "Ee" and not (i > 1 and s[i - 2] in _IDENT_CHARS)
+            j = i + 1
+            while j < n:
+                if is_e and s[j] == "\\":
+                    j += 2
+                    continue
+                if s[j] == "'":
+                    break
+                j += 1
+            end = min(j + 1, n)
+            out.append(s[i:end])
+            i = end
+            continue
+        if c == '"':
+            k = s.find('"', i + 1)
+            end = n if k < 0 else k + 1
+            out.append(s[i:end])
+            i = end
+            continue
+        if c == "$" and not (i > 0 and s[i - 1] in _IDENT_CHARS):
+            m = _DOLLAR_TAG_RE.match(s, i)
+            if m:
+                tag = m.group(0)
+                k = s.find(tag, i + len(tag))
+                end = n if k < 0 else k + len(tag)
+                out.append(s[i:end])
+                i = end
+                continue
+        if c == "/" and s[i + 1 : i + 2] == "*":
+            k = s.find("*/", i + 2)
+            end = n if k < 0 else k + 2
+            out.append(s[i:end])
+            i = end
+            continue
+        if c == "-" and s[i + 1 : i + 2] == "-":
+            k = i + 2
+            while k < n and s[k] not in "\r\n":
+                k += 1
+            i = k
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 # Collapse only value-list `IN (...)` (literals / `$N`), never a subquery `IN (SELECT ...)`.
 _IN_LIST_RE = re.compile(r"\bIN\s*\((?!\s*SELECT\b)[^)]*\)", re.I)
 # A VALUES row-list (one or more parenthesized rows, each allowing one level of nested parens for
@@ -289,9 +352,9 @@ _WS_RE = re.compile(r"\s+")
 def normalize_query_template(query: Optional[str]) -> str:
     """Collapse a query into a template that ignores per-call comments, IN-list length, and VALUES row count.
 
-    1. Strip embedded per-call comments (e.g. ``/*rewritten_pid='123'*/``). Planner hints
-       that start with ``/*+`` (pg_hint_plan / YSQL) are preserved so distinct hint sets stay
-       distinct templates.
+    1. Strip per-call comments: ``/* ... */`` blocks, then ``-- ...`` line comments (quote-aware).
+       Planner hints starting with ``/*+`` (pg_hint_plan / YSQL) are preserved so distinct hint
+       sets stay distinct templates.
     2. Collapse a value-list ``IN (...)`` (literals or ``$N``) to a canonical ``IN (...)``;
        a subquery ``IN (SELECT ...)`` is left untouched.
     3. Collapse a ``VALUES (...),(...),...`` row-list (any number of rows) to a canonical
@@ -304,6 +367,7 @@ def normalize_query_template(query: Optional[str]) -> str:
     if not query:
         return ""
     q = _REWRITE_COMMENT_RE.sub("", str(query))
+    q = _strip_line_comments(q)
     q = _IN_LIST_RE.sub("IN (...)", q)
     q = _VALUES_LIST_RE.sub("VALUES (...)", q)
     q = _PLACEHOLDER_RE.sub("$N", q)
