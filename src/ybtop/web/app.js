@@ -823,7 +823,7 @@
       // Per-queryid deltas first, then fold by template (see collapseStatementsByTemplate).
       const perStatementDeltas = deltaPgStatMergedRows(merged, mergedPrev);
       const deltaRows = canonicalFamily
-        ? collapseStatementsByTemplate(perStatementDeltas)
+        ? collapseStatementsByTemplate(perStatementDeltas).filter(pgStatDeltaRowHasActivity)
         : perStatementDeltas;
       const derived = withPgStatDeltaDerivedRows(
         deltaRows,
@@ -1042,7 +1042,7 @@
     return `${String(r.queryid)}\0${dn}`;
   }
 
-  /** Reconstruct approximate raw totals when _deltaSrc is missing (older snapshots). */
+  /** Row totals: `_deltaSrc` (merged, delta, collapsed rows carry it), else per-call × calls. */
   function deltaSrcFromRowFallback(r) {
     if (!r) return { calls: 0, total_exec_time: 0, rows: 0, doc: {} };
     if (r._deltaSrc) return r._deltaSrc;
@@ -1100,12 +1100,17 @@
         row.rows = Math.round(dRows * 100) / 100;
         row.rows_per_call = dCalls > 0 ? Math.round((dRows / dCalls) * 100) / 100 : 0;
       }
+      // Exact deltas for collapseStatementsByTemplate(); the display fields above are rounded.
+      const deltaSrc = { calls: dCalls, total_exec_time: dExec, doc: {} };
+      if (hasRows) deltaSrc.rows = dRows;
       docKeySet.forEach((dk) => {
         const ctot = sc.doc && sc.doc[dk] != null ? Number(sc.doc[dk]) : 0;
         const ptot = sp.doc && sp.doc[dk] != null ? Number(sp.doc[dk]) : 0;
         const dtot = ctot - ptot;
+        deltaSrc.doc[dk] = dtot;
         row[`${dk}_per_call`] = dCalls > 0 ? Math.round((dtot / dCalls) * 100) / 100 : 0;
       });
+      row._deltaSrc = deltaSrc;
       raw.push(row);
     });
     const filtered = raw.filter(pgStatDeltaRowHasActivity);
@@ -4286,8 +4291,8 @@
   // browser and CLI use the same rules, so a template collapses the same way in every panel.
 
   /**
-   * Collapse statement rows (cumulative rows carrying `_deltaSrc`, or per-statement delta rows)
-   * into one row per query template (and dbname, when present). Aggregates the raw totals so the
+   * Collapse statement rows (cumulative or per-statement delta rows; both carry `_deltaSrc`) into
+   * one row per query template (and dbname, when present). Aggregates the raw totals so the
    * row keeps the same shape as mergeStatements() output (fresh `_deltaSrc`, recomputed per-call
    * fields). The collapsed row's `queryid` is the template text, which is NOT stable across
    * snapshots (each node keeps the text that first created its entry), so in delta mode subtract
@@ -4326,7 +4331,7 @@
       // Heaviest member with a real id: the collapsed row's `queryid` is the template text, so ASH
       // deep links need a statement that actually exists to scope to.
       let primaryQueryid = null;
-      let primaryMs = -1;
+      let primaryMs = -Infinity;
       members.forEach((m) => {
         const s = deltaSrcFromRowFallback(m);
         calls += Number(s.calls) || 0;
@@ -4351,7 +4356,7 @@
         query: key,
         calls: calls,
         total_ms: Math.round(exec * 100) / 100,
-        mean_ms: calls ? Math.round((exec / calls) * 100) / 100 : 0,
+        mean_ms: calls > 0 ? Math.round((exec / calls) * 100) / 100 : 0,
         _tmpl_member_count: members.length,
         _tmpl_queryids: queryids,
         _tmpl_primary_queryid: primaryQueryid,
@@ -4360,10 +4365,10 @@
       if (hasPrepared) row.is_prepared = anyPrepared;
       if (hasRows) {
         row.rows = Math.round(rows * 100) / 100;
-        row.rows_per_call = calls ? Math.round((rows / calls) * 100) / 100 : 0;
+        row.rows_per_call = calls > 0 ? Math.round((rows / calls) * 100) / 100 : 0;
       }
       Object.keys(doc).forEach((k) => {
-        row[`${k}_per_call`] = calls ? Math.round((doc[k] / calls) * 100) / 100 : 0;
+        row[`${k}_per_call`] = calls > 0 ? Math.round((doc[k] / calls) * 100) / 100 : 0;
       });
       const deltaSrc = { calls: calls, total_exec_time: exec, doc: doc };
       if (hasRows) deltaSrc.rows = rows;
