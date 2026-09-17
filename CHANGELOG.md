@@ -2,6 +2,17 @@
 
 All notable functional changes to **ybtop** are listed here by release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) (newest first).
 
+## [Unreleased]
+
+### Changed
+
+- **Query-template normalization (CLI + viewer):** `--` line comments are now stripped as well as `/* … */` (planner hints `/*+ … */` are still kept). The pass is quote-aware: `--` inside strings, quoted identifiers, dollar-quoted bodies or hints is left alone. CQL `//` comments are not handled.
+
+### Fixed
+
+- **Viewer, Merge similar SQL in delta mode:** grouped rows showed lifetime totals instead of the window delta whenever a statement's stored text differed between snapshots (e.g. a per-call `-- route` comment). Deltas are now taken per `queryid` before folding by template. Applies to the YSQL/YCQL Top 25 and the family ASH banner, whose per-node call split dropped nodes for the same reason.
+- **ASH banner, YCQL in delta mode:** the `is_prepared` line was blank; the banner now re-attaches the flag to the per-statement deltas before folding by template, as the YCQL Top 25 already did.
+
 ## [0.1.13] — 2026-08-12
 
 ### Added

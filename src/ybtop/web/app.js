@@ -820,9 +820,19 @@
     if (prevDoc && prevPerNode) {
       deltaMode = true;
       const mergedPrev = mergeFn(prevPerNode);
-      const currentRows = canonicalFamily ? collapseStatementsByTemplate(merged) : merged;
-      const previousRows = canonicalFamily ? collapseStatementsByTemplate(mergedPrev) : mergedPrev;
-      const deltaRows = deltaPgStatMergedRows(currentRows, previousRows);
+      // Per-queryid deltas first, then fold by template (see collapseStatementsByTemplate).
+      let perStatementDeltas = deltaPgStatMergedRows(merged, mergedPrev);
+      if (opts && opts.showIsPrepared) {
+        // Same remap as the YCQL Top 25: deltaPgStatMergedRows() does not carry is_prepared.
+        const prepByKey = new Map(merged.map((r) => [statementMergeKey(r), !!r.is_prepared]));
+        perStatementDeltas = perStatementDeltas.map((r) => ({
+          ...r,
+          is_prepared: prepByKey.get(statementMergeKey(r)) || false,
+        }));
+      }
+      const deltaRows = canonicalFamily
+        ? collapseStatementsByTemplate(perStatementDeltas).filter(pgStatDeltaRowHasActivity)
+        : perStatementDeltas;
       const derived = withPgStatDeltaDerivedRows(
         deltaRows,
         prevDoc.generated_at_utc,
@@ -1040,7 +1050,7 @@
     return `${String(r.queryid)}\0${dn}`;
   }
 
-  /** Reconstruct approximate raw totals when _deltaSrc is missing (older snapshots). */
+  /** Row totals: `_deltaSrc` (merged, delta, collapsed rows carry it), else per-call × calls. */
   function deltaSrcFromRowFallback(r) {
     if (!r) return { calls: 0, total_exec_time: 0, rows: 0, doc: {} };
     if (r._deltaSrc) return r._deltaSrc;
@@ -1098,24 +1108,32 @@
         row.rows = Math.round(dRows * 100) / 100;
         row.rows_per_call = dCalls > 0 ? Math.round((dRows / dCalls) * 100) / 100 : 0;
       }
+      // Exact deltas for collapseStatementsByTemplate(); the display fields above are rounded.
+      const deltaSrc = { calls: dCalls, total_exec_time: dExec, doc: {} };
+      if (hasRows) deltaSrc.rows = dRows;
       docKeySet.forEach((dk) => {
         const ctot = sc.doc && sc.doc[dk] != null ? Number(sc.doc[dk]) : 0;
         const ptot = sp.doc && sp.doc[dk] != null ? Number(sp.doc[dk]) : 0;
         const dtot = ctot - ptot;
+        deltaSrc.doc[dk] = dtot;
         row[`${dk}_per_call`] = dCalls > 0 ? Math.round((dtot / dCalls) * 100) / 100 : 0;
       });
+      row._deltaSrc = deltaSrc;
       raw.push(row);
     });
-    const filtered = raw.filter((r) => {
-      if (r.calls !== 0 || r.total_ms !== 0) return true;
-      if (r.rows != null && r.rows !== 0) return true;
-      return PG_STAT_DOCDB_KEYS.some(
-        (k) =>
-          Object.prototype.hasOwnProperty.call(r, `${k}_per_call`) && Number(r[`${k}_per_call`]) !== 0
-      );
-    });
+    const filtered = raw.filter(pgStatDeltaRowHasActivity);
     filtered.sort((a, b) => b.total_ms - a.total_ms);
     return filtered;
+  }
+
+  /** Delta row still has activity: calls, time, rows, or any DocDB per-call metric. */
+  function pgStatDeltaRowHasActivity(r) {
+    if (r.calls !== 0 || r.total_ms !== 0) return true;
+    if (r.rows != null && r.rows !== 0) return true;
+    return PG_STAT_DOCDB_KEYS.some(
+      (k) =>
+        Object.prototype.hasOwnProperty.call(r, `${k}_per_call`) && Number(r[`${k}_per_call`]) !== 0
+    );
   }
 
   function pgStatStatementColumnsDelta(merged, perNode) {
@@ -4101,6 +4119,73 @@
   // change the chosen plan and must keep templates distinct. Kept identical to Python
   // _REWRITE_COMMENT_RE.
   const HIST_REWRITE_COMMENT_RE = /\/\*(?!\+)[\s\S]*?\*\//g;
+  // Strip `-- ...` line comments (per-call APM/route tags) after the block-comment step.
+  // Quote-aware: `--` inside strings ('' and E'' escapes), quoted identifiers, dollar-quoted
+  // bodies or a kept `/*+ */` hint stays; `foo$bar$` is an identifier, not a dollar quote.
+  // Kept identical to Python _strip_line_comments.
+  const HIST_DOLLAR_TAG_RE = /\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/y;
+  function stripLineComments(s) {
+    if (s.indexOf("--") < 0) return s;
+    const n = s.length;
+    const isIdent = (ch) => /[A-Za-z0-9_]/.test(ch);
+    let out = "";
+    let i = 0;
+    while (i < n) {
+      const c = s[i];
+      if (c === "'") {
+        const isE =
+          i > 0 && (s[i - 1] === "E" || s[i - 1] === "e") && !(i > 1 && isIdent(s[i - 2]));
+        let j = i + 1;
+        while (j < n) {
+          if (isE && s[j] === "\\") {
+            j += 2;
+            continue;
+          }
+          if (s[j] === "'") break;
+          j += 1;
+        }
+        const end = Math.min(j + 1, n);
+        out += s.slice(i, end);
+        i = end;
+        continue;
+      }
+      if (c === '"') {
+        const k = s.indexOf('"', i + 1);
+        const end = k < 0 ? n : k + 1;
+        out += s.slice(i, end);
+        i = end;
+        continue;
+      }
+      if (c === "$" && !(i > 0 && isIdent(s[i - 1]))) {
+        HIST_DOLLAR_TAG_RE.lastIndex = i;
+        const m = HIST_DOLLAR_TAG_RE.exec(s);
+        if (m) {
+          const tag = m[0];
+          const k = s.indexOf(tag, i + tag.length);
+          const end = k < 0 ? n : k + tag.length;
+          out += s.slice(i, end);
+          i = end;
+          continue;
+        }
+      }
+      if (c === "/" && s[i + 1] === "*") {
+        const k = s.indexOf("*/", i + 2);
+        const end = k < 0 ? n : k + 2;
+        out += s.slice(i, end);
+        i = end;
+        continue;
+      }
+      if (c === "-" && s[i + 1] === "-") {
+        let k = i + 2;
+        while (k < n && s[k] !== "\n" && s[k] !== "\r") k += 1;
+        i = k;
+        continue;
+      }
+      out += c;
+      i += 1;
+    }
+    return out;
+  }
   // Collapse only value-list `IN (...)` (literals / `$N`), never a subquery `IN (SELECT ...)`.
   const HIST_IN_LIST_RE = /\bIN\s*\((?!\s*SELECT\b)[^)]*\)/gi;
   // Bulk VALUES row-list — collapse `VALUES (...),(...),...` (any row count, one level of nested
@@ -4109,13 +4194,22 @@
   const HIST_VALUES_LIST_RE = /\bVALUES\s*\((?:[^()]|\([^()]*\))*\)(?:\s*,\s*\((?:[^()]|\([^()]*\))*\))*/gi;
   const HIST_PLACEHOLDER_RE = /\$\d+/g;
 
+  // Pure; ASH re-normalizes the same few hundred texts for thousands of rows, so cache (bounded).
+  const TEMPLATE_CACHE_MAX = 5000;
+  const templateCache = new Map();
   function normalizeQueryTemplate(query) {
     if (!query) return "";
-    let q = String(query).replace(HIST_REWRITE_COMMENT_RE, "");
+    const raw = String(query);
+    const cached = templateCache.get(raw);
+    if (cached !== undefined) return cached;
+    let q = raw.replace(HIST_REWRITE_COMMENT_RE, "");
+    q = stripLineComments(q);
     q = q.replace(HIST_IN_LIST_RE, "IN (...)");
     q = q.replace(HIST_VALUES_LIST_RE, "VALUES (...)");
     q = q.replace(HIST_PLACEHOLDER_RE, "$N");
     q = q.replace(/\s+/g, " ").trim();
+    if (templateCache.size >= TEMPLATE_CACHE_MAX) templateCache.clear();
+    templateCache.set(raw, q);
     return q;
   }
 
@@ -4205,12 +4299,12 @@
   // browser and CLI use the same rules, so a template collapses the same way in every panel.
 
   /**
-   * Collapse merged statement rows (pg_stat / ycql shape, carrying `_deltaSrc`) into one row per
-   * query template (and dbname, when present). Aggregates the raw totals so the row keeps the exact
-   * same shape as mergeStatements() output (including a fresh `_deltaSrc` and recomputed per-call
-   * fields), which lets it flow through the existing delta / time-% pipeline unchanged. The stable
-   * identity (`queryid` = the template text, `dbname` preserved) makes delta keying line up across
-   * snapshots.
+   * Collapse statement rows (cumulative or per-statement delta rows; both carry `_deltaSrc`) into
+   * one row per query template (and dbname, when present). Aggregates the raw totals so the
+   * row keeps the same shape as mergeStatements() output (fresh `_deltaSrc`, recomputed per-call
+   * fields). The collapsed row's `queryid` is the template text, which is NOT stable across
+   * snapshots (each node keeps the text that first created its entry), so in delta mode subtract
+   * per queryid first and collapse the deltas, never collapse per snapshot and subtract by text.
    */
   function collapseStatementsByTemplate(mergedRows) {
     const hasRows = (mergedRows || []).some((r) => Object.prototype.hasOwnProperty.call(r, "rows"));
@@ -4245,7 +4339,7 @@
       // Heaviest member with a real id: the collapsed row's `queryid` is the template text, so ASH
       // deep links need a statement that actually exists to scope to.
       let primaryQueryid = null;
-      let primaryMs = -1;
+      let primaryMs = -Infinity;
       members.forEach((m) => {
         const s = deltaSrcFromRowFallback(m);
         calls += Number(s.calls) || 0;
@@ -4270,7 +4364,7 @@
         query: key,
         calls: calls,
         total_ms: Math.round(exec * 100) / 100,
-        mean_ms: calls ? Math.round((exec / calls) * 100) / 100 : 0,
+        mean_ms: calls > 0 ? Math.round((exec / calls) * 100) / 100 : 0,
         _tmpl_member_count: members.length,
         _tmpl_queryids: queryids,
         _tmpl_primary_queryid: primaryQueryid,
@@ -4279,10 +4373,10 @@
       if (hasPrepared) row.is_prepared = anyPrepared;
       if (hasRows) {
         row.rows = Math.round(rows * 100) / 100;
-        row.rows_per_call = calls ? Math.round((rows / calls) * 100) / 100 : 0;
+        row.rows_per_call = calls > 0 ? Math.round((rows / calls) * 100) / 100 : 0;
       }
       Object.keys(doc).forEach((k) => {
-        row[`${k}_per_call`] = calls ? Math.round((doc[k] / calls) * 100) / 100 : 0;
+        row[`${k}_per_call`] = calls > 0 ? Math.round((doc[k] / calls) * 100) / 100 : 0;
       });
       const deltaSrc = { calls: calls, total_exec_time: exec, doc: doc };
       if (hasRows) deltaSrc.rows = rows;
@@ -5052,23 +5146,13 @@
       let pgCols;
       if (grouped) {
         if (isDelta) {
-          const collapsedCur = collapseStatementsByTemplate(merged);
-          const collapsedPrev = collapseStatementsByTemplate(mergeStatements(prevSt));
-          const memberByKey = new Map(
-            collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_member_count])
-          );
-          const primaryByKey = new Map(
-            collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_primary_queryid])
-          );
+          // Per-queryid deltas (baseRows) first, then fold by template — see
+          // collapseStatementsByTemplate for why the reverse order is wrong.
           pgRows = withPgStatDeltaDerivedRows(
-            deltaPgStatMergedRows(collapsedCur, collapsedPrev),
+            collapseStatementsByTemplate(baseRows).filter(pgStatDeltaRowHasActivity),
             prevDoc.generated_at_utc,
             doc.generated_at_utc
           );
-          pgRows.forEach((r) => {
-            r._tmpl_member_count = memberByKey.get(statementMergeKey(r)) || 1;
-            r._tmpl_primary_queryid = primaryByKey.get(statementMergeKey(r)) || null;
-          });
           applyCanonicalizedQueryText(pgRows);
           pgCols = groupedStatementDisplayColumns(pgStatStatementColumnsDelta(pgRows, st));
           pgTitle = "Top 25 — pg_stat_statements (Δ vs prior snapshot)";
@@ -5183,29 +5267,12 @@
       let ycqlCols;
       if (grouped) {
         if (isDelta) {
-          const collapsedCur = collapseStatementsByTemplate(mergedYcql);
-          const collapsedPrev = collapseStatementsByTemplate(mergeYcqlStatements(prevYcqlSt));
-          const prepByKey = new Map(
-            collapsedCur.map((r) => [statementMergeKey(r), !!r.is_prepared])
-          );
-          const memberByKey = new Map(
-            collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_member_count])
-          );
-          const primaryByKey = new Map(
-            collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_primary_queryid])
-          );
+          // As for YSQL: per-queryid deltas first, then fold by template.
           ycqlRows = withPgStatDeltaDerivedRows(
-            deltaPgStatMergedRows(collapsedCur, collapsedPrev).map((r) => ({
-              ...r,
-              is_prepared: prepByKey.get(statementMergeKey(r)) || false,
-            })),
+            collapseStatementsByTemplate(baseRows).filter(pgStatDeltaRowHasActivity),
             prevDoc.generated_at_utc,
             doc.generated_at_utc
           );
-          ycqlRows.forEach((r) => {
-            r._tmpl_member_count = memberByKey.get(statementMergeKey(r)) || 1;
-            r._tmpl_primary_queryid = primaryByKey.get(statementMergeKey(r)) || null;
-          });
           applyCanonicalizedQueryText(ycqlRows);
           ycqlCols = groupedStatementDisplayColumns(ycqlStatStatementColumnsDelta());
           ycqlTitle = "Top 25 — ycql_stat_statements (Δ vs prior snapshot)";
