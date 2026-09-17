@@ -11,6 +11,7 @@ All notable functional changes to **ybtop** are listed here by release. Format f
 ### Fixed
 
 - **Viewer, Merge similar SQL in delta mode:** grouped rows showed lifetime totals instead of the window delta whenever a statement's stored text differed between snapshots (e.g. a per-call `-- route` comment). Deltas are now taken per `queryid` before folding by template. Applies to the YSQL/YCQL Top 25 and the family ASH banner, whose per-node call split dropped nodes for the same reason.
+- **ASH banner, YCQL in delta mode:** the `is_prepared` line was blank; the banner now re-attaches the flag to the per-statement deltas before folding by template, as the YCQL Top 25 already did.
 
 ## [0.1.13] — 2026-08-12
 

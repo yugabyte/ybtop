@@ -821,7 +821,15 @@
       deltaMode = true;
       const mergedPrev = mergeFn(prevPerNode);
       // Per-queryid deltas first, then fold by template (see collapseStatementsByTemplate).
-      const perStatementDeltas = deltaPgStatMergedRows(merged, mergedPrev);
+      let perStatementDeltas = deltaPgStatMergedRows(merged, mergedPrev);
+      if (opts && opts.showIsPrepared) {
+        // Same remap as the YCQL Top 25: deltaPgStatMergedRows() does not carry is_prepared.
+        const prepByKey = new Map(merged.map((r) => [statementMergeKey(r), !!r.is_prepared]));
+        perStatementDeltas = perStatementDeltas.map((r) => ({
+          ...r,
+          is_prepared: prepByKey.get(statementMergeKey(r)) || false,
+        }));
+      }
       const deltaRows = canonicalFamily
         ? collapseStatementsByTemplate(perStatementDeltas).filter(pgStatDeltaRowHasActivity)
         : perStatementDeltas;
