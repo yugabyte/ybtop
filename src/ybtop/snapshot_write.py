@@ -195,6 +195,11 @@ def _statement_queryids(statements_per_node: dict[str, list[dict[str, Any]]]) ->
     return out
 
 
+def _roles_for_rows(per_node: dict[str, list[dict[str, Any]]], names: dict[str, str]) -> dict[str, str]:
+    used = {str(r.get("userid")) for rows in per_node.values() for r in rows or [] if r.get("userid") is not None}
+    return {u: names[u] for u in sorted(used) if u in names}
+
+
 def _scope_and_dedupe_plans(
     plans_per_node: dict[str, list[dict[str, Any]]],
     keep_queryids: Optional[set[str]] = None,
@@ -480,11 +485,13 @@ def _build_snapshot_document_impl(
     # yb_pg_stat_plans_track at any time and the viewer's guardrail must notice.
     qpm_st: dict[str, Any] = {}
     qpm_databases: dict[str, str] = {}
+    qpm_roles: dict[str, str] = {}
     with stage_timer("qpm_status", _log):
         try:
             with connect(seed_dsn) as conn:
                 qpm_st = Q.qpm_status(conn)
                 qpm_databases = Q.database_names(conn)
+                qpm_roles = Q.role_names(conn)
         except Exception as exc:  # noqa: BLE001 - status is advisory; never fail a snapshot
             log_event(_log, "qpm_status_failed", level=logging.WARNING, error=str(exc))
     qpm_track = str(qpm_st.get("track") or "").lower()
@@ -617,6 +624,8 @@ def _build_snapshot_document_impl(
                 # planid -> text is not 1:1, so rows point at a content digest instead.
                 "plans": plan_texts,
                 "per_node": slim_plans,
+                # userid -> role name, for the roles these rows name only.
+                "roles": _roles_for_rows(slim_plans, qpm_roles),
             }
         )
         with stage_timer("hint_table_pins", _log) as st:

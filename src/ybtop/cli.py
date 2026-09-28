@@ -467,6 +467,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     w.add_argument(
+        "--allow-explain-analyze",
+        action="store_true",
+        help=(
+            "Let the viewer run EXPLAIN ANALYZE of a recorded statement with its slowest "
+            "recorded parameters (default: off). This really executes the statement: "
+            "SELECTs in a READ ONLY transaction, writes in one that is rolled back, as "
+            "the role that ran it and under a statement timeout the viewer asks for. The "
+            "viewer has no authentication, so only enable this when you are the only "
+            "user of this machine."
+        ),
+    )
+    w.add_argument(
         "--snapshot-latency-histograms",
         action="store_true",
         help=(
@@ -652,6 +664,7 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         # None = leave the data directory's saved toggle alone (viewer owns it).
         snapshot_query_plans=getattr(args, "snapshot_query_plans", None),
         allow_plan_pinning=bool(getattr(args, "allow_plan_pinning", False)),
+        allow_explain_analyze=bool(getattr(args, "allow_explain_analyze", False)),
         snapshot_query_plans_per_node=int(
             getattr(args, "snapshot_query_plans_per_node", SNAPSHOT_QUERY_PLANS_PER_NODE)
         ),
@@ -698,6 +711,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                 port=int(args.serve_port),
                 seed_dsn=settings.seed_dsn,
                 allow_plan_pinning=settings.allow_plan_pinning,
+                allow_explain_analyze=settings.allow_explain_analyze,
                 allowed_hosts=getattr(args, "serve_allowed_host", None),
             ):
                 tail = (

@@ -2,6 +2,13 @@
 
 All notable functional changes to **ybtop** are listed here by release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) (newest first).
 
+## [0.1.15] — 2026-09-28
+
+### Added
+
+- **EXPLAIN ANALYZE of recorded statements (opt-in, `watch --allow-explain-analyze`):** From a statement's ASH report, run `EXPLAIN (ANALYZE[, DIST][, DEBUG])` with the parameter values of its slowest recorded QPM execution, on the node that recorded them, in its database and as the role that ran it. A confirmation dialog shows the statement with its values and every statement sent: a statement timeout you choose (default 30 s; the client cancels at the same deadline), `BEGIN READ ONLY` — or, for a statement that writes or locks, a transaction that is always rolled back with `yb_disable_transactional_writes` forced off — `SET LOCAL ROLE`, a plan-only `EXPLAIN (FORMAT JSON)`, the `EXPLAIN (ANALYZE …)` and `ROLLBACK`. Values are bound, never spliced into the SQL. Refused, with the reason: parameters QPM truncated or redacted, constants `pg_stat_statements` normalised away, other statement types, and calls a rollback cannot undo. The plan panel's **Explain analyze** tab shows the result against the recorded slowest and says whether the planner chose the plan that execution ran; the query switches to **inline literals**. One run at a time; the last 25 results are kept in the collector's memory.
+- **Snapshot (`yb_pg_stat_plans.roles`):** oid → name for the roles in the QPM rows.
+
 ## [0.1.14] — 2026-09-28
 
 ### Added

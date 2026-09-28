@@ -292,6 +292,10 @@
     const tb = p.get("table_id");
     ashTableIdFilter = tb != null && String(tb).trim() !== "" ? String(tb).trim() : null;
     readViewerToggleParams(p);
+    // The URL is the source of truth on load and on Back/Forward.
+    qpmPlanView = p.get("plan_view") === "explain" ? "explain" : "plans";
+    qpmShowLiterals = urlParamIsTrue(p, "literals");
+    qpmViewScope = null;
     if (activeViewerSection !== "ash") {
       ashQueryIdFilter = null;
       ashCanonicalizeFilter = false;
@@ -344,6 +348,8 @@
       }
       if (ashNodeIdFilter) p.set("node", ashNodeIdFilter);
       if (ashTableIdFilter) p.set("table_id", ashTableIdFilter);
+      if (ashQueryIdFilter && qpmPlanView === "explain") p.set("plan_view", "explain");
+      if (ashQueryIdFilter && qpmShowLiterals) p.set("literals", "t");
     }
     applyViewerToggleParams(p);
     const qs = p.toString();
@@ -2740,12 +2746,1418 @@
     return btn;
   }
 
+  /* ---- EXPLAIN ANALYZE with the slowest recorded parameters: see ybtop/explain.py ---- */
+
+  /** QPM keeps max_exec_time_params in 256 bytes; text cut to fit is exactly this long. */
+  const QPM_PARAM_TEXT_SLOT_BYTES = 255;
+  const QPM_EXPLAIN_DEFAULT_TIMEOUT_S = 30;
+  const QPM_EXPLAIN_MAX_TIMEOUT_S = 600;
+  const QPM_EXPLAIN_POLL_MS = 1000;
+  const QPM_READ_VERBS = ["SELECT", "WITH", "VALUES", "TABLE"];
+  const QPM_WRITE_VERBS = ["INSERT", "UPDATE", "DELETE", "MERGE"];
+
+  /**
+   * Inverse of PostgreSQL's BuildParamLogString, the format QPM stores:
+   * "$1 = 'it''s', $2 = NULL" -> {1: "it's", 2: null}. Throws on anything else.
+   * Mirrors explain.parse_param_text; a parity test holds the two together.
+   */
+  function qpmParseParamText(text) {
+    const out = {};
+    if (text == null || text === "") return out;
+    const s = String(text);
+    const head = /\$(\d+) = /y;
+    let i = 0;
+    for (;;) {
+      head.lastIndex = i;
+      const m = head.exec(s);
+      if (!m) throw new Error("expected $N = at offset " + i);
+      const num = Number(m[1]);
+      i = head.lastIndex;
+      let val;
+      if (s.startsWith("NULL", i)) {
+        val = null;
+        i += 4;
+      } else if (s[i] === "'") {
+        i += 1;
+        let buf = "";
+        for (;;) {
+          const j = s.indexOf("'", i);
+          if (j < 0) throw new Error("unterminated value for $" + num);
+          buf += s.slice(i, j);
+          if (s[j + 1] === "'") {
+            buf += "'";
+            i = j + 2;
+            continue;
+          }
+          i = j + 1;
+          break;
+        }
+        val = buf;
+      } else {
+        throw new Error("expected a quoted value or NULL for $" + num);
+      }
+      if (Object.prototype.hasOwnProperty.call(out, num)) throw new Error("$" + num + " appears twice");
+      out[num] = val;
+      if (i === s.length) break;
+      if (!s.startsWith(", ", i) || i + 2 === s.length) throw new Error("expected ', ' after $" + num);
+      i += 2;
+    }
+    const keys = Object.keys(out).map(Number).sort((a, b) => a - b);
+    keys.forEach((k, idx) => {
+      if (k !== idx + 1) throw new Error("parameters are not numbered $1..$" + keys.length);
+    });
+    return out;
+  }
+
+  /**
+   * PostgreSQL's identifier bytes: ASCII letters, digits, _ and $, and anything
+   * non-ASCII (the lexer takes every byte from 0x80 up as part of a name). Works on
+   * UTF-16 units: both halves of an astral character count, as the whole one does.
+   */
+  function qpmIdentChar(ch) {
+    return ch != null && ch !== "" && (ch === "_" || ch === "$" || /[A-Za-z0-9]/.test(ch) || ch.charCodeAt(0) >= 0x80);
+  }
+
+  /**
+   * Walk SQL outside quotes, comments and dollar-quoted bodies, calling
+   * onPlaceholder(start, end, n) for each $n. A $n glued to an identifier
+   * (foo$1 is a legal name) is not one. Mirrors explain._scan.
+   */
+  function qpmScanSql(sql, onPlaceholder, onLiteral) {
+    const s = String(sql == null ? "" : sql);
+    const n = s.length;
+    let i = 0;
+    while (i < n) {
+      const c = s[i];
+      const start = i;
+      if (c === "'") {
+        // E'...' honours backslash escapes; plain strings only ''.
+        const esc =
+          i > 0 && (s[i - 1] === "e" || s[i - 1] === "E") && (i < 2 || !qpmIdentChar(s[i - 2]));
+        i += 1;
+        while (i < n) {
+          if (esc && s[i] === "\\") {
+            i += 2;
+            continue;
+          }
+          if (s[i] === "'") {
+            if (s[i + 1] === "'") {
+              i += 2;
+              continue;
+            }
+            break;
+          }
+          i += 1;
+        }
+        i += 1;
+        if (onLiteral) onLiteral(start, Math.min(i, n));
+      } else if (c === '"') {
+        i += 1;
+        while (i < n) {
+          if (s[i] === '"') {
+            if (s[i + 1] === '"') {
+              i += 2;
+              continue;
+            }
+            break;
+          }
+          i += 1;
+        }
+        i += 1;
+      } else if (c === "-" && s.startsWith("--", i)) {
+        const j = s.indexOf("\n", i);
+        i = j < 0 ? n : j + 1;
+        if (onLiteral) onLiteral(start, i);
+      } else if (c === "/" && s.startsWith("/*", i)) {
+        let depth = 1;
+        i += 2;
+        while (i < n && depth) {
+          if (s.startsWith("/*", i)) {
+            depth += 1;
+            i += 2;
+          } else if (s.startsWith("*/", i)) {
+            depth -= 1;
+            i += 2;
+          } else {
+            i += 1;
+          }
+        }
+        if (onLiteral) onLiteral(start, i);
+      } else if (c === "$") {
+        if (i > 0 && qpmIdentChar(s[i - 1])) {
+          i += 1;
+          continue;
+        }
+        const ph = /\$(\d+)/y;
+        ph.lastIndex = i;
+        const m = ph.exec(s);
+        if (m) {
+          onPlaceholder(i, ph.lastIndex, Number(m[1]));
+          i = ph.lastIndex;
+          continue;
+        }
+        const dq = /\$([A-Za-z_][A-Za-z_0-9]*)?\$/y;
+        dq.lastIndex = i;
+        const d = dq.exec(s);
+        if (d) {
+          const close = s.indexOf(d[0], dq.lastIndex);
+          i = close < 0 ? n : close + d[0].length;
+          if (onLiteral) onLiteral(start, i);
+          continue;
+        }
+        i += 1;
+      } else {
+        i += 1;
+      }
+    }
+  }
+
+  function qpmPlaceholders(sql) {
+    const out = new Set();
+    qpmScanSql(sql, (a, b, num) => out.add(num));
+    return out;
+  }
+
+  /** A standard-conforming SQL literal, for display. Nothing built here is executed. */
+  function qpmSqlLiteral(v) {
+    return v == null ? "NULL" : "'" + String(v).replace(/'/g, "''") + "'";
+  }
+
+  /** The statement with each $n shown as its recorded value -- display only. */
+  function qpmInlineLiterals(sql, values) {
+    const s = String(sql == null ? "" : sql);
+    const vals = values || {};
+    let out = "";
+    let last = 0;
+    qpmScanSql(s, (a, b, num) => {
+      if (Object.prototype.hasOwnProperty.call(vals, num)) {
+        out += s.slice(last, a) + qpmSqlLiteral(vals[num]);
+        last = b;
+      }
+    });
+    return out + s.slice(last);
+  }
+
+  function qpmUtf8Length(s) {
+    return new TextEncoder().encode(String(s)).length;
+  }
+
+  /** Why these recorded parameters cannot be replayed, or null. Mirrors explain.param_text_problem. */
+  function qpmParamTextProblem(text) {
+    if (text == null || text === "") return null;
+    if (qpmUtf8Length(text) === QPM_PARAM_TEXT_SLOT_BYTES) {
+      return (
+        "QPM cut this statement's slowest parameters short (they did not fit its "
+        + "255-byte slot), so they cannot be replayed."
+      );
+    }
+    let values;
+    try {
+      values = qpmParseParamText(text);
+    } catch (e) {
+      return "QPM's record of the slowest parameters could not be read.";
+    }
+    const vs = Object.keys(values).map((k) => values[k]);
+    if (vs.length && vs.every((v) => v === "?")) {
+      return (
+        "QPM shows the parameters as '?': yb_pg_stat_plans_show_max_exec_params is "
+        + "off for ybtop's login."
+      );
+    }
+    return null;
+  }
+
+  /** {values: [$1..$k], error: null} to bind, or {values: null, error}. Mirrors explain.bind_values. */
+  function qpmBindValues(sql, text) {
+    const problem = qpmParamTextProblem(text);
+    if (problem) return { values: null, error: problem };
+    const values = qpmParseParamText(text);
+    const nums = Object.keys(values).map(Number);
+    const refs = qpmPlaceholders(sql);
+    if (!refs.size) {
+      if (nums.length) return { values: null, error: "the recorded parameters do not match the statement text" };
+      return { values: [], error: null };
+    }
+    // A loop, not Math.max(...refs): a bulk INSERT can carry 100k+ placeholders,
+    // past what a spread call can take.
+    let top = 0;
+    refs.forEach((k) => {
+      if (k > top) top = k;
+    });
+    for (let k = 1; k <= top; k++) {
+      if (!Object.prototype.hasOwnProperty.call(values, k)) {
+        if (!nums.length) {
+          return {
+            values: null,
+            error:
+              "pg_stat_statements replaced this statement's constants with $1.. and QPM "
+              + "recorded no parameter values for it, so there is nothing to replay.",
+          };
+        }
+        // Values are always $1..$k, so what is missing is past them: constants that
+        // pg_stat_statements numbered after the statement's bind parameters.
+        return {
+          values: null,
+          error:
+            "pg_stat_statements replaced a constant in this statement with $" + k + ", and QPM "
+            + "records bind parameters only, so its value is unknown.",
+        };
+      }
+    }
+    if (nums.some((k) => k > top)) {
+      return { values: null, error: "the recorded parameters do not match the statement text" };
+    }
+    const out = [];
+    for (let k = 1; k <= top; k++) out.push(values[k]);
+    return { values: out, error: null };
+  }
+
+  /** First keyword, past comments, whitespace and opening parentheses. */
+  function qpmFirstVerb(sql) {
+    const s = String(sql == null ? "" : sql);
+    const n = s.length;
+    let i = 0;
+    while (i < n) {
+      if (" \t\n\r\f\v".indexOf(s[i]) >= 0 || s[i] === "(") {
+        i += 1;
+      } else if (s.startsWith("--", i)) {
+        const j = s.indexOf("\n", i);
+        i = j < 0 ? n : j + 1;
+      } else if (s.startsWith("/*", i)) {
+        let depth = 1;
+        i += 2;
+        while (i < n && depth) {
+          if (s.startsWith("/*", i)) {
+            depth += 1;
+            i += 2;
+          } else if (s.startsWith("*/", i)) {
+            depth -= 1;
+            i += 2;
+          } else {
+            i += 1;
+          }
+        }
+      } else {
+        const m = /^[A-Za-z]+/.exec(s.slice(i));
+        return m ? m[0].toUpperCase() : "";
+      }
+    }
+    return "";
+  }
+
+  /**
+   * {kind: "read" | "write" | null, label}. Mirrors explain.statement_kind: writes run
+   * in a transaction that is rolled back, everything else READ ONLY; null is refused.
+   */
+  function qpmStatementKind(sql, planText) {
+    const verb = qpmFirstVerb(sql);
+    const isWriteVerb = QPM_WRITE_VERBS.indexOf(verb) >= 0;
+    if (QPM_READ_VERBS.indexOf(verb) < 0 && !isWriteVerb) return { kind: null, label: verb || "?" };
+    const plan = String(planText == null ? "" : planText);
+    const op = /"Operation":\s*"(Insert|Update|Delete|Merge)"/.exec(plan);
+    const writes =
+      isWriteVerb
+      || /"Node Type":\s*"(?:ModifyTable|LockRows)"/.test(plan)
+      || /^\s*(?:->\s+)?(?:(?:Insert|Update|Delete|Merge) on |LockRows)/m.test(plan);
+    let label;
+    if (isWriteVerb) label = verb;
+    else if (op) label = verb + " … " + op[1].toUpperCase();
+    else if (writes) label = verb === "SELECT" ? "SELECT … FOR UPDATE" : verb + " (locks rows)";
+    else label = verb;
+    return { kind: writes ? "write" : "read", label };
+  }
+
+  /** The statement with strings, comments and dollar-quoted bodies blanked. Mirrors explain._code_only. */
+  function qpmCodeOnly(sql) {
+    const s = String(sql == null ? "" : sql);
+    const chars = s.split("");
+    qpmScanSql(s, () => {}, (a, b) => {
+      for (let k = a; k < b; k++) chars[k] = " ";
+    });
+    return chars.join("");
+  }
+
+  /**
+   * Calls whose effect a ROLLBACK does not undo (other sessions, the server, files,
+   * other databases, sequences, statistics). Mirrors explain._SIDE_EFFECT_CALL.
+   *
+   * A leading group, not a lookbehind: this is built while app.js loads, and a
+   * browser without lookbehind (Safari before 16.4) would throw there and take
+   * the whole viewer down with it.
+   */
+  const QPM_SIDE_EFFECT_CALL = new RegExp(
+    '(?:^|[^A-Za-z0-9_$\\u{80}-\\u{10FFFF}])"?('
+      + "pg_terminate_backend|pg_cancel_backend|pg_reload_conf|pg_rotate_logfile|pg_promote"
+      + "|pg_create_restore_point|pg_switch_wal|pg_(?:start|stop)_backup|pg_backup_(?:start|stop)"
+      + "|pg_stat_statements_reset|pg_stat_reset[a-z_]*|pg_stat_clear_snapshot"
+      + "|pg_(?:create|drop)_[a-z_]*replication_slot|pg_replication_origin_[a-z_]+"
+      + "|pg_file_[a-z_]+|lo_export|lo_import"
+      + "|dblink[a-z_]*|setval"
+      + "|yb_pg_stat_plans_(?:reset|insert)[a-z_]*|yb_reset_analyze_statistics"
+      + "|yb_cancel_transaction|yb_query_diagnostics|yb_increment_[a-z_]+"
+      + ')"?[ \\t\\n\\r\\f\\v]*\\(',
+    "iu"
+  );
+
+  function qpmSideEffectCall(sql) {
+    const m = QPM_SIDE_EFFECT_CALL.exec(qpmCodeOnly(sql));
+    return m ? m[1].toLowerCase() : null;
+  }
+
+  function qpmSideEffectReason(fn) {
+    return "This statement calls " + fn + "(), whose effect a rollback does not undo, so it is not replayed.";
+  }
+
+  /** Why qpmStatementKind refused a statement. Mirrors explain.not_replayable_reason. */
+  function qpmNotReplayableReason(sql, label) {
+    if (String(sql == null ? "" : sql).replace(/^[ \t\n\r\f\v]+/, "").startsWith("<")) {
+      return "pg_stat_statements does not show this statement's text to ybtop's login.";
+    }
+    return (
+      "Only SELECT, WITH, VALUES, TABLE, INSERT, UPDATE, DELETE and MERGE statements are "
+      + "replayed; this one starts with " + (label || "?") + "."
+    );
+  }
+
+  /** YugabyteDB ignores DEBUG without DIST, so DEBUG implies it. */
+  function qpmExplainOptions(dist, debug) {
+    const out = ["ANALYZE"];
+    if (dist || debug) out.push("DIST");
+    if (debug) out.push("DEBUG");
+    return out;
+  }
+
+  /** pg_stat_statements text for a queryid: this database on this node first. Mirrors explain.statement_text. */
+  function qpmStatementText(doc, queryid, datname, preferNode) {
+    const per = (doc && doc.pg_stat_statements && doc.pg_stat_statements.per_node) || {};
+    const nodes = Object.keys(per).sort();
+    const at = nodes.indexOf(preferNode);
+    if (at >= 0) {
+      nodes.splice(at, 1);
+      nodes.unshift(preferNode);
+    }
+    let fallback = null;
+    for (const nid of nodes) {
+      for (const r of per[nid] || []) {
+        if (!r || String(r.queryid) !== String(queryid) || !r.query) continue;
+        if (datname == null || String(r.dbname || "") === String(datname)) return String(r.query);
+        if (fallback == null) fallback = String(r.query);
+      }
+    }
+    return fallback;
+  }
+
+  /**
+   * The recorded execution EXPLAIN ANALYZE replays: the slowest one in scope that can
+   * be replayed. {ok: true, ...target} or {ok: false, reason}; null when nothing in
+   * scope was recorded. The server re-derives the statement and values from the
+   * snapshot for the row this names (explain.resolve_target), never from the page.
+   */
+  function qpmExplainTarget(doc, queryIds, dbids) {
+    const qpm = doc && doc.yb_pg_stat_plans;
+    const perNode = (qpm && qpm.per_node) || {};
+    const cands = [];
+    Object.keys(perNode)
+      .sort()
+      .forEach((nid) => {
+        (perNode[nid] || []).forEach((r) => {
+          if (!r || r.queryid == null) return;
+          if (queryIds && queryIds.size && !queryIds.has(String(r.queryid))) return;
+          if (dbids && !dbids.has(String(r.dbid))) return;
+          cands.push({ nid, r });
+        });
+      });
+    if (!cands.length) return null;
+    // Stable: equal times keep node order, so the pick is deterministic.
+    cands.sort((a, b) => (Number(b.r.max_exec_time) || 0) - (Number(a.r.max_exec_time) || 0));
+    const databases = (qpm && qpm.databases) || {};
+    const plans = (qpm && qpm.plans) || {};
+    const roles = (qpm && qpm.roles) || {};
+    const slowestMs = Number(cands[0].r.max_exec_time);
+    let firstReason = null;
+    let otherReason = null;
+    for (const { nid, r } of cands) {
+      const dbid = String(r.dbid);
+      const datname = databases[dbid];
+      let why = null;
+      let sql = null;
+      let kind = null;
+      let bound = null;
+      // Same order as explain.resolve_target, so page and server give one reason.
+      if (r.plan_ref == null || String(r.plan_ref) === "") {
+        why = "QPM kept no plan for this execution.";
+      } else if (r.userid == null || String(r.userid) === "") {
+        why = "QPM did not record which role ran this statement, so it is not replayed.";
+      } else if (!datname) {
+        why = "this plan was recorded in a database that no longer exists (oid " + dbid + ")";
+      } else {
+        sql = qpmStatementText(doc, r.queryid, datname, nid);
+        if (!sql) why = "pg_stat_statements text for this query_id is not in the snapshot";
+      }
+      if (!why) {
+        kind = qpmStatementKind(sql, (plans[r.plan_ref] || {}).plan);
+        if (!kind.kind) why = qpmNotReplayableReason(sql, kind.label);
+      }
+      if (!why) {
+        const fn = qpmSideEffectCall(sql);
+        if (fn) why = qpmSideEffectReason(fn);
+      }
+      if (!why) {
+        bound = qpmBindValues(sql, r.max_exec_time_params);
+        if (bound.error) why = bound.error;
+      }
+      if (why) {
+        if (firstReason == null) firstReason = why;
+        else if (otherReason == null && why !== firstReason) otherReason = why;
+        continue;
+      }
+      const shown = r.max_exec_time_params ? qpmParseParamText(r.max_exec_time_params) : {};
+      const userid = r.userid == null ? null : String(r.userid);
+      return {
+        ok: true,
+        queryid: String(r.queryid),
+        planid: String(r.planid),
+        plan_ref: String(r.plan_ref),
+        dbid,
+        datname: String(datname),
+        node: nid,
+        userid,
+        role: userid != null && roles[userid] != null ? String(roles[userid]) : null,
+        statement: sql,
+        paramsText: r.max_exec_time_params == null ? null : String(r.max_exec_time_params),
+        sqlDisplay: qpmInlineLiterals(sql, shown),
+        hasParams: qpmPlaceholders(sql).size > 0,
+        kind: kind.kind,
+        label: kind.label,
+        recordedMaxMs: Number(r.max_exec_time),
+        slowestMs,
+        // The very slowest could not be replayed; say why this one was picked instead.
+        skippedReason: Number(r.max_exec_time) < slowestMs ? firstReason : null,
+      };
+    }
+    // The slowest execution's reason first; when the rest fail for another one
+    // (a family of truncated and normalised variants), that one matters too.
+    return { ok: false, reason: firstReason, otherReason, slowestMs };
+  }
+
+  /** Node types with their join type, relation and index, depth-first: a plan's shape. */
+  function qpmPlanSignature(planText) {
+    let root = null;
+    try {
+      root = JSON.parse(String(planText));
+    } catch (e) {
+      return null;
+    }
+    const parts = [];
+    function walk(node, depth) {
+      if (!node || typeof node !== "object") return;
+      parts.push(
+        depth + ":" + ["Node Type", "Join Type", "Relation Name", "Index Name"]
+          .map((k) => (node[k] == null ? "" : String(node[k])))
+          .join("/")
+      );
+      (node.Plans || []).forEach((c) => walk(c, depth + 1));
+    }
+    (Array.isArray(root) ? root : [root]).forEach((e) => walk(e && e.Plan ? e.Plan : e, 0));
+    return parts.length ? parts.join(" ") : null;
+  }
+
+  /**
+   * Which recorded plan the planner chose for the replay: {group, index}, with
+   * group null for a plan QPM has not recorded; null when there is no plan to compare.
+   */
+  function qpmMatchRecordedPlan(planJson, groups, texts) {
+    const sig = qpmPlanSignature(planJson);
+    if (!sig) return null;
+    let comparable = 0;
+    for (let i = 0; i < (groups || []).length; i++) {
+      const t = (texts || {})[groups[i].plan_ref];
+      const other = t ? qpmPlanSignature(t.plan) : null;
+      if (other == null) continue;
+      comparable += 1;
+      if (other === sig) return { group: groups[i], index: i };
+    }
+    // Plans recorded as text, or not at all: nothing to say "not recorded" against.
+    return comparable ? { group: null, index: -1 } : null;
+  }
+
+  /**
+   * How the replay's plan relates to the recorded ones, as {text, warn}, or null.
+   *
+   * A run replays one recorded execution (run.planid / run.plan_ref), so the note
+   * says whether the planner chose that same plan again. If it did, a replay far
+   * faster than the recorded slowest was not slow because of its plan.
+   */
+  function qpmReplayPlanNote(match, run, groups) {
+    if (!match) return null;
+    const ran = (groups || []).find((g) =>
+      (g.variants || [{ planid: g.planid, plan_ref: g.plan_ref }]).some(
+        (v) => String(v.plan_ref) === String(run && run.plan_ref) && String(v.planid) === String(run && run.planid)
+      )
+    );
+    const ranText = ran ? "the slowest execution ran planid " + ran.planid : null;
+    if (!match.group) {
+      return {
+        warn: true,
+        text:
+          "The planner chose a plan QPM has not recorded for this statement"
+          + (ranText ? "; " + ranText : "")
+          + ". The replay is planned for these values: the application may have been on a generic"
+          + " prepared plan, other settings, or older statistics.",
+      };
+    }
+    const g = match.group;
+    const tags = [];
+    if (match.index === 0) tags.push("the fastest recorded plan");
+    if (g.active === false) tags.push("not in use lately");
+    let text = "Same plan shape as recorded planid " + g.planid + (tags.length ? " — " + tags.join(", ") : "") + ".";
+    if (ran === g) text += " It is the plan the slowest execution ran.";
+    else if (ran) text += " Not the plan the slowest execution ran (planid " + ran.planid + ").";
+    return { warn: false, text };
+  }
+
+  function qpmQuoteIdent(name) {
+    return '"' + String(name).replace(/"/g, '""') + '"';
+  }
+
+  /** Exactly what a run sends, for the confirmation dialog. Mirrors explain.run_explain. */
+  function qpmExplainSequence(target, options, timeoutS) {
+    const role = target.role
+      ? qpmQuoteIdent(target.role)
+      : target.userid != null
+        ? "<role oid " + target.userid + ">"
+        : null;
+    return [
+      "SET statement_timeout = '" + timeoutS + "s';",
+      target.kind === "write" ? "BEGIN;" : "BEGIN READ ONLY;",
+      role ? "SET LOCAL ROLE " + role + ";  -- with that role's own settings" : null,
+      "SET LOCAL statement_timeout = '" + timeoutS + "s';",
+      "SET LOCAL yb_disable_transactional_writes = off;  -- so ROLLBACK undoes every write",
+      "EXPLAIN (FORMAT JSON) …;  -- plan only, to match against the recorded plans",
+      "EXPLAIN (" + options.join(", ") + ") …;",
+      "ROLLBACK;",
+    ].filter(Boolean);
+  }
+
+  /** The unindented summary lines EXPLAIN ANALYZE ends with, as [label, value]. */
+  function qpmExplainSummary(planText) {
+    const want = [
+      "Execution Time",
+      "Planning Time",
+      "Storage Read Requests",
+      "Storage Rows Scanned",
+      "Storage Write Requests",
+      "Catalog Read Requests",
+      "Peak Memory Usage",
+    ];
+    const got = {};
+    String(planText == null ? "" : planText)
+      .split("\n")
+      .forEach((line) => {
+        const m = /^([A-Z][A-Za-z ]+):\s*(.+)$/.exec(line);
+        if (m && want.indexOf(m[1]) >= 0 && got[m[1]] == null) got[m[1]] = m[2].trim();
+      });
+    return want.filter((k) => got[k] != null).map((k) => [k, got[k]]);
+  }
+
+  /** Seconds, 1..600; blank or not a plain number -> the default. Mirrors explain.clamp_timeout. */
+  function qpmClampTimeout(v) {
+    const text = v == null || typeof v === "boolean" ? "" : String(v).replace(/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g, "");
+    if (!/^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/.test(text)) {
+      return QPM_EXPLAIN_DEFAULT_TIMEOUT_S;
+    }
+    const n = Number(text);
+    if (!isFinite(n)) return QPM_EXPLAIN_DEFAULT_TIMEOUT_S;
+    return Math.max(1, Math.min(QPM_EXPLAIN_MAX_TIMEOUT_S, Math.floor(n + 0.5)));
+  }
+
+  /**
+   * Fold a GET /api/explain answer into the page's run cache. The server is the
+   * source of truth for the statements asked about: what it no longer has (the
+   * collector restarted) is dropped, or the page would show "running" for ever.
+   */
+  function qpmApplyExplainResponse(cache, dbid, queryIds, body) {
+    (queryIds || []).forEach((q) => cache.delete(String(dbid) + "|" + String(q)));
+    [body && body.run, body && body.active].forEach((run) => {
+      if (run && run.dbid != null && run.queryid != null) {
+        cache.set(String(run.dbid) + "|" + String(run.queryid), run);
+      }
+    });
+    return cache;
+  }
+
+  /** The drilldown a plan view belongs to, from the URL alone -- stable across Prev/Next. */
+  function qpmViewScopeKey(queryId, canonicalize, dbnameParam) {
+    return String(queryId) + "|" + (canonicalize ? "family|" + (dbnameParam || "") : "query");
+  }
+
+  /** The statements to ask the collector about: the one a run would replay first. */
+  function qpmRunQueryIds(scopeIds, target) {
+    const out = [];
+    if (target && target.ok) out.push(String(target.queryid));
+    (scopeIds || []).forEach((q) => {
+      if (out.indexOf(String(q)) < 0) out.push(String(q));
+    });
+    return out.slice(0, 200);
+  }
+
+  /* ---- EXPLAIN ANALYZE: view state, runs from the server, polling ---- */
+
+  /** Drilldown view state, mirrored in the URL as plan_view=explain and literals=t. */
+  let qpmPlanView = "plans";
+  let qpmShowLiterals = false;
+  /** Which drilldown that state belongs to; a different query starts on its plans. */
+  let qpmViewScope = null;
+  /** "dbid|queryid" -> the latest run the server reported for that statement. */
+  const qpmExplainRuns = new Map();
+  /** {available, reason} from the collector, once asked. */
+  let qpmExplainAvail = null;
+  /** The run in flight anywhere on this collector: one at a time. */
+  let qpmExplainActive = null;
+  /** What the poller asks about: the statements of the panel on screen. */
+  let qpmExplainWatch = null;
+  /** True for the whole of a poll, await included: a redraw then must not start a second loop. */
+  let qpmExplainPolling = false;
+  /** Run ids the user asked to cancel, so a redraw keeps saying "Cancelling". */
+  const qpmExplainCancelling = new Set();
+  /**
+   * The plan panel on screen, for the query banner's EXPLAIN button: open its
+   * dialog, or bring its result into view. Set on every render; the banner is
+   * drawn just before the panel, so it looks this up when clicked.
+   */
+  let qpmPanelActions = null;
+  /** Redraws for on-screen explain surfaces (panel, query row); pruned when detached. */
+  const qpmExplainListeners = new Set();
+
+  function qpmExplainPrefs() {
+    let p = {};
+    try {
+      p = JSON.parse(window.localStorage.getItem("ybtop.explainPrefs") || "{}") || {};
+    } catch (e) {
+      p = {};
+    }
+    return {
+      dist: !!p.dist,
+      debug: !!p.debug,
+      timeout_s: qpmClampTimeout(p.timeout_s == null ? QPM_EXPLAIN_DEFAULT_TIMEOUT_S : p.timeout_s),
+    };
+  }
+
+  function qpmSaveExplainPrefs(p) {
+    try {
+      window.localStorage.setItem("ybtop.explainPrefs", JSON.stringify(p));
+    } catch (e) {
+      /* a convenience only */
+    }
+  }
+
+  function qpmNotifyExplain() {
+    qpmExplainListeners.forEach((fn) => {
+      if (!fn.isLive()) qpmExplainListeners.delete(fn);
+      else fn();
+    });
+  }
+
+  function qpmListen(fn, isLive) {
+    fn.isLive = isLive;
+    qpmExplainListeners.add(fn);
+  }
+
+  /** Newest run among these statements, from what the server last reported. */
+  function qpmLatestRun(dbid, queryIds) {
+    let best = null;
+    (queryIds || []).forEach((q) => {
+      const run = qpmExplainRuns.get(String(dbid) + "|" + String(q));
+      if (run && (best == null || String(run.started_utc) > String(best.started_utc))) best = run;
+    });
+    return best;
+  }
+
+  function qpmRememberRun(run) {
+    if (run && run.dbid != null && run.queryid != null) {
+      qpmExplainRuns.set(String(run.dbid) + "|" + String(run.queryid), run);
+    }
+  }
+
+  async function qpmFetchExplain(dbid, queryIds) {
+    try {
+      const q =
+        "api/explain?dbid=" + encodeURIComponent(String(dbid))
+        + "&queryids=" + encodeURIComponent(Array.from(queryIds || []).join(","));
+      const res = await fetch(q, { cache: "no-store" });
+      if (!res.ok) {
+        if (res.status === 404) qpmExplainAvail = { available: false, reason: null, missing: true };
+        return null;
+      }
+      const body = await res.json();
+      qpmExplainAvail = { available: !!body.available, reason: body.reason || null };
+      qpmExplainActive = body.active || null;
+      qpmApplyExplainResponse(qpmExplainRuns, dbid, queryIds, body);
+      return body;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function qpmPostExplain(route, payload) {
+    const res = await fetch("api/" + route, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    let body = {};
+    try {
+      body = await res.json();
+    } catch (e) {
+      body = {};
+    }
+    if (!res.ok) {
+      const err = new Error(body.error || "HTTP " + res.status);
+      err.active = body.active || null;
+      throw err;
+    }
+    return body;
+  }
+
+  /** Poll while the watched statement has a run in flight; one poller for the page. */
+  function qpmEnsureExplainPoll() {
+    if (qpmExplainPolling) return;
+    qpmExplainPolling = true;
+    const tick = async () => {
+      const w = qpmExplainWatch;
+      if (w) {
+        await qpmFetchExplain(w.dbid, w.queryIds);
+        qpmNotifyExplain();
+      }
+      // A failed poll keeps the last state, so a run in flight keeps being polled.
+      const run = w ? qpmLatestRun(w.dbid, w.queryIds) : null;
+      if (run && run.state === "running") setTimeout(tick, QPM_EXPLAIN_POLL_MS);
+      else qpmExplainPolling = false;
+    };
+    setTimeout(tick, QPM_EXPLAIN_POLL_MS);
+  }
+
+  function qpmSetPlanView(view) {
+    qpmPlanView = view === "explain" ? "explain" : "plans";
+    writeViewerStateToUrl();
+    qpmNotifyExplain();
+  }
+
+  function qpmFmtClock(iso) {
+    const ms = Date.parse(String(iso || ""));
+    return isFinite(ms) ? new Date(ms).toISOString().slice(11, 19) + " UTC" : "—";
+  }
+
+  /* ---- EXPLAIN ANALYZE: confirmation dialog ---- */
+
+  /**
+   * The "this really runs it" dialog. Shows the statement with its values inlined,
+   * the options, the timeout, and the exact sequence that will be sent.
+   */
+  function qpmOpenExplainDialog(target, snapshotFile, onStarted) {
+    const dlg = el("dialog", { className: "qpm-dialog", "aria-labelledby": "qpm-dialog-title" });
+    const form = el("form", { method: "dialog", className: "qpm-dialog-form" });
+    dlg.appendChild(form);
+    const title = el("h3", { id: "qpm-dialog-title", className: "qpm-dialog-title", textContent: "Run EXPLAIN ANALYZE?" });
+    form.appendChild(title);
+    const actions = el("div", { className: "qpm-dialog-actions" });
+    const closeBtn = el("button", { type: "button", className: "qpm-enable-btn qpm-dialog-cancel", textContent: "Cancel" });
+    // Once Run is clicked the collector may already be starting the statement, so
+    // the dialog stays until the answer is in; cancel from the result view.
+    let starting = false;
+    closeBtn.addEventListener("click", () => {
+      if (!starting) dlg.close();
+    });
+    dlg.addEventListener("cancel", (ev) => {
+      if (starting) ev.preventDefault();
+    });
+    dlg.addEventListener("close", () => dlg.remove());
+
+    const avail = qpmExplainAvail;
+    const blocker =
+      avail && avail.missing
+        ? "This viewer has no EXPLAIN endpoint -- it is an older ybtop, or files served without ybtop watch."
+        : avail && !avail.available
+          ? avail.reason || "EXPLAIN ANALYZE is not available from this viewer."
+          : !target || !target.ok
+            ? "This statement cannot be replayed: " + ((target && target.reason) || "nothing recorded for it.")
+              + (target && target.otherReason ? " Its other recorded executions: " + target.otherReason : "")
+            : null;
+    if (blocker) {
+      // Nothing can run, so don't ask as if it could.
+      title.textContent = "EXPLAIN ANALYZE";
+      form.appendChild(el("p", { className: "qpm-dialog-note", textContent: blocker }));
+      closeBtn.textContent = "Close";
+      actions.appendChild(closeBtn);
+      form.appendChild(actions);
+      document.body.appendChild(dlg);
+      dlg.showModal();
+      closeBtn.focus();
+      return;
+    }
+
+    form.appendChild(
+      el("p", {
+        className: "qpm-dialog-warn",
+        textContent:
+          "This executes the statement on the cluster, once, with the parameters of its slowest "
+          + "recorded execution -- including any functions it calls.",
+      })
+    );
+    if (target.kind === "write") {
+      form.appendChild(
+        el("p", {
+          className: "qpm-dialog-warn qpm-dialog-warn--write",
+          textContent:
+            target.label + ": its changes are made inside a transaction that is always rolled "
+            + "back, but it holds their row locks while it runs, and sequence values it draws "
+            + "are used up.",
+        })
+      );
+    }
+    const meta = el("div", { className: "qpm-dialog-meta" });
+    [
+      ["query_id", target.queryid],
+      ["slowest", qpmFmtMs(target.recordedMaxMs) + " on " + target.node],
+      ["database", target.datname],
+      ["as", target.role || (target.userid != null ? "role oid " + target.userid : "ybtop's login")],
+    ].forEach(([k, v]) => qpmMetric(meta, k, v));
+    form.appendChild(meta);
+    if (target.skippedReason) {
+      form.appendChild(
+        el("p", {
+          className: "qpm-dialog-note",
+          textContent:
+            "The slowest execution (" + qpmFmtMs(target.slowestMs) + ") cannot be replayed -- "
+            + target.skippedReason + " This is the slowest one that can.",
+        })
+      );
+    }
+    form.appendChild(el("pre", { className: "qpm-dialog-sql", textContent: target.sqlDisplay }));
+
+    const prefs = qpmExplainPrefs();
+    const opts = el("div", { className: "qpm-dialog-opts" });
+    function check(label, checked, disabled, title) {
+      const lab = el("label", { className: "qpm-dialog-check", title: title || "" });
+      const box = el("input", { type: "checkbox" });
+      box.checked = !!checked;
+      box.disabled = !!disabled;
+      lab.appendChild(box);
+      lab.appendChild(document.createTextNode(label));
+      opts.appendChild(lab);
+      return box;
+    }
+    check("ANALYZE", true, true, "Always on: the point is to run it");
+    const distBox = check("DIST", prefs.dist, false, "Storage requests, rows scanned and RPC timing per node");
+    const debugBox = check("DEBUG", prefs.debug, false, "DocDB and RocksDB metrics per node; needs DIST");
+    const tlab = el("label", { className: "qpm-dialog-timeout" });
+    tlab.appendChild(document.createTextNode("Statement timeout"));
+    const tin = el("input", {
+      type: "number",
+      min: "1",
+      max: String(QPM_EXPLAIN_MAX_TIMEOUT_S),
+      step: "1",
+      value: String(prefs.timeout_s),
+      "aria-label": "Statement timeout in seconds",
+    });
+    tlab.appendChild(tin);
+    tlab.appendChild(document.createTextNode("s"));
+    opts.appendChild(tlab);
+    form.appendChild(opts);
+
+    const seq = el("pre", { className: "qpm-dialog-seq" });
+    form.appendChild(seq);
+    const msg = el("p", { className: "qpm-dialog-note qpm-dialog-note--err" });
+    msg.hidden = true;
+    form.appendChild(msg);
+    const runBtn = el("button", {
+      type: "button",
+      className: "qpm-enable-btn qpm-dialog-run" + (target.kind === "write" ? " qpm-enable-btn--danger" : ""),
+      textContent: target.kind === "write" ? "Run, then roll back" : "Run",
+    });
+    // One run at a time per collector: say so now rather than after the click.
+    const busy = qpmExplainActive && qpmExplainActive.state === "running" ? qpmExplainActive : null;
+    if (busy) {
+      runBtn.disabled = true;
+      msg.hidden = false;
+      msg.className = "qpm-dialog-note";
+      msg.textContent =
+        String(busy.queryid) === String(target.queryid)
+          ? "This statement is already running (started " + qpmFmtClock(busy.started_utc) + ")."
+          : "Another EXPLAIN ANALYZE is running (query_id " + busy.queryid + ", started "
+            + qpmFmtClock(busy.started_utc) + "); one runs at a time.";
+    }
+
+    function sync() {
+      // DEBUG needs DIST: tick it and hold it while DEBUG is on.
+      if (debugBox.checked) distBox.checked = true;
+      distBox.disabled = debugBox.checked;
+      seq.textContent = qpmExplainSequence(
+        target,
+        qpmExplainOptions(distBox.checked, debugBox.checked),
+        qpmClampTimeout(tin.value)
+      ).join("\n");
+    }
+    distBox.addEventListener("change", sync);
+    debugBox.addEventListener("change", sync);
+    tin.addEventListener("input", sync);
+    sync();
+
+    // Enter in the timeout box would submit the form: running must be a click.
+    form.addEventListener("submit", (ev) => ev.preventDefault());
+    runBtn.addEventListener("click", async () => {
+      const chosen = {
+        dist: distBox.checked,
+        debug: debugBox.checked,
+        timeout_s: qpmClampTimeout(tin.value),
+      };
+      tin.value = String(chosen.timeout_s);
+      qpmSaveExplainPrefs(chosen);
+      runBtn.disabled = true;
+      runBtn.textContent = "Starting…";
+      starting = true;
+      closeBtn.disabled = true;
+      msg.hidden = true;
+      msg.className = "qpm-dialog-note qpm-dialog-note--err";
+      try {
+        const body = await qpmPostExplain("explain", {
+          queryid: target.queryid,
+          planid: target.planid,
+          plan_ref: target.plan_ref,
+          dbid: target.dbid,
+          userid: target.userid,
+          node: target.node,
+          file: snapshotFile || "",
+          dist: chosen.dist,
+          debug: chosen.debug,
+          timeout_s: chosen.timeout_s,
+        });
+        qpmRememberRun(body.run);
+        qpmExplainActive = body.run;
+        starting = false;
+        dlg.close();
+        onStarted(body.run);
+      } catch (e) {
+        starting = false;
+        closeBtn.disabled = false;
+        // A 409 names the run in flight; the page shows it (and can cancel it) if it is ours.
+        if (e.active) {
+          qpmRememberRun(e.active);
+          qpmExplainActive = e.active;
+          qpmNotifyExplain();
+        }
+        runBtn.disabled = !!e.active;
+        runBtn.textContent = target.kind === "write" ? "Run, then roll back" : "Run";
+        msg.hidden = false;
+        msg.setAttribute("role", "alert");
+        msg.textContent = String(e.message || e);
+      }
+    });
+
+    actions.appendChild(closeBtn);
+    actions.appendChild(runBtn);
+    form.appendChild(actions);
+    document.body.appendChild(dlg);
+    dlg.showModal();
+    // Cancel has focus: running is a deliberate second step, never an Enter away.
+    closeBtn.focus();
+  }
+
+  /* ---- EXPLAIN ANALYZE: result view ---- */
+
+  /**
+   * One line at the top of the plan panel: the Run button with what it would
+   * replay, or the last run's result with a way to it -- visible without first
+   * switching to the EXPLAIN tab. Muted, with the reason, when nothing can run.
+   */
+  /** "6.2× faster than the recorded 106 ms", or null when there is nothing to compare. */
+  function qpmRatioText(ms, recordedMs) {
+    const ratio = recordedMs > 0 ? ms / recordedMs : null;
+    if (ratio == null || !isFinite(ratio) || ratio <= 0) return null;
+    return (ratio >= 1 ? ratio.toFixed(ratio >= 10 ? 0 : 1) + "× slower" : (1 / ratio).toFixed(1 / ratio >= 10 ? 0 : 1) + "× faster")
+      + " than the recorded " + qpmFmtMs(recordedMs);
+  }
+
+  /**
+   * What the plan panel's EXPLAIN strip shows, from the run, the target and whether
+   * the collector allows it. Pure, so every state is testable:
+   *   button {label, action: "open" | "show", muted, running}
+   *   parts  [[kind, text]] with kind k (key), v, quiet, mono
+   *   link   "Show result →" / "Show progress →" or null
+   */
+  function qpmExplainStripModel(run, target, avail) {
+    const off = !!(avail && !avail.available);
+    const ready = !off && !!(target && target.ok);
+    const running = !!(run && run.state === "running");
+    const parts = [];
+    let button;
+    if (running) {
+      button = { label: "Running…", action: "show", muted: false, running: true };
+      parts.push(["k", "on"], ["v", run.node + (run.role ? " as " + run.role : "")]);
+    } else {
+      button = { label: run ? "Run again" : "Explain analyze", action: "open", muted: !ready, running: false };
+      if (run) {
+        parts.push(["k", "last run"]);
+        if (run.state === "done" && run.execution_ms != null) {
+          parts.push(["v", qpmFmtMs(run.execution_ms)]);
+          const ratio = qpmRatioText(run.execution_ms, run.recorded_max_ms);
+          if (ratio) parts.push(["quiet", ratio]);
+        } else {
+          parts.push(["v", run.state === "timeout" ? "timed out" : run.state === "cancelled" ? "cancelled" : "failed"]);
+        }
+        parts.push(["quiet", qpmFmtClock(run.finished_utc || run.started_utc)]);
+      } else if (ready) {
+        parts.push(
+          ["k", "replays"],
+          ["v", "the slowest execution, " + qpmFmtMs(target.recordedMaxMs) + " on " + target.node],
+          ["quiet", "as " + (target.role || "role oid " + target.userid)]
+        );
+        if (target.paramsText) parts.push(["mono", target.paramsText]);
+      } else {
+        parts.push([
+          "quiet",
+          off
+            ? (avail && avail.reason) || "EXPLAIN ANALYZE is not available from this viewer."
+            : "Cannot be replayed: " + ((target && target.reason) || "nothing recorded for it."),
+        ]);
+      }
+    }
+    return {
+      muted: !ready && !run,
+      button,
+      parts,
+      link: run ? (running ? "Show progress →" : "Show result →") : null,
+    };
+  }
+
+  /**
+   * One line at the top of the plan panel: the Run button with what it would
+   * replay, or the last run's result with a way to it -- visible without first
+   * switching to the EXPLAIN tab. Muted, with the reason, when nothing can run.
+   */
+  function qpmExplainStrip(run, target, openDialog, showResult) {
+    const m = qpmExplainStripModel(run, target, qpmExplainAvail);
+    const strip = el("div", { className: "qpm-explain-strip" + (m.muted ? " qpm-explain-strip--muted" : "") });
+    const btn = el("button", {
+      type: "button",
+      className:
+        "qpm-explain-primary qpm-explain-primary--sm"
+        + (m.button.running ? " qpm-explain-primary--running" : "")
+        + (m.button.muted ? " qpm-explain-primary--muted" : ""),
+    });
+    btn.appendChild(
+      m.button.running
+        ? el("span", { className: "qpm-seg-dot", "aria-hidden": "true" })
+        : el("span", { className: "qpm-explain-glyph", "aria-hidden": "true", textContent: "▶" })
+    );
+    btn.appendChild(document.createTextNode(m.button.label));
+    btn.addEventListener("click", () => (m.button.action === "show" ? showResult && showResult() : openDialog()));
+    strip.appendChild(btn);
+    const text = el("span", { className: "qpm-explain-strip-text" });
+    const CLS = {
+      k: "qpm-explain-strip-k",
+      v: "qpm-explain-strip-v",
+      quiet: "qpm-explain-strip-v qpm-explain-strip-v--quiet",
+      mono: "qpm-explain-strip-v qpm-explain-strip-v--mono",
+    };
+    m.parts.forEach(([kind, t]) => {
+      const span = el("span", { className: CLS[kind], textContent: t });
+      // Values are cut to one line; the card below and the dialog show them in full.
+      if (kind === "mono") span.title = t;
+      text.appendChild(span);
+    });
+    strip.appendChild(text);
+    if (m.link && showResult) {
+      const link = el("button", { type: "button", className: "qpm-explain-strip-link", textContent: m.link });
+      link.addEventListener("click", showResult);
+      strip.appendChild(link);
+    }
+    return strip;
+  }
+
+  /**
+   * The EXPLAIN side of the plan panel: an invitation before any run, progress while
+   * one runs, then its output -- with which recorded plan it matches and how its time
+   * compares to the slowest recorded execution it replayed.
+   */
+  function qpmExplainView(run, target, groups, texts, openDialog, drillQueryId) {
+    const wrap = el("div", { className: "qpm-explain" });
+    const again = el("button", {
+      type: "button",
+      className: "qpm-enable-btn",
+      textContent: run ? "Run again…" : "Run EXPLAIN ANALYZE…",
+    });
+    again.addEventListener("click", openDialog);
+
+    if (!run) {
+      wrap.appendChild(qpmExplainStrip(null, target, openDialog, null));
+      return wrap;
+    }
+
+    const head = el("div", { className: "qpm-explain-head" });
+    head.appendChild(
+      el("span", { className: "qpm-explain-title", textContent: "EXPLAIN (" + (run.options || ["ANALYZE"]).join(", ") + ")" })
+    );
+    const sub = el("span", { className: "qpm-explain-sub" });
+    head.appendChild(sub);
+    wrap.appendChild(head);
+
+    // Which statement ran matters in a canonical family, where it may not be the one
+    // the drilldown was opened on.
+    const which = String(run.queryid) !== String(drillQueryId) ? " · query_id " + run.queryid : "";
+    if (run.state === "running") {
+      // Elapsed on the collector's clock, not this browser's. Updated in place by
+      // tick(), so a redraw each second does not steal keyboard focus.
+      sub.setAttribute("aria-live", "polite");
+      const tick = (r) => {
+        const elapsed = Math.max(0, Math.round(Number(r.run_s) || 0));
+        sub.textContent =
+          "running on " + r.node + (r.role ? " as " + r.role : "") + which + " · "
+          + elapsed + " s of " + r.timeout_s + " s";
+      };
+      tick(run);
+      wrap._qpmTick = tick;
+      const row = el("div", { className: "qpm-enable-row" });
+      row.appendChild(el("span", { className: "qpm-spinner", "aria-hidden": "true" }));
+      const stop = el("button", { type: "button", className: "qpm-enable-btn qpm-enable-btn--danger", textContent: "Cancel" });
+      if (qpmExplainCancelling.has(run.id)) {
+        stop.disabled = true;
+        stop.textContent = "Cancelling…";
+      }
+      stop.addEventListener("click", async () => {
+        stop.disabled = true;
+        stop.textContent = "Cancelling…";
+        qpmExplainCancelling.add(run.id);
+        try {
+          const body = await qpmPostExplain("explain/cancel", { dbid: run.dbid, queryid: run.queryid });
+          qpmRememberRun(body.run);
+        } catch (e) {
+          qpmExplainCancelling.delete(run.id);
+          stop.disabled = false;
+          stop.textContent = "Cancel";
+        }
+      });
+      row.appendChild(stop);
+      row.appendChild(
+        el("span", {
+          className: "qpm-note",
+          textContent:
+            (run.kind === "write" ? "Runs in a transaction that is rolled back. " : "Read-only transaction. ")
+            + "Stops at " + run.timeout_s + " s: statement_timeout on the server, and a cancel from the collector.",
+        })
+      );
+      wrap.appendChild(row);
+      return wrap;
+    }
+
+    sub.textContent =
+      qpmFmtClock(run.finished_utc || run.started_utc)
+      + " · " + run.node + (run.role ? " · as " + run.role : "")
+      + (run.datname ? " · " + run.datname : "") + which;
+    head.appendChild(again);
+
+    if (run.state !== "done") {
+      wrap.appendChild(
+        el("div", {
+          className: "qpm-note qpm-note--warn",
+          role: "alert",
+          textContent: (run.state === "error" ? "Failed: " : "") + String(run.error || "no output"),
+        })
+      );
+    }
+    // The slowest case can move on after a run: say so, rather than let an old
+    // result stand for the current worst execution.
+    if (
+      target && target.ok && String(target.queryid) === String(run.queryid)
+      && isFinite(target.recordedMaxMs) && isFinite(Number(run.recorded_max_ms))
+      && target.recordedMaxMs > Number(run.recorded_max_ms) * 1.001
+      && String(target.paramsText) !== String(run.params_text)
+    ) {
+      wrap.appendChild(
+        el("div", {
+          className: "qpm-note qpm-note--warn",
+          textContent:
+            "A slower execution has been recorded since this run: " + qpmFmtMs(target.recordedMaxMs)
+            + " (this run replayed " + qpmFmtMs(Number(run.recorded_max_ms)) + "). Run again to replay it.",
+        })
+      );
+    }
+
+    const metrics = el("div", { className: "qpm-metrics" });
+    if (run.execution_ms != null) {
+      const ratio = run.recorded_max_ms > 0 ? run.execution_ms / run.recorded_max_ms : null;
+      qpmMetric(metrics, "this run", qpmFmtMs(run.execution_ms));
+      qpmMetric(
+        metrics,
+        "recorded slowest",
+        qpmFmtMs(run.recorded_max_ms)
+          + (ratio != null && isFinite(ratio) && ratio > 0
+            ? ratio >= 1
+              ? "  (" + ratio.toFixed(ratio >= 10 ? 0 : 1) + "× slower now)"
+              : "  (" + (1 / ratio).toFixed(1 / ratio >= 10 ? 0 : 1) + "× faster now)"
+            : ""),
+        "qpm-metric--wide"
+      );
+    } else if (run.recorded_max_ms != null) {
+      qpmMetric(metrics, "recorded slowest", qpmFmtMs(run.recorded_max_ms));
+    }
+    qpmExplainSummary(run.plan_text)
+      .filter(([k]) => k !== "Execution Time")
+      .forEach(([k, v]) => qpmMetric(metrics, k.replace(/^Storage /, "").toLowerCase(), v));
+    if (run.params_text) qpmMetric(metrics, "params", run.params_text, "qpm-metric--full");
+    if (run.role_settings && run.role_settings.length) {
+      qpmMetric(metrics, "role settings", run.role_settings.join(", "), "qpm-metric--full");
+    }
+    wrap.appendChild(metrics);
+
+    const note = qpmReplayPlanNote(qpmMatchRecordedPlan(run.plan_json, groups, texts), run, groups);
+    if (note) {
+      wrap.appendChild(el("div", { className: note.warn ? "qpm-note qpm-note--warn" : "qpm-note", textContent: note.text }));
+    }
+    const notices = run.notices || [];
+    notices.slice(0, 20).forEach((n) => wrap.appendChild(el("div", { className: "qpm-note", textContent: n })));
+    if (notices.length > 20) {
+      wrap.appendChild(el("div", { className: "qpm-note", textContent: "… and " + (notices.length - 20) + " more notices" }));
+    }
+    if (run.plan_text) {
+      wrap.appendChild(el("pre", { className: "qpm-tree qpm-explain-out", textContent: String(run.plan_text) }));
+    }
+    return wrap;
+  }
+
+  /**
+   * The query banner's EXPLAIN control: a primary button while nothing runs, live
+   * progress while something does, and a chip for the last result. It drives the
+   * plan panel below (qpmPanelActions), so there is one dialog and one result view.
+   */
+  /**
+   * What the query banner's EXPLAIN control shows. Pure:
+   *   {label, running, muted, title, last: chip text or null}
+   */
+  function qpmExplainBannerModel(run, target, avail) {
+    const off = !!(avail && !avail.available);
+    const ready = !off && !!(target && target.ok);
+    const running = !!(run && run.state === "running");
+    let label;
+    let title;
+    if (running) {
+      label = "Running · " + Math.max(0, Math.round(Number(run.run_s) || 0)) + " s";
+      title = "Show the EXPLAIN ANALYZE that is running";
+    } else {
+      label = "Explain analyze";
+      title = off
+        ? (avail && avail.reason) || "EXPLAIN ANALYZE is off for this collector"
+        : ready
+          ? "EXPLAIN ANALYZE this statement with the values of its slowest recorded execution ("
+            + qpmFmtMs(target.recordedMaxMs) + ")"
+          : "Cannot be replayed: " + ((target && target.reason) || "nothing recorded");
+    }
+    let last = null;
+    if (run && !running) {
+      last =
+        (run.state === "done" && run.execution_ms != null
+          ? "Last run " + qpmFmtMs(run.execution_ms)
+          : run.state === "timeout" ? "Last run timed out" : run.state === "cancelled" ? "Last run cancelled" : "Last run failed")
+        + " · " + qpmFmtClock(run.finished_utc || run.started_utc) + " →";
+    }
+    return { label, running, muted: !ready && !running, title, last };
+  }
+
+  /**
+   * The query banner's EXPLAIN control: a primary button while nothing runs, live
+   * progress while something does, and a chip for the last result. It drives the
+   * plan panel below (qpmPanelActions), so there is one dialog and one result view.
+   */
+  function qpmExplainBannerControl(target, runScope) {
+    const wrap = el("span", { className: "qpm-explain-banner" });
+    const btn = el("button", { type: "button", className: "qpm-explain-primary" });
+    const last = el("button", { type: "button", className: "qpm-explain-last", title: "Show the result" });
+    wrap.appendChild(last);
+    wrap.appendChild(btn);
+    const act = (name) => () => {
+      const p = qpmPanelActions;
+      if (p && p.isLive()) p[name]();
+    };
+    btn.addEventListener("click", () => {
+      const run = runScope ? qpmLatestRun(runScope.dbid, runScope.queryIds) : null;
+      (run && run.state === "running" ? act("reveal") : act("open"))();
+    });
+    last.addEventListener("click", act("reveal"));
+    let painted = null;
+    function paint() {
+      const run = runScope ? qpmLatestRun(runScope.dbid, runScope.queryIds) : null;
+      const m = qpmExplainBannerModel(run, target, qpmExplainAvail);
+      const key = JSON.stringify(m);
+      if (key === painted) return;
+      painted = key;
+      btn.textContent = "";
+      btn.classList.toggle("qpm-explain-primary--muted", m.muted);
+      btn.classList.toggle("qpm-explain-primary--running", m.running);
+      btn.appendChild(
+        m.running
+          ? el("span", { className: "qpm-seg-dot", "aria-hidden": "true" })
+          : el("span", { className: "qpm-explain-glyph", "aria-hidden": "true", textContent: "▶" })
+      );
+      btn.appendChild(document.createTextNode(m.label));
+      btn.title = m.title;
+      last.hidden = !m.last;
+      if (m.last) last.textContent = m.last;
+    }
+    paint();
+    qpmListen(paint, () => wrap.isConnected);
+    return wrap;
+  }
+
+  /** "literals" toggle for the drilldown's query row; forced on while the EXPLAIN view is open. */
+  function qpmLiteralsControl(queryEl, labelEl, noteEl, originalText, originalLabel, target, drillQueryId, runScope) {
+    const btn = el("button", { type: "button", className: "qpm-literals-btn", textContent: "inline literals" });
+    function paint() {
+      // Same lookup as the panel, so the row and the output above/below it are one run.
+      const run = runScope ? qpmLatestRun(runScope.dbid, runScope.queryIds) : null;
+      const forced = qpmPlanView === "explain";
+      const on = !!(target && target.ok && (qpmShowLiterals || forced));
+      // In the EXPLAIN view the row shows what actually ran; otherwise what would.
+      const shownRun = forced && run && run.sql_display ? run : null;
+      const text = on ? (shownRun ? shownRun.sql_display : target.sqlDisplay) : originalText;
+      queryEl.textContent = text || "(no text in snapshot)";
+      labelEl.textContent = on ? "query · literals" : originalLabel;
+      btn.setAttribute("aria-pressed", on ? "true" : "false");
+      btn.classList.toggle("qpm-literals-btn--on", on);
+      btn.disabled = !(target && target.ok) || forced;
+      btn.title = !(target && target.ok)
+        ? "No values to inline: " + ((target && target.reason) || "nothing recorded")
+        : forced
+          ? "Shown with values while the EXPLAIN ANALYZE view is open"
+          : on
+            ? "Show the statement with its $n placeholders"
+            : "Show the statement with the values of its slowest recorded execution";
+      noteEl.hidden = !on;
+      if (on) {
+        const src = shownRun || target;
+        // A run's values were the slowest when it ran; a slower one may have come since.
+        noteEl.textContent =
+          (shownRun ? "values this run replayed, the slowest when it ran: " : "values of the slowest recorded execution: ")
+          + qpmFmtMs(shownRun ? shownRun.recorded_max_ms : target.recordedMaxMs)
+          + " on " + src.node
+          + (String(src.queryid) !== String(drillQueryId) ? " · query_id " + src.queryid : "");
+      }
+    }
+    btn.addEventListener("click", () => {
+      qpmShowLiterals = !qpmShowLiterals;
+      writeViewerStateToUrl();
+      paint();
+    });
+    paint();
+    qpmListen(paint, () => btn.isConnected);
+    return btn;
+  }
+
   /**
    * The QUERY PLANS block for a scoped ASH drilldown. Returns null when the
    * snapshot has no QPM section, the cluster does not support QPM, or this query
    * has no plans on record -- the panel should be absent, not empty.
    */
-  function qpmPlansPanel(doc, queryId, canonicalFamily, clusterNodeCount, snapshotFile, dbname) {
+  function qpmPlansPanel(doc, queryId, canonicalFamily, clusterNodeCount, snapshotFile, dbname, explainTarget) {
     const qpm = doc && doc.yb_pg_stat_plans;
     const mode = qpmPanelMode(qpm);
     if (mode === "legacy" || mode === "collection-off") {
@@ -2795,14 +4207,22 @@
         textContent: qpmVerdictHeadline(verdict),
       })
     );
+    // Recorded plans <-> EXPLAIN ANALYZE; a plain button until a run exists.
+    const explainCtl = el("span", { className: "qpm-explain-ctl" });
+    head.appendChild(explainCtl);
     if (qpmCollectionState && qpmCollectionState.writable !== false) {
       head.appendChild(qpmCollectionHeaderControl());
     }
     section.appendChild(head);
 
     const body = el("div", { className: "qpm-panel-body" });
+    const plansView = el("div", { className: "qpm-plans-view" });
+    // EXPLAIN ANALYZE, up front: no tab switch needed to see or start it.
+    const stripHost = el("div", { className: "qpm-explain-strip-host" });
+    plansView.appendChild(stripHost);
+    const explainView = el("div", { className: "qpm-explain-view" });
     if (qpm.truncated) {
-      body.appendChild(
+      plansView.appendChild(
         el("div", {
           className: "qpm-note qpm-note--warn",
           textContent:
@@ -2813,11 +4233,104 @@
       );
     }
     groups.forEach((g, i) =>
-      body.appendChild(
+      plansView.appendChild(
         qpmPlanCard(g, verdict, texts, i, clusterNodeCount, snapshotFile, queryId)
       )
     );
+    body.appendChild(plansView);
+    body.appendChild(explainView);
     section.appendChild(body);
+
+    // Runs are keyed per statement and database on the collector, which holds them,
+    // so a run survives navigating away, a reload, and newer snapshots.
+    const runDbid = explainTarget && explainTarget.ok ? explainTarget.dbid : groups[0].dbid;
+    const scopeIds = qpmScopeQueryIds(queryId, canonicalFamily);
+    const runQueryIds = qpmRunQueryIds(
+      scopeIds.size ? Array.from(scopeIds) : [].concat(...groups.map((g) => Array.from(g.queryIds || []))),
+      explainTarget
+    );
+    // Show the EXPLAIN side and bring it on screen: a run started from the query
+    // banner is otherwise running out of sight below it.
+    function reveal() {
+      if (body.hidden) toggleBtn.click();
+      qpmSetPlanView("explain");
+      // After the dialog's close has handed focus back (and scrolled to) the button
+      // that opened it; and only when the panel's top is not already well in view.
+      setTimeout(() => {
+        const r = section.getBoundingClientRect();
+        if (r.top < 0 || r.top > window.innerHeight * 0.55) {
+          section.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+      }, 80);
+    }
+    function openDialog() {
+      qpmOpenExplainDialog(explainTarget, snapshotFile, (run) => {
+        qpmExplainWatch = { dbid: run.dbid, queryIds: runQueryIds };
+        reveal();
+        qpmEnsureExplainPoll();
+      });
+    }
+    qpmPanelActions = { open: openDialog, reveal, isLive: () => section.isConnected };
+    let paintedCtl = null;
+    let paintedView = null;
+    let paintedStrip = null;
+    function paint() {
+      const run = qpmLatestRun(runDbid, runQueryIds);
+      const view = qpmPlanView === "explain" ? "explain" : "plans";
+      // Structure only: the elapsed seconds of a running run are updated in place.
+      const runKey = run ? run.id + "|" + run.state + "|" + (qpmExplainCancelling.has(run.id) ? "c" : "") : "none";
+      const off = !!(qpmExplainAvail && !qpmExplainAvail.available);
+      const ctlKey = view + "|" + runKey + "|" + (off ? "off" : "on");
+      if (ctlKey !== paintedCtl) {
+        paintedCtl = ctlKey;
+        explainCtl.textContent = "";
+        {
+          // Always shown: the EXPLAIN side is a first-class view, not something to
+          // discover after a first run.
+          const seg = el("span", { className: "qpm-seg", role: "group", "aria-label": "Plan view" });
+          [
+            ["plans", "Recorded plans"],
+            ["explain", "Explain analyze"],
+          ].forEach(([v, label]) => {
+            const b = el("button", {
+              type: "button",
+              className: "qpm-seg-btn" + (v === view ? " qpm-seg-btn--on" : ""),
+              textContent: label,
+              "aria-pressed": v === view ? "true" : "false",
+            });
+            if (v === "explain" && run && run.state === "running") {
+              b.appendChild(el("span", { className: "qpm-seg-dot", "aria-hidden": "true" }));
+            }
+            b.addEventListener("click", () => qpmSetPlanView(v));
+            seg.appendChild(b);
+          });
+          explainCtl.appendChild(seg);
+        }
+      }
+      if (view === "plans" && runKey + "|" + off !== paintedStrip) {
+        paintedStrip = runKey + "|" + off;
+        stripHost.textContent = "";
+        stripHost.appendChild(qpmExplainStrip(run, explainTarget, openDialog, reveal));
+      }
+      plansView.hidden = view !== "plans";
+      explainView.hidden = view !== "explain";
+      if (view === "explain" && runKey + "|" + off !== paintedView) {
+        paintedView = runKey + "|" + off;
+        explainView.textContent = "";
+        explainView.appendChild(qpmExplainView(run, explainTarget, groups, texts, openDialog, queryId));
+      } else if (view === "explain" && run && run.state === "running") {
+        const shown = explainView.firstChild;
+        if (shown && shown._qpmTick) shown._qpmTick(run);
+      }
+    }
+    paint();
+    qpmListen(paint, () => section.isConnected);
+    qpmExplainWatch = { dbid: runDbid, queryIds: runQueryIds };
+    qpmFetchExplain(runDbid, runQueryIds).then(() => {
+      qpmNotifyExplain();
+      const run = qpmLatestRun(runDbid, runQueryIds);
+      if (run && run.state === "running") qpmEnsureExplainPoll();
+    });
 
     toggleBtn.addEventListener("click", () => {
       body.hidden = !body.hidden;
@@ -6871,7 +8384,45 @@
         }
         panelAsh.appendChild(bn);
       }
+      if (!qF) {
+        // Outside a query drilldown the plan view and literals start over.
+        qpmViewScope = null;
+        qpmPlanView = "plans";
+        qpmShowLiterals = false;
+      }
       if (qF) {
+        const qpmRowDb = !canonicalFamily && st ? mergedStatementRowForQuery(st, mergeStatements, qF) : null;
+        const qpmDbname =
+          canonicalFamily && canonicalFamily.dbname
+            ? canonicalFamily.dbname
+            : qpmRowDb && qpmRowDb.dbname
+              ? qpmRowDb.dbname
+              : null;
+        // A different drilldown starts on its recorded plans, with placeholders. Keyed
+        // on the URL alone: stepping Prev/Next must not reset it when a window lacks
+        // the query, or when a family resolves in one window and not the next.
+        const qpmScope = qpmViewScopeKey(qF, ashCanonicalizeFilter, ashCanonicalDbnameFilter);
+        if (qpmViewScope !== null && qpmViewScope !== qpmScope) {
+          qpmPlanView = "plans";
+          qpmShowLiterals = false;
+          writeViewerStateToUrl();
+        }
+        qpmViewScope = qpmScope;
+        const qpmSec = doc && doc.yb_pg_stat_plans;
+        let explainTarget = null;
+        try {
+          explainTarget =
+            qpmPanelMode(qpmSec) === "plans"
+              ? qpmExplainTarget(
+                doc,
+                qpmScopeQueryIds(qF, canonicalFamily),
+                qpmPanelDbids(qpmSec, qpmDbname, qpmScopeQueryIds(qF, canonicalFamily))
+              )
+              : null;
+        } catch (e) {
+          // An optional aid: whatever the recorded text holds, the page still renders.
+          explainTarget = { ok: false, reason: "could not read the recorded statement (" + (e.message || e) + ")" };
+        }
         const qRaw = canonicalFamily ? canonicalFamily.template : getQueryTextForToolbar(doc, qF);
         const qText =
           qRaw != null && String(qRaw).trim() !== "" ? String(qRaw).trim() : "";
@@ -6885,31 +8436,44 @@
           const rowDb = mergedStatementRowForQuery(st, mergeStatements, qF);
           if (rowDb && rowDb.dbname) ashQueryTitle += `; dbname=${rowDb.dbname}`;
         }
-        note.appendChild(
+        const titleRow = el("div", { className: "ash-mode-banner-title-row" });
+        titleRow.appendChild(
           el("div", {
             className: "ash-mode-banner-title",
             textContent: ashQueryTitle,
           })
         );
+        note.appendChild(titleRow);
         const row = el("div", { className: "ash-mode-banner-query-row" });
-        row.appendChild(
-          el("span", {
-            className: "ash-mode-banner-query-k",
-            textContent: canonicalFamily ? "canonical query" : "query",
-          })
-        );
-        row.appendChild(
-          el("span", {
-            className: qText
-              ? "ash-mode-banner-query-highlight"
-              : "ash-mode-banner-query-highlight ash-mode-banner-query-highlight--empty",
-            textContent: qText || "(no text in snapshot)",
-          })
-        );
+        const queryLabel = canonicalFamily ? "canonical query" : "query";
+        const queryK = el("span", { className: "ash-mode-banner-query-k", textContent: queryLabel });
+        row.appendChild(queryK);
+        const queryV = el("span", {
+          className: qText
+            ? "ash-mode-banner-query-highlight"
+            : "ash-mode-banner-query-highlight ash-mode-banner-query-highlight--empty",
+          textContent: qText || "(no text in snapshot)",
+        });
+        row.appendChild(queryV);
         note.appendChild(row);
+        const litScope =
+          explainTarget && explainTarget.ok
+            ? { dbid: explainTarget.dbid, queryIds: qpmRunQueryIds(Array.from(qpmScopeQueryIds(qF, canonicalFamily)), explainTarget) }
+            : null;
+        // The drilldown's primary action, where the eye lands: top right of the query.
+        if (explainTarget) titleRow.appendChild(qpmExplainBannerControl(explainTarget, litScope));
+        // Only statements with placeholders have anything to inline. The chip sits
+        // by the label, so switching the text under it never moves it.
+        if (explainTarget && (!explainTarget.ok || explainTarget.hasParams)) {
+          const litNote = el("div", { className: "qpm-literals-note" });
+          row.insertBefore(
+            qpmLiteralsControl(queryV, queryK, litNote, qText, queryLabel, explainTarget, qF, litScope),
+            queryV
+          );
+          note.appendChild(litNote);
+        }
         appendAshScopedQueryStatementLines(note, doc, prevDoc, qF, ash, canonicalFamily);
         panelAsh.appendChild(note);
-        const qpmRowDb = !canonicalFamily && st ? mergedStatementRowForQuery(st, mergeStatements, qF) : null;
         const qpmPanel = qpmPlansPanel(
           doc,
           qF,
@@ -6918,11 +8482,8 @@
           currentIndex >= 0 && manifestEntries[currentIndex]
             ? manifestEntries[currentIndex].file
             : null,
-          canonicalFamily && canonicalFamily.dbname
-            ? canonicalFamily.dbname
-            : qpmRowDb && qpmRowDb.dbname
-              ? qpmRowDb.dbname
-              : null
+          qpmDbname,
+          explainTarget
         );
         if (qpmPanel) panelAsh.appendChild(qpmPanel);
       }
@@ -7721,6 +9282,8 @@
 
     document.addEventListener("keydown", (e) => {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
+      // A modal is open (the EXPLAIN dialog): the snapshot behind it must not move.
+      if (document.querySelector("dialog[open]")) return;
       const t = e.target;
       const inInput =
         t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
