@@ -16,6 +16,7 @@ class Capabilities:
     yb_ash_range_function: bool
     pg_stat_docdb_metrics: bool
     pg_stat_latency_histogram: bool
+    qpm_stat_plans: bool
 
     @staticmethod
     def detect(conn: psycopg.Connection) -> Capabilities:
@@ -24,6 +25,7 @@ class Capabilities:
             yb_ash_range_function=_yb_ash_two_arg_range_function_exists(conn),
             pg_stat_docdb_metrics=_pg_stat_has_docdb_seeks(conn),
             pg_stat_latency_histogram=_pg_stat_has_latency_histogram(conn),
+            qpm_stat_plans=_qpm_stat_plans_view_exists(conn),
         )
 
 
@@ -86,6 +88,16 @@ def _pg_stat_has_latency_histogram(conn: psycopg.Connection) -> bool:
         fetch_all(conn, "SELECT yb_latency_histogram FROM pg_stat_statements LIMIT 0")
         return True
     except pg_errors.UndefinedColumn:
+        conn.rollback()
+        return False
+
+
+def _qpm_stat_plans_view_exists(conn: psycopg.Connection) -> bool:
+    """Query Plan Management (yb_pg_stat_plans) exists on YB 2025.2.3+; absent on older clusters."""
+    try:
+        fetch_all(conn, "SELECT planid FROM yb_pg_stat_plans LIMIT 0 /* __YB_STAT_PLANS_SKIP */")
+        return True
+    except (pg_errors.UndefinedTable, pg_errors.UndefinedColumn, pg_errors.InsufficientPrivilege):
         conn.rollback()
         return False
 

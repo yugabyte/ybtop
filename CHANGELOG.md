@@ -2,6 +2,20 @@
 
 All notable functional changes to **ybtop** are listed here by release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) (newest first).
 
+## [0.1.14] — 2026-09-28
+
+### Added
+
+- **Query plan history (opt-in):** Snapshots can carry **Query Plan Management** data (**`yb_pg_stat_plans`**, YugabyteDB 2025.2.3+) as a **`yb_pg_stat_plans`** section: per-node rows (calls, average / slowest time, the slowest execution's parameters, first / last use) for the statements in the `pg_stat_statements` top N, plan and hint text stored once per snapshot (**`plans`**, by `plan_ref`), **`databases`** (oid → name) and **`pinned`**. Off by default; switch it on from the viewer — the setting lives in the data directory's **`ybtop.control.json`** and is read at every checkpoint — or with **`watch --snapshot-query-plans`**. **`--no-snapshot-query-plans`** keeps it off; **`--snapshot-query-plans-per-node`** (default `2000`) caps rows per node. Every snapshot records whether QPM is present and tracking (`yb_pg_stat_plans_track`), so the viewer can say why a panel is empty.
+- **Browser (plan panel):** A statement's ASH report shows its plans, fastest first — timings, calls and share, nodes, slowest parameters, plan tree and hints — under a headline that says whether the fastest plan is the one in use ("fastest plan no longer in use · current plan 3.1× slower"). A "fastest" measured on fewer than 50 calls is marked provisional. Plans are scoped to the statement's database, or to live databases when the report names none. A prepared statement's custom and generic plans, which QPM records under two planids, are one card; plans that share their hints but differ elsewhere say that a pin allows both.
+- **Browser (plans column):** The YSQL statement tables gain a **plans** column — distinct plans recorded for the statement in its database — with **P** when a hint is pinned for it.
+- **Plan pinning (opt-in, `watch --allow-plan-pinning`):** From a plan's hints row: install **pg_hint_plan**, enable the hint table for the database (`ALTER DATABASE … SET pg_hint_plan.enable_hint_table`, `pg_hint_plan.yb_use_query_id_for_hinting`), pin that plan's hints for its query_id, and remove the pin. The request names a recorded plan only; the hint text and the database come from ybtop's own snapshot, and `ybtop serve` never writes to the cluster. Pins show as **P** at once, before the next checkpoint reads the hint table back.
+- **Viewer request guards:** POSTs must be same-origin JSON (`Content-Type: application/json`, `Sec-Fetch-Site`, `Origin`), so a page on another site cannot drive the collection toggle or pinning.
+
+### Changed
+
+- **Viewer Host check (DNS-rebinding guard):** Requests whose `Host` header is not a name the viewer is reached by are refused with 403. Loopback names always work and a loopback-bound viewer accepts only those; list other names — a proxy's public name, or the host name of a viewer bound to another address — with **`watch --serve-allowed-host`** / **`serve --allowed-host`** (repeatable).
+
 ## [0.1.13] — 2026-08-12
 
 ### Added
