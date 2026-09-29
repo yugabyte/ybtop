@@ -134,7 +134,7 @@ YugabyteDB 2025.2.3 and later record every plan a statement has used in **Query 
 
 **The plans column** in the statement tables counts the distinct plans QPM recorded for each statement in its database, with **P** when a hint is pinned for it. Sort by it to find the statements whose plan has changed.
 
-**The plan panel** in a statement's ASH report (click its query) has one card per plan, fastest first: average and slowest time, calls and share of calls, first and last use, the nodes that ran it, the slowest execution's parameters, and the plan tree. The headline says whether the fastest plan is the one serving the traffic — "fastest plan no longer in use · current plan 3.1× slower" is a plan regression; a "fastest" measured on fewer than 50 calls is marked provisional. A prepared statement's custom plan and generic plan, which QPM records under two planids, are shown as the one plan they are.
+**The plan panel** in a statement's ASH report (click its query) has one card per plan, fastest first: average and slowest time, calls and share of calls, first and last use, the nodes that ran it, the slowest execution's parameters, and the plan tree. The headline says whether the fastest plan is the one serving the traffic — "fastest plan no longer in use · current plan 3.1× slower" is a plan regression; a "fastest" measured on fewer than 50 calls that are also under 5% of the statement's calls is marked provisional. A prepared statement's custom plan and generic plan, which QPM records under two planids, are shown as the one plan they are.
 
 ![The plan panel for a pinned statement: all traffic on the pinned index plan, the Seq Scan it replaced no longer in use](docs/images/qpm-plans-panel.png)
 

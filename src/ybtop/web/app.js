@@ -1408,12 +1408,15 @@
    * one whose text keeps more $N parameters (a custom plan has '?' in their place;
    * batched nested loops add $N of their own to both).
    */
-  function qpmVariantsNote(variants, texts) {
+  function qpmVariantsNote(variants, texts, queryIdCount) {
     const params = variants.map(
       (v) => (String(((texts || {})[v.plan_ref] || {}).plan || "").match(/\$\d+/g) || []).length
     );
-    const most = Math.max.apply(null, params);
-    const least = Math.min.apply(null, params);
+    // Across query_ids (a merged family) $N counts tell IN-list lengths apart, not
+    // custom from generic plans, so no labels there.
+    const several = (queryIdCount || 1) > 1;
+    const most = several ? 0 : Math.max.apply(null, params);
+    const least = several ? 0 : Math.min.apply(null, params);
     const listed = variants.map((v, i) => {
       const form = most > least ? (params[i] === most ? "generic plan, " : "custom plan, ") : "";
       return v.planid + " (" + form + qpmCallsText(v.calls) + ", " + qpmFmtMs(v.avg_exec_time) + ")";
@@ -1432,7 +1435,10 @@
         " Where the text is identical, the difference lives in cost and row estimates, which this"
         + " text omits — set yb_pg_stat_plans_verbose_plans = on to see it.";
     }
-    return text + " The hints are the same, so one pin covers them all.";
+    return text + (several
+      ? " The hints are the same, but a hint is pinned per query_id -- open one of its "
+        + queryIdCount + " query_ids to pin it."
+      : " The hints are the same, so one pin covers them all.");
   }
 
   /** Plans are keyed by queryid; a canonical family spans several, so union them. */
@@ -1514,8 +1520,8 @@
   /**
    * "queryid|dbid" -> Set of plan keys, plus "queryid|*" across all databases.
    * Same plan identity the drilldown groups by (qpmPlanTwinKey, else planid +
-   * plan_ref), so the PGSS count matches the number of plan cards the drilldown
-   * shows for that statement.
+   * plan_ref), so for a row in one database the count is the number of cards the
+   * drilldown shows for that database.
    */
   function qpmPlanIndex(qpmSection) {
     const idx = new Map();
@@ -1583,9 +1589,12 @@
 
   /**
    * Adds qpm_plans (distinct plans) and qpm_pinned to statement rows for the PGSS
-   * "plans" column. Scoped exactly like the drilldown: the row's own database when
-   * the snapshot can map its name, otherwise every database, and all queryids a
-   * template row stands for.
+   * "plans" column: the row's own database when the snapshot can map its name,
+   * otherwise every database (a plan in two counts once), and all queryids a
+   * template row stands for. Where it can differ from the drilldown: that scopes a
+   * nameless row to live databases with a card per database, and a row's link
+   * names no database, so a statement that also runs in another database opens
+   * on its busiest one.
    */
   function annotateRowsWithQpmPlans(rows, qpmSection, pinnedByDbOverride, templateMembers) {
     const idx = qpmPlanIndex(qpmSection);
@@ -2066,7 +2075,10 @@
     body.appendChild(metrics);
 
     if (variants.length > 1) {
-      body.appendChild(el("div", { className: "qpm-note", textContent: qpmVariantsNote(variants, texts) }));
+      body.appendChild(el("div", {
+        className: "qpm-note",
+        textContent: qpmVariantsNote(variants, texts, (group.queryIds && group.queryIds.size) || 1),
+      }));
     }
     if (group.sameHintsAs && group.sameHintsAs.length > 0) {
       body.appendChild(
@@ -2248,16 +2260,23 @@
    * Panels are rebuilt on every navigation, so a timer per panel multiplied and
    * each one eventually reloaded the page, long after the user had moved on. Now
    * an "enabling" panel just attaches here, and when the snapshot lands the page
-   * advances to it only if a waiting panel is still on screen.
+   * advances to it only if a waiting panel is still on screen -- advancing, not
+   * reloading, so the page keeps what it holds (this page's pins, open cards).
    *
-   * Advancing (not reloading) matters: once newer snapshots exist the URL pins
-   * the old window with t=, so a reload would land on the pre-enable snapshot.
+   * A snapshot has landed when the manifest's newest file changes, not when the
+   * manifest grows: past its retention window each checkpoint adds one entry and
+   * GC drops one.
    */
   let qpmEnableWait = null;
 
+  function qpmNewestFile(entries) {
+    const last = Array.isArray(entries) && entries.length ? entries[entries.length - 1] : null;
+    return last && last.file ? String(last.file) : null;
+  }
+
   function qpmWaitForCollectedSnapshot() {
     if (qpmEnableWait) return qpmEnableWait;
-    const wait = { startCount: manifestEntries.length, t0: Date.now(), gaveUp: false };
+    const wait = { startNewest: qpmNewestFile(manifestEntries), t0: Date.now(), gaveUp: false };
     qpmEnableWait = wait;
     const tick = async () => {
       let fresh = null;
@@ -2266,9 +2285,10 @@
       } catch (e) {
         fresh = null;
       }
-      if (Array.isArray(fresh) && fresh.length > wait.startCount) {
+      const newest = qpmNewestFile(fresh);
+      if (newest && newest !== wait.startNewest) {
         qpmEnableWait = null;
-        manifestEntries = fresh;
+        adoptManifest(fresh);
         if (document.querySelector(".qpm-panel--enabling")) {
           showSnapshotAt(manifestEntries.length - 1);
         }
@@ -2276,6 +2296,8 @@
       }
       if (Date.now() - wait.t0 > QPM_ENABLE_GIVE_UP_MS) {
         wait.gaveUp = true;
+        // Not for the rest of the page's life: a panel drawn later waits afresh.
+        qpmEnableWait = null;
         document.querySelectorAll(".qpm-panel--enabling").forEach(qpmMarkEnablingStalled);
         return;
       }
@@ -2750,9 +2772,10 @@
   }
 
   /**
-   * The QUERY PLANS block for a scoped ASH drilldown. Returns null when the
-   * snapshot has no QPM section, the cluster does not support QPM, or this query
-   * has no plans on record -- the panel should be absent, not empty.
+   * The QUERY PLANS block for a scoped ASH drilldown. Without plans in the snapshot
+   * it is the collection-off panel (no QPM section, or collection off) or a notice
+   * (no QPM on the cluster, tracking off). Null only when this query has no plans on
+   * record -- the panel should be absent, not empty.
    */
   function qpmPlansPanel(doc, queryId, canonicalFamily, clusterNodeCount, snapshotFile, dbname) {
     const qpm = doc && doc.yb_pg_stat_plans;
@@ -7564,6 +7587,29 @@
    * snapshot file when possible (so a new arrival doesn't yank them off the window they're reading).
    * Chart + nav controls are re-rendered after; the active doc itself is not refetched.
    */
+  /** Take a fresh manifest while staying on the snapshot on screen, whose index can move. */
+  function adoptManifest(fresh) {
+    const prevFile =
+      currentIndex >= 0 && manifestEntries[currentIndex]
+        ? manifestEntries[currentIndex].file
+        : null;
+    manifestEntries = fresh;
+    currentIndex = prevFile
+      ? manifestEntries.findIndex((e) => e && e.file === prevFile)
+      : manifestEntries.length - 1;
+    const btnPrev = document.getElementById("btn-prev");
+    const btnNext = document.getElementById("btn-next");
+    const btnFirst = document.getElementById("btn-first");
+    const btnLast = document.getElementById("btn-last");
+    if (btnPrev) btnPrev.disabled = currentIndex <= 0;
+    if (btnNext) btnNext.disabled = currentIndex < 0 || currentIndex >= manifestEntries.length - 1;
+    if (btnFirst) btnFirst.disabled = currentIndex <= 0;
+    if (btnLast) btnLast.disabled = currentIndex < 0 || currentIndex >= manifestEntries.length - 1;
+    const ent = currentIndex >= 0 ? manifestEntries[currentIndex] : null;
+    updateNavDisplay(currentIndex >= 0 ? currentIndex : 0, manifestEntries.length, ent, lastDoc);
+    renderWindowChart();
+  }
+
   async function refreshManifest() {
     if (manifestRefreshInFlight) return;
     manifestRefreshInFlight = true;
@@ -7574,25 +7620,7 @@
         if (st) qpmCollectionState = st;
       });
       if (!Array.isArray(fresh) || !fresh.length) return;
-      const prevFile =
-        currentIndex >= 0 && manifestEntries[currentIndex]
-          ? manifestEntries[currentIndex].file
-          : null;
-      manifestEntries = fresh;
-      currentIndex = prevFile
-        ? manifestEntries.findIndex((e) => e && e.file === prevFile)
-        : manifestEntries.length - 1;
-      const btnPrev = document.getElementById("btn-prev");
-      const btnNext = document.getElementById("btn-next");
-      const btnFirst = document.getElementById("btn-first");
-      const btnLast = document.getElementById("btn-last");
-      if (btnPrev) btnPrev.disabled = currentIndex <= 0;
-      if (btnNext) btnNext.disabled = currentIndex < 0 || currentIndex >= manifestEntries.length - 1;
-      if (btnFirst) btnFirst.disabled = currentIndex <= 0;
-      if (btnLast) btnLast.disabled = currentIndex < 0 || currentIndex >= manifestEntries.length - 1;
-      const ent = currentIndex >= 0 ? manifestEntries[currentIndex] : null;
-      updateNavDisplay(currentIndex >= 0 ? currentIndex : 0, manifestEntries.length, ent, lastDoc);
-      renderWindowChart();
+      adoptManifest(fresh);
     } catch (_e) {
       /* ignore transient manifest fetch failures; retry on the next tick. */
     } finally {

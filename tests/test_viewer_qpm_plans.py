@@ -388,7 +388,75 @@ out.pinRow = {
     subtractedWithoutLookup: count(subtracted, null),
   };
 }
-console.log(JSON.stringify(out));
+{ // the variants note across a merged family's query_ids: no custom/generic guess, no false pin claim
+  const texts = { l2: { plan: '{"Index Cond": "(id = ANY (ARRAY[$1, $2]))"}' }, l3: { plan: '{"Index Cond": "(id = ANY (ARRAY[$1, $2, $3]))"}' } };
+  const v = [{ planid: "P2", plan_ref: "l2", calls: 10, avg_exec_time: 1 }, { planid: "P3", plan_ref: "l3", calls: 5, avg_exec_time: 1 }];
+  out.familyNote = { family: A.qpmVariantsNote(v, texts, 2), single: A.qpmVariantsNote(v, texts, 1) };
+}
+{ // the provisional mark needs both: under 50 calls AND under 5% of the statement's calls
+  const tenOfHundred = verdictOf({ n1: [row("q1", "FAST", "rF", 10, 1.0, 0), row("q1", "SLOW", "rS", 90, 2.0, 0)] });
+  out.shareRule = { lowConfidence: tenOfHundred.v.lowConfidence, headline: tenOfHundred.headline };
+}
+const W_SRC = [cb("QPM_ENABLE_POLL_MS"), cb("QPM_ENABLE_GIVE_UP_MS"), "let qpmEnableWait = null;",
+  fn("qpmNewestFile"), fn("qpmWaitForCollectedSnapshot"), fn("adoptManifest"),
+  "return { qpmWaitForCollectedSnapshot, adoptManifest, pending: () => qpmEnableWait };"].join("\n");
+// Page globals the functions use, stubbed; `with` lets the lifted code resolve them against env.
+const withEnv = (env) => new Function("env", "with (env) { " + W_SRC + " }")(env);
+const pageEnv = (files) => {
+  const e = { manifestEntries: files.map((file) => ({ file })), currentIndex: files.length - 1, queue: [], now: 0,
+    shown: [], enabling: true, next: null, lastDoc: null, adopted: null };
+  e.setTimeout = (f) => { e.queue.push(f); };
+  e.Date = { now: () => e.now };
+  e.document = { querySelector: () => (e.enabling ? {} : null), querySelectorAll: () => [], getElementById: () => null };
+  e.loadManifest = async () => e.next;
+  e.showSnapshotAt = (i) => e.shown.push(i);
+  e.qpmMarkEnablingStalled = () => {};
+  e.updateNavDisplay = () => {};
+  e.renderWindowChart = () => {};
+  return e;
+};
+async function enableWaitCases() {
+  const r = {};
+  { // retention: one entry added, one GC'd -- same length, new newest file: it has landed
+    const e = pageEnv(["a", "b", "c"]);
+    const W = withEnv(e);
+    W.qpmWaitForCollectedSnapshot();
+    e.next = [{ file: "b" }, { file: "c" }, { file: "d" }];
+    await e.queue.shift()();
+    r.landed = { newest: e.manifestEntries[e.manifestEntries.length - 1].file, shown: e.shown, cleared: W.pending() === null };
+  }
+  { // it lands after the user moved on: no jump, and the index still names the snapshot on screen
+    const e = pageEnv(["a", "b", "c"]);
+    e.enabling = false;
+    e.currentIndex = 1;  // reading "b"
+    const W = withEnv(e);
+    W.qpmWaitForCollectedSnapshot();
+    e.next = [{ file: "b" }, { file: "c" }, { file: "d" }];
+    await e.queue.shift()();
+    r.movedOn = { shown: e.shown, onScreen: e.manifestEntries[e.currentIndex].file };
+  }
+  { // nothing new for the give-up time: stalled, and a later panel waits afresh
+    const e = pageEnv(["a", "b", "c"]);
+    const W = withEnv(e);
+    const w = W.qpmWaitForCollectedSnapshot();
+    e.next = [{ file: "a" }, { file: "b" }, { file: "c" }];
+    e.now = 10 * 60 * 1000;
+    await e.queue.shift()();
+    r.gaveUp = { gaveUp: w.gaveUp, cleared: W.pending() === null, fresh: W.qpmWaitForCollectedSnapshot() !== w };
+  }
+  { // taking a fresh manifest keeps the viewer on the snapshot on screen
+    const e = pageEnv(["a", "b", "c"]);
+    const W = withEnv(e);
+    const at = (idx, fresh) => { e.manifestEntries = ["a", "b", "c"].map((file) => ({ file })); e.currentIndex = idx;
+      W.adoptManifest(fresh.map((file) => ({ file }))); return e.currentIndex; };
+    r.adopt = { onB: at(1, ["b", "c", "d"]), onGcd: at(0, ["b", "c", "d"]), none: at(-1, ["b", "c", "d"]) };
+  }
+  return r;
+}
+(async () => {
+  out.enableWait = await enableWaitCases();
+  console.log(JSON.stringify(out));
+})();
 """
 
 
@@ -542,6 +610,33 @@ class ViewerQpmPlansTest(unittest.TestCase):
         self.assertEqual(o["offReadonly"], "readonly")
         self.assertEqual(o["onNewest"], "enabling")
         self.assertEqual(o["onReadonly"], "enabling")
+
+    def test_a_snapshot_lands_when_the_newest_file_changes_not_when_the_manifest_grows(self):
+        w = self.out["enableWait"]
+        self.assertEqual(w["landed"], {"newest": "d", "shown": [2], "cleared": True})
+
+    def test_a_landing_after_the_user_moved_on_leaves_them_where_they_are(self):
+        self.assertEqual(self.out["enableWait"]["movedOn"], {"shown": [], "onScreen": "b"})
+
+    def test_giving_up_is_not_for_the_rest_of_the_page(self):
+        self.assertEqual(self.out["enableWait"]["gaveUp"], {"gaveUp": True, "cleared": True, "fresh": True})
+
+    def test_a_fresh_manifest_keeps_the_snapshot_on_screen(self):
+        # onGcd: the snapshot on screen was garbage-collected; the viewer says so rather than switch.
+        self.assertEqual(self.out["enableWait"]["adopt"], {"onB": 0, "onGcd": -1, "none": 2})
+
+    def test_a_merged_familys_twins_claim_neither_labels_nor_one_pin(self):
+        n = self.out["familyNote"]
+        self.assertNotIn("generic plan", n["family"])
+        self.assertNotIn("custom plan", n["family"])
+        self.assertNotIn("one pin covers them all", n["family"])
+        self.assertIn("pinned per query_id", n["family"])
+        self.assertIn("one pin covers them all", n["single"])
+
+    def test_provisional_needs_few_calls_and_a_small_share(self):
+        s = self.out["shareRule"]
+        self.assertFalse(s["lowConfidence"])  # 10 calls, but 10% of the statement's
+        self.assertNotIn("provisional", s["headline"])
 
     def test_a_collector_locked_off_is_shown_as_locked(self):
         self.assertEqual(self.out["offState"]["locked"], "locked")
