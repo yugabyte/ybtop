@@ -320,6 +320,20 @@ def database_names(conn: psycopg.Connection) -> dict[str, str]:
     return {str(r["oid"]): str(r["datname"]) for r in rows}
 
 
+def role_names(conn: psycopg.Connection) -> dict[str, str]:
+    """oid (as text) -> rolname for every role.
+
+    QPM rows carry only userid. The viewer names the role an EXPLAIN ANALYZE will
+    run as before anything connects, so the snapshot carries the names.
+    """
+    rows = fetch_all(
+        conn,
+        "SELECT oid::text AS oid, rolname::text AS rolname FROM pg_catalog.pg_roles"
+        " /* __YB_STAT_PLANS_SKIP */",
+    )
+    return {str(r["oid"]): str(r["rolname"]) for r in rows}
+
+
 def database_name(conn: psycopg.Connection, dbid: str) -> Optional[str]:
     """datname for one database oid, or None if it no longer exists."""
     rows = fetch_all(

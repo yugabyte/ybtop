@@ -15,10 +15,11 @@ import psycopg.conninfo
 from rich.console import Console
 
 from ybtop import __version__ as _ybtop_version
+from ybtop import explain as X
 from ybtop import pinscan
 from ybtop import queries as Q
 from ybtop.control import CONTROL_DEFAULTS, ControlLocked, read_control, read_control_locks, write_control
-from ybtop.db import connect, dsn_for_database
+from ybtop.db import connect, dsn_for_database, dsn_for_host
 
 _INT64_TEXT = re.compile(r"^-?\d{1,20}$")
 
@@ -205,6 +206,10 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
     # unavailable rather than half-working.
     seed_dsn: "str | None" = None
     allow_plan_pinning: bool = False
+    # EXPLAIN ANALYZE executes statements, so it has its own opt-in
+    # (`ybtop watch --allow-explain-analyze`), independent of pinning.
+    allow_explain_analyze: bool = False
+    explain_runs: X.ExplainRuns = X.ExplainRuns()
     # DNS-rebinding guard; see host_allowed. The flag differs between watch and serve.
     bind_host: str = "127.0.0.1"
     allowed_hosts: "frozenset[str]" = frozenset()
@@ -225,7 +230,6 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
         else:
             self._send_bytes(msg.encode("utf-8"), "text/plain; charset=utf-8", 403)
         return False
-
 
     def log_message(self, fmt: str, *args: object) -> None:
         return
@@ -281,6 +285,103 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
                 "pinning is available from the viewer that ybtop watch starts."
             )
         return None
+
+    def _explain_unavailable_reason(self) -> "str | None":
+        """Why EXPLAIN ANALYZE cannot be offered, or None when it can."""
+        cls = type(self)
+        if not cls.allow_explain_analyze:
+            return (
+                "EXPLAIN ANALYZE is off for this collector. It executes statements on the "
+                "cluster and this page has no login, so it is switched on where the "
+                "collector runs -- start ybtop watch with --allow-explain-analyze -- not "
+                "from here."
+            )
+        if not cls.seed_dsn:
+            return (
+                "This viewer has no database connection (ybtop serve reads files only); "
+                "EXPLAIN ANALYZE is available from the viewer that ybtop watch starts."
+            )
+        return None
+
+    def _handle_explain(self, body: dict) -> None:
+        """Start one EXPLAIN ANALYZE of a recorded execution; the run continues in the background.
+
+        The request names a recorded QPM row (queryid, planid, plan_ref, dbid, node)
+        in one of our snapshots. The statement, its parameter values, the database,
+        the node and the role all come from that snapshot; only the options and the
+        timeout come from the request.
+        """
+        reason = self._explain_unavailable_reason()
+        if reason is not None:
+            self._send_json({"error": reason}, 403)
+            return
+        vals = {
+            k: str(body.get(k) or "").strip()
+            for k in ("queryid", "planid", "plan_ref", "dbid", "node", "file", "userid")
+        }
+        if not vals["userid"]:
+            self._send_json({"error": "this page is older than the collector; reload it"}, 400)
+            return
+        for k in ("queryid", "planid", "dbid", "userid"):
+            if not _INT64_TEXT.match(vals[k]):
+                self._send_json({"error": "%s must be an integer" % k}, 400)
+                return
+        if not _PLAN_REF_TEXT.match(vals["plan_ref"]):
+            self._send_json({"error": "plan_ref is malformed"}, 400)
+            return
+        for k in ("dist", "debug"):
+            if k in body and not isinstance(body[k], bool):
+                self._send_json({"error": "%s must be true or false" % k}, 400)
+                return
+        doc = self._load_snapshot(vals["file"])
+        if doc is None:
+            self._send_json(
+                {
+                    "error": "snapshot %s is no longer on disk -- ybtop keeps a few hours of "
+                    "snapshots. Open the latest snapshot and try again." % (vals["file"] or "(none)")
+                },
+                404,
+            )
+            return
+        # The node must be one this snapshot recorded -- never a host from the request.
+        if vals["node"] not in ((doc.get("yb_pg_stat_plans") or {}).get("per_node") or {}):
+            self._send_json({"error": "that node is not in this snapshot"}, 404)
+            return
+        target, why = X.resolve_target(
+            doc,
+            queryid=vals["queryid"],
+            planid=vals["planid"],
+            plan_ref=vals["plan_ref"],
+            dbid=vals["dbid"],
+            node=vals["node"],
+            userid=vals["userid"],
+        )
+        if target is None:
+            self._send_json({"error": why}, 409)
+            return
+        target["snapshot_file"] = vals["file"]
+        host, port = X.split_node(vals["node"])
+        dsn = dsn_for_host(dsn_for_database(str(type(self).seed_dsn), target["datname"]), host, port)
+        options = X.explain_options(body.get("dist") is True, body.get("debug") is True)
+        timeout_s = X.clamp_timeout(body.get("timeout_s"))
+
+        def work(run: dict, cancel_ready: object) -> dict:
+            return X.run_explain(
+                dsn, target, options, timeout_s, on_cancel_ready=cancel_ready, stop=run["_stop"]
+            )
+
+        run, busy = type(self).explain_runs.start(target, options, timeout_s, work)
+        if run is None:
+            self._send_json(
+                {
+                    "error": "Another EXPLAIN ANALYZE is still running (query_id %s); "
+                    "one runs at a time." % ((busy or {}).get("queryid") or "?"),
+                    "active": busy,
+                },
+                409,
+            )
+            return
+        self._send_json({"run": run}, 202)
 
     def _pin_state(self, target: dict, conn: object = None) -> dict[str, object]:
         """Prerequisites plus whether a hint is pinned, in the target plan's database.
@@ -471,7 +572,7 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self) -> None:  # noqa: N802
-        """State-changing endpoints: collection toggle and pinning.
+        """State-changing endpoints: collection toggle, pinning, EXPLAIN ANALYZE.
 
         POST-only, same-origin JSON only (see cross_site_problem), from a Host this
         viewer is reached by (see host_allowed).
@@ -486,6 +587,8 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
             "/api/unpin",
             "/api/hinting",
             "/api/hint-plan/install",
+            "/api/explain",
+            "/api/explain/cancel",
         ):
             self.send_error(404)
             return
@@ -516,6 +619,16 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
             return
         if route == "/api/hint-plan/install":
             self._handle_install_hint_plan(body)
+            return
+        if route == "/api/explain":
+            self._handle_explain(body)
+            return
+        if route == "/api/explain/cancel":
+            dbid, queryid = str(body.get("dbid") or ""), str(body.get("queryid") or "")
+            if not _INT64_TEXT.match(dbid) or not _INT64_TEXT.match(queryid):
+                self._send_json({"error": "expected dbid and queryid"}, 400)
+                return
+            self._send_json({"run": type(self).explain_runs.cancel(dbid, queryid)})
             return
         problem = self._collection_switch_problem()
         if problem is not None:
@@ -651,6 +764,27 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
             self._send_json(self._collection_state())
             return
 
+        if path == "/api/explain":
+            qs = parse_qs(parsed.query or "")
+            dbid = (qs.get("dbid") or [""])[0]
+            # A canonical family can span hundreds of query_ids; the page puts the
+            # one it would replay first.
+            queryids = [q for q in ((qs.get("queryids") or [""])[0]).split(",") if q][:200]
+            if (dbid and not _INT64_TEXT.match(dbid)) or not all(_INT64_TEXT.match(q) for q in queryids):
+                self._send_json({"error": "dbid and queryids must be integers"}, 400)
+                return
+            reason = self._explain_unavailable_reason()
+            runs = type(self).explain_runs
+            self._send_json(
+                {
+                    "available": reason is None,
+                    "reason": reason,
+                    "run": runs.latest(dbid, queryids) if dbid and queryids else None,
+                    "active": runs.active(),
+                }
+            )
+            return
+
         if path == "/api/pin":
             qs = parse_qs(parsed.query or "")
             fields = {k: (qs.get(k) or [""])[0] for k in ("queryid", "planid", "plan_ref", "dbid", "file")}
@@ -727,6 +861,7 @@ def start_serve_background(
     port: int,
     seed_dsn: str | None = None,
     allow_plan_pinning: bool = False,
+    allow_explain_analyze: bool = False,
     allowed_hosts: "list[str] | None" = None,
 ) -> bool:
     """
@@ -752,8 +887,11 @@ def start_serve_background(
         return False
     YbtopHTTPRequestHandler.data_dir = root
     # Only the watch-embedded viewer gets a DSN, and only when explicitly allowed.
-    YbtopHTTPRequestHandler.seed_dsn = seed_dsn if allow_plan_pinning else None
+    YbtopHTTPRequestHandler.seed_dsn = (
+        seed_dsn if (allow_plan_pinning or allow_explain_analyze) else None
+    )
     YbtopHTTPRequestHandler.allow_plan_pinning = bool(allow_plan_pinning)
+    YbtopHTTPRequestHandler.allow_explain_analyze = bool(allow_explain_analyze)
     YbtopHTTPRequestHandler.bind_host = host
     YbtopHTTPRequestHandler.allowed_hosts = _allowed(allowed_hosts)
     try:

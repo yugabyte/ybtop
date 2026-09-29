@@ -59,6 +59,8 @@ class Settings:
     snapshot_query_plans_per_node: int = SNAPSHOT_QUERY_PLANS_PER_NODE
     # Lets the viewer write pg_hint_plan rows; off unless the operator opts in.
     allow_plan_pinning: bool = False
+    # Lets the viewer run EXPLAIN ANALYZE of recorded statements; off unless opted in.
+    allow_explain_analyze: bool = False
     snapshot_latency_analysis: bool = False
     snapshot_compress: bool = False
     log_enabled: bool = True

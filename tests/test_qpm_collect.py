@@ -101,7 +101,7 @@ class QpmStatusTest(unittest.TestCase):
 
     def setUp(self):
         self.calls = {"connect": 0, "status": 0, "databases": 0}
-        self.saved = (snapshot_write.connect, Q.qpm_status, Q.database_names,
+        self.saved = (snapshot_write.connect, Q.qpm_status, Q.database_names, Q.role_names,
                       snapshot_write.QPM_STATUS_OFF_MAX_AGE_S)
         snapshot_write._qpm_status_cache.clear()
 
@@ -119,9 +119,10 @@ class QpmStatusTest(unittest.TestCase):
             return {"16640": "app"}
 
         snapshot_write.connect, Q.qpm_status, Q.database_names = fake_connect, fake_status, fake_databases
+        Q.role_names = lambda conn: {"16384": "app_user"}
 
     def tearDown(self):
-        (snapshot_write.connect, Q.qpm_status, Q.database_names,
+        (snapshot_write.connect, Q.qpm_status, Q.database_names, Q.role_names,
          snapshot_write.QPM_STATUS_OFF_MAX_AGE_S) = self.saved
         snapshot_write._qpm_status_cache.clear()
 
@@ -131,19 +132,19 @@ class QpmStatusTest(unittest.TestCase):
                             pg_stat_latency_histogram=False, qpm_stat_plans=qpm)
 
     def test_a_cluster_without_qpm_is_not_asked(self):
-        self.assertEqual(snapshot_write._qpm_status_for_snapshot("dsn", self.caps(False), True), ({}, {}))
+        self.assertEqual(snapshot_write._qpm_status_for_snapshot("dsn", self.caps(False), True), ({}, {}, {}))
         self.assertEqual(self.calls["connect"], 0)
 
     def test_collecting_reads_status_and_names_every_checkpoint(self):
         for _ in range(3):
-            st, dbs = snapshot_write._qpm_status_for_snapshot("dsn", self.caps(True), True)
-        self.assertEqual((st["track"], dbs), ("all", {"16640": "app"}))
+            st, dbs, roles = snapshot_write._qpm_status_for_snapshot("dsn", self.caps(True), True)
+        self.assertEqual((st["track"], dbs, roles), ("all", {"16640": "app"}, {"16384": "app_user"}))
         self.assertEqual(self.calls, {"connect": 3, "status": 3, "databases": 3})
 
     def test_off_reads_status_now_and_then_and_never_the_names(self):
         for _ in range(3):
-            st, dbs = snapshot_write._qpm_status_for_snapshot("dsn", self.caps(True), False)
-        self.assertEqual((st["track"], dbs), ("all", {}))  # the viewer still sees track
+            st, dbs, roles = snapshot_write._qpm_status_for_snapshot("dsn", self.caps(True), False)
+        self.assertEqual((st["track"], dbs, roles), ("all", {}, {}))  # the viewer still sees track
         self.assertEqual(self.calls, {"connect": 1, "status": 1, "databases": 0})
         snapshot_write.QPM_STATUS_OFF_MAX_AGE_S = 0.0
         snapshot_write._qpm_status_for_snapshot("dsn", self.caps(True), False)
