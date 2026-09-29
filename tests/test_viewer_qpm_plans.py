@@ -40,11 +40,18 @@ const NAMES = ["qpmPlanShapeSignature", "qpmScopeQueryIds", "aggregateQpmPlans",
   "qpmPanelMode", "qpmPinEffectWarnings", "qpmCollectionOffState", "qpmCollectionHeaderLabel", "qpmPinRowMode",
   "qpmDbidsForName", "qpmDatabaseLabel", "qpmRowQueryIds", "qpmPlanIndex", "annotateRowsWithQpmPlans",
   "withQpmPlansColumn", "qpmEffectivePinned", "qpmPanelDbids", "qpmPinButtonStates",
-  "qpmMaskPlanParams", "qpmPlanTwinKey", "qpmTwinKeysFor", "qpmVariantsNote", "qpmCallsText"];
-const A = new Function([
+  "qpmMaskPlanParams", "qpmPlanTwinKey", "qpmTwinKeysFor", "qpmVariantsNote", "qpmCallsText",
+  "qpmTemplateMembers", "collapseStatementsByTemplate", "statementMergeKey", "deltaSrcFromRowFallback",
+  "ycqlPreparedTruthy", "deltaPgStatMergedRows", "queryTemplateKey"];
+// Template normalization (the consts and normalizeQueryTemplate), for queryTemplateKey.
+const norm = src.slice(src.indexOf("const HIST_REWRITE_COMMENT_RE"), src.indexOf("function queryTemplateKey("));
+// Helpers only some versions of the delta pipeline have (#7 adds this one).
+const optional = (n) => (src.indexOf(`\n  function ${n}(`) >= 0 ? fn(n) : "");
+const A = new Function(["let mergeSimilarSql = true;", cb("PG_STAT_DOCDB_KEYS"), norm,
   cb("QPM_PLAN_ACTIVE_WINDOW_MS"), cb("QPM_LOW_CONFIDENCE_CALLS"), cb("QPM_LOW_CONFIDENCE_SHARE"),
   cb("QPM_TRACK_MODES_ON"), cb("QPM_PLANS_COL"),
   cb("QPM_TYPE_NAME_SRC"), cb("QPM_MASK_CONST"), cb("QPM_MASK_ARRAY"), cb("QPM_MASK_CAST"),
+  optional("pgStatDeltaRowHasActivity"),
   ...NAMES.map(fn), "return {" + NAMES.join(",") + ", QPM_PLANS_COL};"].join("\n"))();
 
 const NOW = Date.parse("2026-09-17T12:00:00Z");
@@ -355,6 +362,29 @@ out.pinRow = {
     oneCall: verdictOf({ n1: [row("q1", "FAST", "rF", 1, 1.0, 0), row("q1", "SLOW", "rS", 5000, 2.0, 0)] }).headline,
   };
 }
+{ // Merge on, delta mode: the plans column counts across a template's members whichever
+  // way the delta pass builds the grouped rows. Subtracting collapsed rows (main) drops
+  // their member list; collapsing per-statement deltas (#7) keeps it.
+  const stmt = (queryid, query, calls) => ({ queryid, query, dbname: "app", calls, total_ms: calls, mean_ms: 1,
+    _deltaSrc: { calls, total_exec_time: calls, doc: {} } });
+  const Q2 = "select * from t where id in ($1, $2)", Q3 = "select * from t where id in ($1, $2, $3)";
+  const prev = [stmt("q1", Q2, 100), stmt("q2", Q3, 50)];
+  const cur = [stmt("q1", Q2, 160), stmt("q2", Q3, 80)];
+  const sec = { databases: { "16640": "app" }, plans: {}, per_node: { n1: [
+    { queryid: "q1", planid: "P1", plan_ref: "a", dbid: "16640", calls: 1 },
+    { queryid: "q2", planid: "P2", plan_ref: "b", dbid: "16640", calls: 1 }] } };
+  const members = A.qpmTemplateMembers(cur);
+  const subtracted = A.deltaPgStatMergedRows(A.collapseStatementsByTemplate(cur), A.collapseStatementsByTemplate(prev));
+  const collapsed = A.collapseStatementsByTemplate(A.deltaPgStatMergedRows(cur, prev));
+  const count = (rows, m) => A.annotateRowsWithQpmPlans(rows, sec, new Map(), m)[0].qpm_plans;
+  out.deltaPipelines = {
+    rows: [subtracted.length, collapsed.length],
+    subtractedKeepsMembers: Array.isArray(subtracted[0]._tmpl_queryids),
+    subtracted: count(subtracted, members),
+    collapsed: count(collapsed, members),
+    subtractedWithoutLookup: count(subtracted, null),
+  };
+}
 console.log(JSON.stringify(out));
 """
 
@@ -562,6 +592,15 @@ class ViewerQpmPlansTest(unittest.TestCase):
         self.assertEqual(c["template"]["qpm_plans"], 3)  # P1,P2 from q1 + P4 from q2; shared P2 once
         self.assertEqual(c["template"]["qpm_plans"], c["templateDrill"])
         self.assertEqual(c["summary"]["qpm_plans"], 2)
+
+    def test_plans_column_counts_members_whichever_delta_pass_built_the_rows(self):
+        # Guards the #7 interplay: main's delta pass rebuilds grouped rows without their
+        # members, #7's keeps them; the column must read the same either way.
+        d = self.out["deltaPipelines"]
+        self.assertEqual(d["rows"], [1, 1])
+        self.assertFalse(d["subtractedKeepsMembers"])  # why the lookup exists
+        self.assertEqual((d["subtracted"], d["collapsed"]), (2, 2))
+        self.assertEqual(d["subtractedWithoutLookup"], 0)
 
     def test_plans_column_is_scoped_to_the_rows_database(self):
         c = self.out["col"]

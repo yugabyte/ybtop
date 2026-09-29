@@ -1486,13 +1486,29 @@
   }
 
   /** The queryids a statement row stands for: itself, or every member of a template row. */
-  function qpmRowQueryIds(r) {
+  function qpmRowQueryIds(r, templateMembers) {
     if (!r) return [];
     if (Array.isArray(r._tmpl_queryids) && r._tmpl_queryids.length) return r._tmpl_queryids.map(String);
     if (Array.isArray(r.query_members) && r.query_members.length) {
       return r.query_members.map((m) => String(m && m.query_id));
     }
+    // A template row that a delta pass rebuilt without its members: find them by its
+    // template key (see qpmTemplateMembers).
+    const members = templateMembers ? templateMembers.get(statementMergeKey(r)) : null;
+    if (members && members.length) return members.map(String);
     return r.queryid != null ? [String(r.queryid)] : [];
+  }
+
+  /**
+   * Template key -> member queryids, from the snapshot's own statements. The plans
+   * column counts a merged row's plans across its members, and must not depend on
+   * how a delta pass rebuilds grouped rows: one that subtracts collapsed rows drops
+   * their member list, one that collapses per-statement deltas keeps it.
+   */
+  function qpmTemplateMembers(mergedRows) {
+    const out = new Map();
+    collapseStatementsByTemplate(mergedRows).forEach((r) => out.set(statementMergeKey(r), r._tmpl_queryids || []));
+    return out;
   }
 
   /**
@@ -1571,14 +1587,14 @@
    * the snapshot can map its name, otherwise every database, and all queryids a
    * template row stands for.
    */
-  function annotateRowsWithQpmPlans(rows, qpmSection, pinnedByDbOverride) {
+  function annotateRowsWithQpmPlans(rows, qpmSection, pinnedByDbOverride, templateMembers) {
     const idx = qpmPlanIndex(qpmSection);
     const pinnedByDb = pinnedByDbOverride || qpmEffectivePinned(qpmSection, NaN, new Map());
     return (rows || []).map((r) => {
       const dbids = qpmDbidsForName(qpmSection, r && r.dbname);
       const plans = new Set();
       let pinned = false;
-      qpmRowQueryIds(r).forEach((q) => {
+      qpmRowQueryIds(r, templateMembers).forEach((q) => {
         const keys = dbids ? Array.from(dbids, (d) => q + "|" + d) : [q + "|*"];
         keys.forEach((k) => {
           const set = idx.get(k);
@@ -6569,8 +6585,6 @@
           const primaryByKey = new Map(
             collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_primary_queryid])
           );
-          // The members, too: the plans column counts plans across them.
-          const idsByKey = new Map(collapsedCur.map((r) => [statementMergeKey(r), r._tmpl_queryids]));
           pgRows = withPgStatDeltaDerivedRows(
             deltaPgStatMergedRows(collapsedCur, collapsedPrev),
             prevDoc.generated_at_utc,
@@ -6579,7 +6593,6 @@
           pgRows.forEach((r) => {
             r._tmpl_member_count = memberByKey.get(statementMergeKey(r)) || 1;
             r._tmpl_primary_queryid = primaryByKey.get(statementMergeKey(r)) || null;
-            r._tmpl_queryids = idsByKey.get(statementMergeKey(r)) || [];
           });
           applyCanonicalizedQueryText(pgRows);
           pgCols = groupedStatementDisplayColumns(pgStatStatementColumnsDelta(pgRows, st));
@@ -6607,7 +6620,9 @@
       }
 
       if (pgssShowPlans) {
-        pgRows = annotateRowsWithQpmPlans(pgRows, pgssQpm, pgssPinned);
+        pgRows = annotateRowsWithQpmPlans(
+          pgRows, pgssQpm, pgssPinned, mergeSimilarSql ? qpmTemplateMembers(merged) : null
+        );
         pgCols = withQpmPlansColumn(pgCols);
       }
       panelPgss.appendChild(
