@@ -150,16 +150,16 @@ The viewer has no login, and a pin changes the plans your application gets, so p
 
 With **`ybtop watch --allow-explain-analyze`**, a statement's ASH report gets an **Explain analyze** button. It runs `EXPLAIN (ANALYZE)` of the statement, optionally with **DIST** and **DEBUG**, using the parameter values of its slowest recorded execution, on the node that recorded them, in its database and as the role that ran it. The plan panel's **Explain analyze** tab then shows the result instead of the recorded plans, and the query above it switches to **inline literals**: the statement with those values in place of `$1`, `$2`, … (a chip beside the query turns that on for the recorded view too).
 
-![The confirmation dialog: the statement with its values (redacted here), the options, the timeout, and every statement ybtop will send](docs/images/qpm-explain-dialog.png)
+![The confirmation dialog: the statement with its values (redacted here), the options, the timeout, and the steps of the run](docs/images/qpm-explain-dialog.png)
 
-Nothing runs until you confirm. The dialog shows the statement with its values and every statement ybtop will send:
+Nothing runs until you confirm. The dialog shows the statement with its values and the steps of the run (its catalog reads, for the role's name and settings, left out):
 
 - a **statement timeout** you choose (default 30 s, at most 600), set before anything else; ybtop also cancels from the client at the same moment;
 - **`BEGIN READ ONLY`** for a query. A statement that writes or locks rows (INSERT, UPDATE, DELETE, MERGE, SELECT … FOR UPDATE) runs in a transaction that is always **rolled back**, with `yb_disable_transactional_writes` forced off — with it on, YugabyteDB applies writes outside the transaction;
 - **`SET LOCAL ROLE`** to the role that ran it, with that role's own settings;
 - a plan-only `EXPLAIN (FORMAT JSON)`, to compare with the recorded plans, then the `EXPLAIN (ANALYZE …)`, then `ROLLBACK`.
 
-The values are sent as bind parameters, never spliced into the SQL, and ybtop's statements are marked so QPM does not record the replay. ybtop refuses — and says why on the button — when QPM cut the parameters short or redacted them (`yb_pg_stat_plans_show_max_exec_params` off), when `pg_stat_statements` normalised a constant that QPM kept no value for, for statements other than SELECT, WITH, VALUES, TABLE, INSERT, UPDATE, DELETE and MERGE, and for calls whose effect a rollback cannot undo (`pg_terminate_backend`, `dblink`, `setval`, …). Functions the statement calls do run, and a user-defined function can hide such an effect; the dialog says so.
+The values are sent as bind parameters, never spliced into the SQL, and ybtop's statements are marked so QPM does not record the replay. ybtop refuses — and says why on the button — when QPM cut the parameters short or redacted them (`yb_pg_stat_plans_show_max_exec_params` off), when `pg_stat_statements` normalised a constant that QPM kept no value for, for statements other than SELECT, WITH, VALUES, TABLE, INSERT, UPDATE, DELETE and MERGE, and for calls whose effect a rollback cannot undo (`pg_terminate_backend`, `dblink`, `setval`, …). Functions the statement calls do run, and a user-defined function can hide such an effect; the dialog says so. It also says that a write's replay uses up the sequence values it draws (`nextval()`, serial and identity defaults), as any rolled-back transaction does.
 
 ![An EXPLAIN (ANALYZE, DIST, DEBUG) result: the run against the recorded slowest, DocDB request counts, and whether the planner chose the plan the slowest execution ran (names and values redacted here)](docs/images/qpm-explain-result.png)
 

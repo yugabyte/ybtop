@@ -3098,8 +3098,9 @@
   }
 
   /**
-   * {kind: "read" | "write" | null, label}. Mirrors explain.statement_kind: writes run
-   * in a transaction that is rolled back, everything else READ ONLY; null is refused.
+   * {kind: "read" | "write" | null, label}. Mirrors explain.statement_kind: what writes
+   * or locks rows by its text or its recorded plan runs in a transaction that is
+   * rolled back, everything else READ ONLY; null is refused.
    */
   function qpmStatementKind(sql, planText) {
     const verb = qpmFirstVerb(sql);
@@ -3107,14 +3108,16 @@
     if (QPM_READ_VERBS.indexOf(verb) < 0 && !isWriteVerb) return { kind: null, label: verb || "?" };
     const plan = String(planText == null ? "" : planText);
     const op = /"Operation":\s*"(Insert|Update|Delete|Merge)"/.exec(plan);
+    const lock = qpmLockingClause(sql);
     const writes =
       isWriteVerb
+      || lock != null
       || /"Node Type":\s*"(?:ModifyTable|LockRows)"/.test(plan)
       || /^\s*(?:->\s+)?(?:(?:Insert|Update|Delete|Merge) on |LockRows)/m.test(plan);
     let label;
     if (isWriteVerb) label = verb;
     else if (op) label = verb + " … " + op[1].toUpperCase();
-    else if (writes) label = verb === "SELECT" ? "SELECT … FOR UPDATE" : verb + " (locks rows)";
+    else if (writes) label = verb === "SELECT" ? "SELECT … FOR " + (lock || "UPDATE") : verb + " (locks rows)";
     else label = verb;
     return { kind: writes ? "write" : "read", label };
   }
@@ -3131,7 +3134,8 @@
 
   /**
    * Calls whose effect a ROLLBACK does not undo (other sessions, the server, files,
-   * other databases, sequences, statistics). Mirrors explain._SIDE_EFFECT_CALL.
+   * other databases, a sequence's current value, statistics), matched on the code
+   * in ASCII lower case. Mirrors explain._SIDE_EFFECT_CALL.
    *
    * A leading group, not a lookbehind: this is built while app.js loads, and a
    * browser without lookbehind (Safari before 16.4) would throw there and take
@@ -3148,12 +3152,42 @@
       + "|yb_pg_stat_plans_(?:reset|insert)[a-z_]*|yb_reset_analyze_statistics"
       + "|yb_cancel_transaction|yb_query_diagnostics|yb_increment_[a-z_]+"
       + ')"?[ \\t\\n\\r\\f\\v]*\\(',
-    "iu"
+    "u"
   );
 
+  /** FOR UPDATE / NO KEY UPDATE / SHARE / KEY SHARE, on lower-cased code. Mirrors explain._LOCKING_CLAUSE. */
+  const QPM_LOCKING_CLAUSE = new RegExp(
+    "(?:^|[^a-z0-9_$\\u{80}-\\u{10FFFF}])for[ \\t\\n\\r\\f\\v]+"
+      + "(no[ \\t\\n\\r\\f\\v]+key[ \\t\\n\\r\\f\\v]+update|update|key[ \\t\\n\\r\\f\\v]+share|share)"
+      + "(?![a-z0-9_$\\u{80}-\\u{10FFFF}])",
+    "u"
+  );
+
+  /** PostgreSQL's lexer folds only ASCII letters; toLowerCase (and an "i" flag) folds more. */
+  function qpmAsciiLower(s) {
+    return String(s).replace(/[A-Z]+/g, (m) => m.toLowerCase());
+  }
+
   function qpmSideEffectCall(sql) {
-    const m = QPM_SIDE_EFFECT_CALL.exec(qpmCodeOnly(sql));
-    return m ? m[1].toLowerCase() : null;
+    const m = QPM_SIDE_EFFECT_CALL.exec(qpmAsciiLower(qpmCodeOnly(sql)));
+    return m ? m[1] : null;
+  }
+
+  /** "UPDATE", "NO KEY UPDATE", "SHARE" or "KEY SHARE" if the text locks rows. Mirrors explain.locking_clause. */
+  function qpmLockingClause(sql) {
+    const code = qpmCodeOnly(sql).replace(/"(?:[^"]|"")*"?/g, (m) => " ".repeat(m.length));
+    const m = QPM_LOCKING_CLAUSE.exec(qpmAsciiLower(code));
+    return m ? m[1].toUpperCase().split(/[ \t\n\r\f\v]+/).join(" ") : null;
+  }
+
+  /** Why the snapshot has no name for a plan's database. Mirrors explain.database_unknown_reason. */
+  function qpmDatabaseUnknownReason(databases, dbid) {
+    if (!databases || !Object.keys(databases).length) {
+      return "this snapshot has no list of databases (reading it failed), so this plan's database (oid "
+        + dbid + ") is unknown; try a later snapshot";
+    }
+    return "this plan's database (oid " + dbid + ") is not in the snapshot's list of databases: it was"
+      + " dropped before the snapshot, or created while it was taken";
   }
 
   function qpmSideEffectReason(fn) {
@@ -3241,7 +3275,7 @@
       } else if (r.userid == null || String(r.userid) === "") {
         why = "QPM did not record which role ran this statement, so it is not replayed.";
       } else if (!datname) {
-        why = "this plan was recorded in a database that no longer exists (oid " + dbid + ")";
+        why = qpmDatabaseUnknownReason(databases, dbid);
       } else {
         sql = qpmStatementText(doc, r.queryid, datname, nid);
         if (!sql) why = "pg_stat_statements text for this query_id is not in the snapshot";
@@ -3372,7 +3406,13 @@
     return '"' + String(name).replace(/"/g, '""') + '"';
   }
 
-  /** Exactly what a run sends, for the confirmation dialog. Mirrors explain.run_explain. */
+  /**
+   * The steps of a run, in order, for the confirmation dialog. Mirrors
+   * explain.run_explain, less its catalog reads (the role's name and its ALTER ROLE
+   * settings) and the set_config calls: the role's settings are the note on SET
+   * LOCAL ROLE, and yb_disable_transactional_writes is shown as the SET LOCAL it
+   * amounts to (the run also checks it took).
+   */
   function qpmExplainSequence(target, options, timeoutS) {
     const role = target.role
       ? qpmQuoteIdent(target.role)
@@ -3468,7 +3508,11 @@
   let qpmExplainActive = null;
   /** What the poller asks about: the statements of the panel on screen. */
   let qpmExplainWatch = null;
-  /** True for the whole of a poll, await included: a redraw then must not start a second loop. */
+  /**
+   * True for the whole of a poll, await included: a redraw then must not start a
+   * second loop. The loop reads the watch again after its await, so a redraw that
+   * changes the watch is still polled.
+   */
   let qpmExplainPolling = false;
   /** Run ids the user asked to cancel, so a redraw keeps saying "Cancelling". */
   const qpmExplainCancelling = new Set();
@@ -3581,8 +3625,11 @@
         await qpmFetchExplain(w.dbid, w.queryIds);
         qpmNotifyExplain();
       }
-      // A failed poll keeps the last state, so a run in flight keeps being polled.
-      const run = w ? qpmLatestRun(w.dbid, w.queryIds) : null;
+      // From the watch as it is now: a panel drawn during the await may watch another
+      // statement, and its qpmEnsureExplainPoll found this loop still going. A failed
+      // poll keeps the last state, so a run in flight keeps being polled.
+      const now = qpmExplainWatch;
+      const run = now ? qpmLatestRun(now.dbid, now.queryIds) : null;
       if (run && run.state === "running") setTimeout(tick, QPM_EXPLAIN_POLL_MS);
       else qpmExplainPolling = false;
     };
@@ -3727,18 +3774,29 @@
       className: "qpm-enable-btn qpm-dialog-run" + (target.kind === "write" ? " qpm-enable-btn--danger" : ""),
       textContent: target.kind === "write" ? "Run, then roll back" : "Run",
     });
-    // One run at a time per collector: say so now rather than after the click.
-    const busy = qpmExplainActive && qpmExplainActive.state === "running" ? qpmExplainActive : null;
-    if (busy) {
-      runBtn.disabled = true;
-      msg.hidden = false;
-      msg.className = "qpm-dialog-note";
+    // One run at a time per collector: say so now rather than after the click. What
+    // the page last heard can be stale -- nothing polls another statement's run --
+    // so the collector is asked again as the dialog opens.
+    let clicked = false;
+    function showBusy() {
+      const busy = qpmExplainActive && qpmExplainActive.state === "running" ? qpmExplainActive : null;
+      runBtn.disabled = !!busy;
+      msg.hidden = !busy;
+      msg.className = "qpm-dialog-note" + (busy ? "" : " qpm-dialog-note--err");
+      if (!busy) return;
       msg.textContent =
         String(busy.queryid) === String(target.queryid)
           ? "This statement is already running (started " + qpmFmtClock(busy.started_utc) + ")."
           : "Another EXPLAIN ANALYZE is running (query_id " + busy.queryid + ", started "
             + qpmFmtClock(busy.started_utc) + "); one runs at a time.";
     }
+    showBusy();
+    qpmFetchExplain(target.dbid, [target.queryid]).then(() => {
+      qpmNotifyExplain();
+      // A run found in flight is shown by the panel: poll it, or it stays "Running…".
+      if (qpmExplainActive && qpmExplainActive.state === "running") qpmEnsureExplainPoll();
+      if (!clicked) showBusy();
+    });
 
     function sync() {
       // DEBUG needs DIST: tick it and hold it while DEBUG is on.
@@ -3758,6 +3816,7 @@
     // Enter in the timeout box would submit the form: running must be a click.
     form.addEventListener("submit", (ev) => ev.preventDefault());
     runBtn.addEventListener("click", async () => {
+      clicked = true;
       const chosen = {
         dist: distBox.checked,
         debug: debugBox.checked,
@@ -3792,11 +3851,13 @@
       } catch (e) {
         starting = false;
         closeBtn.disabled = false;
-        // A 409 names the run in flight; the page shows it (and can cancel it) if it is ours.
+        // A 409 names the run in flight; the page shows it (and can cancel it) if it is
+        // ours, and polls so that it does not stay "Running…".
         if (e.active) {
           qpmRememberRun(e.active);
           qpmExplainActive = e.active;
           qpmNotifyExplain();
+          qpmEnsureExplainPoll();
         }
         runBtn.disabled = !!e.active;
         runBtn.textContent = target.kind === "write" ? "Run, then roll back" : "Run";
@@ -3817,11 +3878,6 @@
 
   /* ---- EXPLAIN ANALYZE: result view ---- */
 
-  /**
-   * One line at the top of the plan panel: the Run button with what it would
-   * replay, or the last run's result with a way to it -- visible without first
-   * switching to the EXPLAIN tab. Muted, with the reason, when nothing can run.
-   */
   /** "6.2× faster than the recorded 106 ms", or null when there is nothing to compare. */
   function qpmRatioText(ms, recordedMs) {
     const ratio = recordedMs > 0 ? ms / recordedMs : null;
@@ -4078,11 +4134,6 @@
   }
 
   /**
-   * The query banner's EXPLAIN control: a primary button while nothing runs, live
-   * progress while something does, and a chip for the last result. It drives the
-   * plan panel below (qpmPanelActions), so there is one dialog and one result view.
-   */
-  /**
    * What the query banner's EXPLAIN control shows. Pure:
    *   {label, running, muted, title, last: chip text or null}
    */
@@ -4260,7 +4311,7 @@
         textContent: qpmVerdictHeadline(verdict),
       })
     );
-    // Recorded plans <-> EXPLAIN ANALYZE; a plain button until a run exists.
+    // The Recorded plans / Explain analyze switch, drawn by paint() below.
     const explainCtl = el("span", { className: "qpm-explain-ctl" });
     head.appendChild(explainCtl);
     if (qpmCollectionState && qpmCollectionState.writable !== false) {

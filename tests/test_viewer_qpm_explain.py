@@ -44,11 +44,12 @@ const NAMES = ["qpmParseParamText", "qpmIdentChar", "qpmScanSql", "qpmPlaceholde
   "qpmStatementKind", "qpmExplainOptions", "qpmStatementText", "qpmExplainTarget", "qpmPlanSignature",
   "qpmMatchRecordedPlan", "qpmReplayPlanNote", "qpmQuoteIdent", "qpmExplainSequence", "qpmExplainSummary", "qpmClampTimeout",
   "qpmCodeOnly", "qpmSideEffectCall", "qpmSideEffectReason", "qpmNotReplayableReason",
+  "qpmAsciiLower", "qpmLockingClause", "qpmDatabaseUnknownReason",
   "qpmApplyExplainResponse", "qpmViewScopeKey", "qpmRunQueryIds",
   "qpmFmtMs", "qpmFmtClock", "qpmRatioText", "qpmExplainStripModel", "qpmExplainBannerModel"];
 const A = new Function([
   cb("QPM_PARAM_TEXT_SLOT_BYTES"), cb("QPM_EXPLAIN_DEFAULT_TIMEOUT_S"), cb("QPM_EXPLAIN_MAX_TIMEOUT_S"),
-  cb("QPM_READ_VERBS"), cb("QPM_WRITE_VERBS"), cb("QPM_SIDE_EFFECT_CALL"),
+  cb("QPM_READ_VERBS"), cb("QPM_WRITE_VERBS"), cb("QPM_SIDE_EFFECT_CALL"), cb("QPM_LOCKING_CLAUSE"),
   ...NAMES.map(fn), "return {" + NAMES.join(",") + "};"].join("\n"))();
 
 const input = JSON.parse(fs.readFileSync(0, "utf8"));
@@ -68,6 +69,8 @@ out.kind = input.kind.map(([q, p]) => A.qpmStatementKind(q, p));
 out.sideEffect = input.sql.concat(input.sideEffect).map((q) => A.qpmSideEffectCall(q));
 out.notReplayable = input.kind.map(([q]) => A.qpmNotReplayableReason(q, A.qpmStatementKind(q, null).label));
 out.clamp2 = input.clamp.map((v) => A.qpmClampTimeout(v));
+out.dbReason = [A.qpmDatabaseUnknownReason({}, "5"), A.qpmDatabaseUnknownReason({ 1: "x" }, "5"),
+  A.qpmDatabaseUnknownReason(null, "5")];
 { // a bulk INSERT with 130k placeholders must not throw (Math.max(...refs) did)
   const n = 130000;
   const q = "insert into t values " + Array.from({ length: n / 2 }, (_, k) => "($" + (2 * k + 1) + ",$" + (2 * k + 2) + ")").join(",");
@@ -112,6 +115,11 @@ out.target = {
     if (r.queryid === "7") r.query = "select pg_terminate_backend($1)";
   }));
   out.target.sideEffect = A.qpmExplainTarget(d, S(["7"]), S(["16640"]));
+}
+{ // the snapshot could not list the databases: no claim that one was dropped
+  const d = JSON.parse(JSON.stringify(doc));
+  d.yb_pg_stat_plans.databases = {};
+  out.target.noDbList = A.qpmExplainTarget(d, S(["7"]), S(["16640"]));
 }
 { // every recorded execution unreplayable -> not ok, with the slowest one's reason
   const d = JSON.parse(JSON.stringify(doc));
@@ -216,7 +224,138 @@ out.clamp = [A.qpmClampTimeout("abc"), A.qpmClampTimeout(0), A.qpmClampTimeout(9
     out.banner[k] = A.qpmExplainBannerModel(...cases[k]);
   });
 }
-process.stdout.write(JSON.stringify(out));
+
+// Page globals the lifted code uses, stubbed; `with` resolves them against env.
+const withEnv = (env, src) => new Function("env", "with (env) { " + src + " }")(env);
+
+async function pollCases() {
+  const r = {};
+  const env = { qpmExplainPolling: false, queue: [], runs: {}, QPM_EXPLAIN_POLL_MS: 1,
+    qpmExplainWatch: { dbid: "1", queryIds: ["A"] } };
+  env.setTimeout = (f) => { env.queue.push(f); };
+  env.qpmNotifyExplain = () => {};
+  env.qpmLatestRun = (dbid, ids) => env.runs[ids[0]] || null;
+  const P = withEnv(env, fn("qpmEnsureExplainPoll") + "\nreturn { qpmEnsureExplainPoll };");
+  env.qpmEnsureExplainPoll = P.qpmEnsureExplainPoll;
+  env.runs.A = { state: "done" };
+  env.qpmFetchExplain = async () => {
+    // During the await a panel for another statement is drawn, with a run in flight;
+    // its own qpmEnsureExplainPoll finds this loop still going.
+    env.qpmExplainWatch = { dbid: "1", queryIds: ["B"] };
+    env.runs.B = { state: "running" };
+    env.qpmEnsureExplainPoll();
+  };
+  P.qpmEnsureExplainPoll();
+  await env.queue.shift()();
+  r.watchChanged = { polling: env.qpmExplainPolling, next: env.queue.length };
+  env.qpmFetchExplain = async () => { env.runs.B = { state: "done" }; };
+  await env.queue.shift()();
+  r.finished = { polling: env.qpmExplainPolling, next: env.queue.length };
+  return r;
+}
+
+const fakeNode = (tag) => {
+  const n = { tag, children: [], on: {}, attrs: {}, hidden: false, disabled: false, checked: false,
+    value: "", textContent: "", className: "", open: false };
+  n.appendChild = (c) => { n.children.push(c); return c; };
+  n.addEventListener = (ty, f) => { (n.on[ty] = n.on[ty] || []).push(f); };
+  n.setAttribute = (k, v) => { n.attrs[k] = v; if (k === "value") n.value = v; };
+  n.showModal = () => { n.open = true; };
+  n.close = () => { n.open = false; };
+  n.remove = () => {};
+  n.focus = () => {};
+  return n;
+};
+const findNode = (n, pred) => {
+  if (pred(n)) return n;
+  for (const c of n.children || []) {
+    const f = findNode(c, pred);
+    if (f) return f;
+  }
+  return null;
+};
+const D_SRC = [fn("el"), fn("qpmOpenExplainDialog"), "return { qpmOpenExplainDialog };"].join("\n");
+const TGT = { ok: true, queryid: "7", planid: "1", plan_ref: "aa", dbid: "16640", userid: "16384", node: "n1:5433",
+  kind: "read", label: "SELECT", recordedMaxMs: 5, datname: "app", role: "app_user", sqlDisplay: "select 1" };
+function openDialog(active, post) {
+  const e = { qpmExplainActive: active, qpmExplainAvail: { available: true }, polled: 0, remembered: [],
+    QPM_EXPLAIN_MAX_TIMEOUT_S: 600 };
+  e.document = { createElement: fakeNode, createTextNode: (x) => ({ text: x, children: [] }), body: fakeNode("body") };
+  e.qpmMetric = () => {};
+  e.qpmFmtMs = (ms) => ms + " ms";
+  e.qpmFmtClock = () => "15:20:00 UTC";
+  e.qpmExplainPrefs = () => ({ dist: false, debug: false, timeout_s: 30 });
+  e.qpmSaveExplainPrefs = () => {};
+  e.qpmExplainSequence = () => [];
+  e.qpmExplainOptions = () => ["ANALYZE"];
+  e.qpmClampTimeout = () => 30;
+  e.qpmRememberRun = (run) => { e.remembered.push(run); };
+  e.qpmNotifyExplain = () => {};
+  e.qpmEnsureExplainPoll = () => { e.polled += 1; };
+  e.qpmPostExplain = post || (async () => ({ run: { state: "running" } }));
+  // Only the dialog's own ask brings the collector's answer.
+  let answer;
+  let fresh = null;
+  const refreshed = new Promise((res) => { answer = res; });
+  e.asked = [];
+  e.qpmFetchExplain = (dbid, ids) => {
+    e.asked.push([dbid, ids]);
+    return refreshed.then(() => { e.qpmExplainActive = fresh; });
+  };
+  e.answer = async (now) => {
+    fresh = now;
+    answer();
+    await refreshed;
+    await null;
+    await null;
+  };
+  withEnv(e, D_SRC).qpmOpenExplainDialog(TGT, "f.json", () => {});
+  const dlg = e.document.body.children[0];
+  e.run = findNode(dlg, (n) => /qpm-dialog-run/.test(n.className || ""));
+  e.msg = findNode(dlg, (n) => n.tag === "p" && /^qpm-dialog-note/.test(n.className || ""));
+  e.click = () => e.run.on.click[0]();
+  return e;
+}
+const shown = (e) => ({ disabled: e.run.disabled, hidden: e.msg.hidden, text: e.msg.hidden ? null : e.msg.textContent,
+  polled: e.polled });
+async function dialogCases() {
+  const r = {};
+  const other = { state: "running", queryid: "9", dbid: "16640", started_utc: "x" };
+  { // the page last heard of a run that has since finished: asked again, Run is back
+    const e = openDialog(other);
+    r.staleBefore = shown(e);
+    await e.answer(null);
+    r.staleAfter = shown(e);
+    r.asked = e.asked;
+  }
+  { // asked again, this statement turns out to be running: say so, and poll it
+    const e = openDialog(null);
+    await e.answer({ state: "running", queryid: "7", dbid: "16640", started_utc: "x" });
+    r.ownRun = shown(e);
+  }
+  { // a 409 names the run in flight: it is shown and polled
+    const e = openDialog(null, async () => {
+      const err = new Error("Another EXPLAIN ANALYZE is still running (query_id 8); one runs at a time.");
+      err.active = { state: "running", queryid: "8", dbid: "16640", started_utc: "x" };
+      throw err;
+    });
+    await e.answer(null);
+    await e.click();
+    r.conflict = Object.assign(shown(e), { remembered: e.remembered.map((x) => x.queryid) });
+  }
+  { // an answer that comes after the click does not hide the click's error
+    const e = openDialog(null, async () => { throw new Error("boom"); });
+    await e.click();
+    await e.answer(null);
+    r.lateAnswer = shown(e);
+  }
+  return r;
+}
+(async () => {
+  out.poll = await pollCases();
+  out.dialog = await dialogCases();
+  process.stdout.write(JSON.stringify(out));
+})().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
 """
 
 PARAMS = [
@@ -282,9 +421,14 @@ SIDE_EFFECT = [
     "select \U00020000setval(1)",
     "select yb_pg_stat_plans_reset(null, null, null, null)",
     "select pg_stat_reset ()",
+    # only the lexer's whitespace before "(", and only ASCII letters folded
+    "select setval \t\n\r\f\v('s', 1)", "select setval\u00a0('s', 1)", "select setval\x1c('s', 1)",
+    "select setval\u2003('s', 1)", "SELECT PG_CATALOG.SETVAL('s', 1)",
+    "select dbl\u0131nk_exec(1)", "select \u017fetval(1)", "select pg_\u017ftat_reset()",
 ]
 
-CLAMP = ["", "  ", "abc", None, "2.5", " 7 ", "0x10", "1_000", "inf", "1e2", "-3", "45", 12.4, True, "600.4", "9999"]
+CLAMP = ["", "  ", "abc", None, "2.5", " 7 ", "0x10", "1_000", "inf", "1e2", "-3", "45", 12.4, True, "600.4", "9999",
+         "\t\v45\n", "\u00a045", "45\u2003"]
 
 KIND = [
     ["select 1", None],
@@ -301,6 +445,15 @@ KIND = [
     ["\x85select 1", None],
     ["\t\v\f(select 1)", None],
     ["<insufficient privilege>", None],
+    # a locking clause makes a write without the plan; not in strings, comments or names
+    ["select * from t where id = $1 for update", None],
+    ["SELECT * FROM t FOR  no key\nupdate OF t SKIP LOCKED", None],
+    ["select * from t for/* c */share", ""],
+    ["with x as (select * from t for key share) select * from x", None],
+    ["select 'for update' from t -- for share", None],
+    ['select "for update" from t', None],
+    ["select substring(s for 3), x.for_update, forupdate from t", None],
+    ["select * from t for \u212aey share", None],
 ]
 
 
@@ -363,6 +516,33 @@ class ViewerExplainTest(unittest.TestCase):
         for (sql, plan), js in zip(KIND, self.out["kind"]):
             kind, label = X.statement_kind(sql, plan)
             self.assertEqual((js["kind"], js["label"]), (kind, label), sql)
+
+    def test_unknown_database_reasons_match_the_server(self):
+        self.assertEqual(self.out["dbReason"], [
+            X.database_unknown_reason({}, "5"), X.database_unknown_reason({"1": "x"}, "5"),
+            X.database_unknown_reason({}, "5")])
+        no_list = self.out["target"]["noDbList"]
+        self.assertFalse(no_list["ok"])
+        self.assertEqual(no_list["reason"], X.database_unknown_reason({}, "16640"))
+        # the 50 ms execution's database is not in the list: skipped, with the server's reason
+        self.assertEqual(self.out["target"]["anyDb"]["skippedReason"],
+                         X.database_unknown_reason(self.doc["yb_pg_stat_plans"]["databases"], "16385"))
+
+    def test_the_poll_follows_the_watch_as_it_is_after_the_await(self):
+        self.assertEqual(self.out["poll"]["watchChanged"], {"polling": True, "next": 1})
+        self.assertEqual(self.out["poll"]["finished"], {"polling": False, "next": 0})
+
+    def test_the_dialog_asks_whether_a_run_is_in_flight(self):
+        d = self.out["dialog"]
+        self.assertEqual((d["staleBefore"]["disabled"], d["staleBefore"]["hidden"]), (True, False))
+        self.assertEqual(d["staleAfter"], {"disabled": False, "hidden": True, "text": None, "polled": 0})
+        self.assertEqual(d["asked"], [["16640", ["7"]]])
+        self.assertEqual((d["ownRun"]["disabled"], d["ownRun"]["polled"]), (True, 1))
+        self.assertTrue(d["ownRun"]["text"].startswith("This statement is already running"))
+        self.assertEqual((d["conflict"]["disabled"], d["conflict"]["polled"], d["conflict"]["remembered"]),
+                         (True, 1, ["8"]))
+        self.assertIn("still running", d["conflict"]["text"])
+        self.assertEqual((d["lateAnswer"]["hidden"], d["lateAnswer"]["text"]), (False, "boom"))
 
     def test_target_is_the_slowest_execution_that_can_be_replayed(self):
         t = self.out["target"]["q7"]
@@ -433,7 +613,7 @@ class ViewerExplainTest(unittest.TestCase):
         self.assertTrue(n["notRecordedRanUnknown"]["text"].startswith(
             "The planner chose a plan QPM has not recorded for this statement. The replay"))
 
-    def test_dialog_shows_exactly_what_runs(self):
+    def test_dialog_shows_the_steps_of_a_run(self):
         read = self.out["seq"]["read"]
         self.assertEqual(read[0], "SET statement_timeout = '30s';")
         self.assertEqual(read[1], "BEGIN READ ONLY;")
