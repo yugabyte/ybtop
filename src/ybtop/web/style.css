@@ -1110,7 +1110,8 @@ tr:nth-child(even) {
   display: grid;
   /* Wide enough that a planid or timestamp never wraps mid-value; capped so six
      metrics cluster instead of spreading across a very wide window. */
-  grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+  /* min(): on a phone one column must still fit the panel, never overflow it. */
+  grid-template-columns: repeat(auto-fill, minmax(min(13rem, 100%), 1fr));
   gap: 0 1.1rem;
   max-width: 72rem;
   margin: 0.4rem 0 0.5rem;
@@ -1123,6 +1124,14 @@ tr:nth-child(even) {
   font-size: 0.76rem;
   line-height: 1.6;
   min-width: 0;
+}
+
+/* Spanning two tracks where only one fits would add an implicit column and push
+   the grid past the panel, so only wide screens get it. */
+@media (min-width: 48rem) {
+  .qpm-metric--wide {
+    grid-column: span 2;
+  }
 }
 
 .qpm-metric--full {
@@ -1392,4 +1401,467 @@ th.th-per-call-metric[data-sort-key="qpm_plans"] {
 td.qpm-plans-cell {
   padding-left: 0.3rem;
   padding-right: 0.3rem;
+}
+
+/* QPM: EXPLAIN ANALYZE -- header control, view toggle, result, dialog */
+
+.qpm-explain-ctl {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+}
+
+.qpm-explain-ctl + .qpm-panel-off-btn {
+  margin-left: 0.5rem;
+}
+
+.qpm-seg {
+  display: inline-flex;
+  border: 1px solid var(--yb-border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.qpm-seg-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.2rem 0.7rem;
+  border: 0;
+  background: none;
+  color: var(--yb-muted);
+  font-family: inherit;
+  font-size: 0.74rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+
+.qpm-seg-btn + .qpm-seg-btn {
+  border-left: 1px solid var(--yb-border);
+}
+
+.qpm-seg-btn:hover:not(.qpm-seg-btn--on) {
+  color: var(--yb-text);
+}
+
+.qpm-seg-btn--on {
+  background: rgba(94, 184, 255, 0.18);
+  color: var(--yb-link);
+  box-shadow: inset 0 -2px 0 var(--yb-link);
+}
+
+.qpm-seg-dot {
+  width: 0.4rem;
+  height: 0.4rem;
+  border-radius: 50%;
+  background: var(--yb-link);
+  animation: qpm-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes qpm-pulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .qpm-seg-dot {
+    animation: none;
+  }
+}
+
+.qpm-explain-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.7rem;
+  margin: 0.15rem 0 0.1rem;
+}
+
+.qpm-explain-head .qpm-enable-btn {
+  margin-left: auto;
+}
+
+.qpm-explain-title {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--yb-text);
+}
+
+.qpm-explain-sub {
+  font-size: 0.74rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--yb-muted);
+}
+
+.qpm-explain-out {
+  max-height: 60vh;
+}
+
+/* "inline literals" on the drilldown's query row */
+
+.qpm-literals-btn {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  padding: 0.05rem 0.45rem;
+  border: 1px solid var(--yb-border);
+  border-radius: 999px;
+  background: none;
+  color: var(--yb-muted);
+  font-family: inherit;
+  font-size: 0.66rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  cursor: pointer;
+}
+
+.qpm-literals-btn:hover:not(:disabled) {
+  color: var(--yb-link);
+  border-color: rgba(94, 184, 255, 0.45);
+}
+
+.qpm-literals-btn--on {
+  color: var(--yb-link);
+  border-color: rgba(94, 184, 255, 0.55);
+  background: rgba(94, 184, 255, 0.1);
+}
+
+.qpm-literals-btn:disabled {
+  cursor: default;
+}
+
+.qpm-literals-btn:disabled:not(.qpm-literals-btn--on) {
+  opacity: 0.5;
+}
+
+.qpm-literals-note {
+  margin: 0.2rem 0 0;
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--yb-muted);
+}
+
+/* The confirmation dialog */
+
+.qpm-dialog {
+  width: min(46rem, calc(100vw - 2rem));
+  max-height: calc(100vh - 3rem);
+  padding: 0;
+  border: 1px solid var(--yb-border);
+  border-radius: 6px;
+  background: var(--yb-surface);
+  color: var(--yb-text);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+}
+
+.qpm-dialog::backdrop {
+  background: rgba(3, 8, 18, 0.62);
+}
+
+.qpm-dialog-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  padding: 1rem 1.1rem 0.9rem;
+}
+
+.qpm-dialog-title {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.qpm-dialog-warn {
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: #f5b544;
+}
+
+.qpm-dialog-warn--write {
+  color: var(--yb-danger);
+}
+
+.qpm-dialog-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.1rem 1.3rem;
+}
+
+.qpm-dialog-meta .qpm-metric-v {
+  flex: 0 1 auto;
+}
+
+.qpm-dialog-note {
+  margin: 0;
+  font-size: 0.76rem;
+  line-height: 1.45;
+  color: var(--yb-muted);
+}
+
+.qpm-dialog-note--err {
+  color: var(--yb-danger);
+}
+
+.qpm-dialog-sql,
+.qpm-dialog-seq {
+  margin: 0;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--yb-border);
+  border-radius: 3px;
+  background: rgba(11, 20, 38, 0.7);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.74rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: auto;
+}
+
+.qpm-dialog-sql {
+  max-height: 30vh;
+  color: var(--yb-link);
+}
+
+.qpm-dialog-seq {
+  color: var(--yb-muted);
+}
+
+.qpm-dialog-opts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 1rem;
+  font-size: 0.78rem;
+}
+
+.qpm-dialog-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  cursor: pointer;
+}
+
+.qpm-dialog-timeout {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-left: auto;
+  color: var(--yb-muted);
+}
+
+.qpm-dialog-timeout input {
+  width: 4.2rem;
+  padding: 0.15rem 0.3rem;
+  border: 1px solid var(--yb-border);
+  border-radius: 3px;
+  background: var(--yb-bg);
+  color: var(--yb-text);
+  font-family: inherit;
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.qpm-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.2rem;
+}
+
+/* EXPLAIN ANALYZE as the drilldown's primary action */
+
+/* The action stays on the title's line; a long title wraps instead of pushing it down. */
+.ash-mode-banner-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.35rem 1rem;
+}
+
+.ash-mode-banner-title-row .ash-mode-banner-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.qpm-explain-banner {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.4rem 0.6rem;
+  margin-left: auto;
+}
+
+@media (max-width: 40rem) {
+  .ash-mode-banner-title-row {
+    flex-wrap: wrap;
+  }
+
+  /* Its own row, and free to wrap: the chip and the button never run off the edge. */
+  .qpm-explain-banner {
+    flex: 1 1 100%;
+    justify-content: flex-start;
+    margin-left: 0;
+  }
+}
+
+.qpm-explain-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.38rem 0.85rem;
+  border: 1px solid var(--yb-link);
+  border-radius: 4px;
+  background: var(--yb-link);
+  color: var(--yb-bg);
+  font-family: inherit;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(94, 184, 255, 0.22);
+}
+
+.qpm-explain-primary:hover {
+  background: #7cc6ff;
+}
+
+.qpm-explain-primary:focus-visible {
+  outline: 2px solid var(--yb-text);
+  outline-offset: 2px;
+}
+
+.qpm-explain-glyph {
+  font-size: 0.72em;
+  line-height: 1;
+}
+
+/* Off on this collector, or nothing to replay: present, plainly not the action. */
+.qpm-explain-primary--muted {
+  border-color: var(--yb-border);
+  background: none;
+  color: var(--yb-muted);
+  box-shadow: none;
+}
+
+.qpm-explain-primary--muted:hover {
+  background: rgba(94, 184, 255, 0.08);
+  color: var(--yb-text);
+}
+
+.qpm-explain-primary--running {
+  background: rgba(94, 184, 255, 0.14);
+  color: var(--yb-link);
+  box-shadow: none;
+}
+
+.qpm-explain-primary--running:hover {
+  background: rgba(94, 184, 255, 0.22);
+}
+
+.qpm-explain-last {
+  padding: 0.2rem 0.55rem;
+  border: 1px solid var(--yb-border);
+  border-radius: 999px;
+  background: none;
+  color: var(--yb-muted);
+  font-family: inherit;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.qpm-explain-last:hover {
+  color: var(--yb-link);
+  border-color: rgba(94, 184, 255, 0.45);
+}
+
+
+/* EXPLAIN ANALYZE strip at the top of the plan panel */
+
+.qpm-explain-strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem 0.8rem;
+  margin: 0.15rem 0 0.55rem;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid rgba(94, 184, 255, 0.3);
+  border-radius: 4px;
+  background: rgba(94, 184, 255, 0.05);
+}
+
+.qpm-explain-strip--muted {
+  border-color: var(--yb-border);
+  background: none;
+}
+
+.qpm-explain-primary--sm {
+  padding: 0.26rem 0.7rem;
+  font-size: 0.76rem;
+  box-shadow: none;
+}
+
+.qpm-explain-strip-text {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.15rem 0.55rem;
+  flex: 1 1 18rem;
+  min-width: 0;
+  font-size: 0.78rem;
+}
+
+.qpm-explain-strip-k {
+  font-size: 0.64rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--yb-muted);
+}
+
+.qpm-explain-strip-v {
+  color: var(--yb-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.qpm-explain-strip-v--quiet {
+  color: var(--yb-muted);
+}
+
+.qpm-explain-strip-v--mono {
+  flex: 1 1 100%;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.74rem;
+  color: var(--yb-link);
+}
+
+.qpm-explain-strip-link {
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--yb-link);
+  font-family: inherit;
+  font-size: 0.76rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.qpm-explain-strip-link:hover {
+  text-decoration: underline;
 }
