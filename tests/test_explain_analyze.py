@@ -128,6 +128,27 @@ class StatementKindTest(unittest.TestCase):
             ("write", "WITH … UPDATE"),
         )
 
+    def test_a_locking_clause_is_a_write_without_the_plan(self):
+        # a plan_ref can carry hints and no plan text
+        for sql, label in [
+            ("select * from t where id = $1 for update", "SELECT … FOR UPDATE"),
+            ("SELECT * FROM t FOR  no key\nupdate OF t SKIP LOCKED", "SELECT … FOR NO KEY UPDATE"),
+            ("select * from t for/* c */share", "SELECT … FOR SHARE"),
+            ("select * from t for key share nowait", "SELECT … FOR KEY SHARE"),
+        ]:
+            self.assertEqual(X.statement_kind(sql, None), ("write", label), sql)
+        self.assertEqual(
+            X.statement_kind("with x as (select * from t for update) select * from x", ""),
+            ("write", "WITH (locks rows)"),
+        )
+        for sql in (
+            "select 'for update' from t", "select 1 -- for update", "select 1 /* for share */",
+            'select "for update" from t', "select substring(s for 3) from t",
+            "select x.for_update, forupdate from t", "select $$for update$$",
+            "select * from t for \u212aey share",  # a Kelvin sign is not K to PostgreSQL
+        ):
+            self.assertEqual(X.statement_kind(sql, None), ("read", "SELECT"), sql)
+
     def test_not_replayable(self):
         for sql in ("call p()", "do $$ begin end $$", "copy t to stdout", "set x = 1", ""):
             self.assertIsNone(X.statement_kind(sql, None)[0], sql)
@@ -148,6 +169,7 @@ class StatementKindTest(unittest.TestCase):
         # An emptied box is "use the default", never a 1 s replay.
         self.assertEqual([X.clamp_timeout(v) for v in ("", "  ", "0x10", "1_000", "inf", True)], [30] * 6)
         self.assertEqual([X.clamp_timeout(v) for v in ("2.5", " 7 ", 12.4, "1e2")], [3, 7, 12, 100])
+        self.assertEqual([X.clamp_timeout(v) for v in ("\t\v45\n", "\u00a045", "45\u2003")], [45, 30, 30])
 
 
 def _doc():
@@ -205,7 +227,7 @@ class ResolveTargetTest(unittest.TestCase):
         cases = {
             ("7", "1", "aa", "16640", "n9:5433"): "not recorded",
             ("7", "9", "aa", "16640", "n1:5433"): "not recorded",
-            ("7", "1", "aa", "16385", "n1:5433"): "no longer exists",  # dropped database
+            ("7", "1", "aa", "16385", "n1:5433"): "not in the snapshot's list of databases",  # dropped
             ("7", "1", "aa", "16640", "n2:5433"): "show_max_exec_params",  # redacted on that node
         }
         for (q, p, r, d, n), expect in cases.items():
@@ -217,6 +239,12 @@ class ResolveTargetTest(unittest.TestCase):
         t, why = X.resolve_target(no_role, queryid="7", planid="1", plan_ref="aa", dbid="16640", node="n1:5433", userid="")
         self.assertIsNone(t)  # never quietly replay as ybtop's own (superuser) login
         self.assertIn("which role", why)
+        unlisted = _doc()
+        unlisted["yb_pg_stat_plans"]["databases"] = {}  # the list could not be read
+        why = X.resolve_target(unlisted, queryid="7", planid="1", plan_ref="aa", dbid="16640",
+                               node="n1:5433", userid="16384")[1]
+        self.assertIn("no list of databases", why)
+        self.assertNotIn("dropped", why)
         del doc["pg_stat_statements"]
         self.assertIn("text for this query_id", X.resolve_target(
             doc, queryid="7", planid="1", plan_ref="aa", dbid="16640", node="n1:5433", userid="16384")[1])
@@ -240,6 +268,7 @@ class ResolveTargetTest(unittest.TestCase):
             ('select "setval"($1, 1)', "setval"),
             ("select dblink_exec($1, $2)", "dblink_exec"),
             ("select pg_stat_reset()", "pg_stat_reset"),
+            ("select setval \t\n\r\f\v('s', 1)", "setval"),
             ("select yb_pg_stat_plans_reset(null, null, null, null)", "yb_pg_stat_plans_reset"),
         ]:
             self.assertEqual(X.side_effect_call(sql), fn, sql)
@@ -247,6 +276,10 @@ class ResolveTargetTest(unittest.TestCase):
             "select * from t where note = $1 -- pg_terminate_backend(",
             "select my_setval($1)", "select nextval($1)", "select pg_terminate_backendx($1)",
             "select \u00e9setval(1)",
+            # PostgreSQL's lexer: these are part of the name, not whitespace
+            "select setval\u00a0('s', 1)", "select setval\x1c('s', 1)", "select setval\u2003('s', 1)",
+            # and it folds only ASCII letters: other names, not these functions
+            "select dbl\u0131nk_exec(1)", "select \u017fetval(1)", "select pg_\u017ftat_reset()",
         ):
             self.assertIsNone(X.side_effect_call(sql), sql)
         doc = _doc()
@@ -332,6 +365,10 @@ def _target(kind="read", **kw):
     return t
 
 
+def sqls_so_far(pg):
+    return [c[0] for c in pg.calls]
+
+
 class RunExplainTest(unittest.TestCase):
     def run_with(self, pg, target, options=("ANALYZE",), timeout=30, **kw):
         conn = _FakeConn(pg)
@@ -392,6 +429,16 @@ class RunExplainTest(unittest.TestCase):
         res, sqls, _ = self.run_with(pg, _target(), stop=stop)
         self.assertTrue(res["cancelled"])
         self.assertFalse(any("EXPLAIN (ANALYZE" in q for q in sqls))
+        self.assertEqual(sqls[-1], "ROLLBACK")
+
+    def test_a_run_given_up_on_never_starts_the_analyze(self):
+        asked = []
+        pg = _FakePg()
+        res, sqls, _ = self.run_with(pg, _target(), may_analyze=lambda: asked.append(sqls_so_far(pg)) or False)
+        self.assertEqual(len(asked), 1)
+        self.assertIn("EXPLAIN (FORMAT JSON)", asked[0][-1])  # asked last, after the plan-only EXPLAIN
+        self.assertFalse(any("EXPLAIN (ANALYZE" in q for q in sqls))
+        self.assertTrue(res["cancelled"])
         self.assertEqual(sqls[-1], "ROLLBACK")
 
     def test_values_are_bound_never_spliced(self):
@@ -494,7 +541,11 @@ class RunExplainTest(unittest.TestCase):
     def test_read_only_refusal_is_explained(self):
         pg = _FakePg(fail_on="EXPLAIN (ANALYZE", sqlstate="25006")
         res, _, _ = self.run_with(pg, _target())
-        self.assertIn("only replayed read-only", res["error"])
+        self.assertIn("ran READ ONLY, since neither its text nor its recorded plan", res["error"])
+        pg = _FakePg(fail_on="EXPLAIN (ANALYZE", sqlstate="25006")
+        res, _, _ = self.run_with(pg, _target(kind="write", statement="update t set v = $1"))
+        self.assertIn("default_transaction_read_only", res["error"])
+        self.assertNotIn("READ ONLY, since", res["error"])
 
 
 class ExplainRunsTest(unittest.TestCase):
@@ -502,7 +553,7 @@ class ExplainRunsTest(unittest.TestCase):
         runs = X.ExplainRuns()
         gate = threading.Event()
 
-        def slow(run, ready):
+        def slow(run, ready, may):
             gate.wait(5)
             return {"plan_text": "x", "error": None}
 
@@ -521,7 +572,7 @@ class ExplainRunsTest(unittest.TestCase):
         done = runs.latest("16640", ["7", "8"])
         self.assertEqual((done["queryid"], done["state"]), ("7", "done"))
         self.assertNotIn("_t0", done)
-        c, busy = runs.start(_target(queryid="8"), ["ANALYZE"], 30, lambda r, ready: {"error": "nope"})
+        c, busy = runs.start(_target(queryid="8"), ["ANALYZE"], 30, lambda r, ready, may: {"error": "nope"})
         for _ in range(200):
             if runs.active() is None:
                 break
@@ -533,7 +584,7 @@ class ExplainRunsTest(unittest.TestCase):
         runs = X.ExplainRuns()
         hang, late = threading.Event(), threading.Event()
 
-        def work(run, ready):
+        def work(run, ready, may):
             hang.wait(5)
             late.set()
             return {"plan_text": "late", "error": None}
@@ -548,7 +599,7 @@ class ExplainRunsTest(unittest.TestCase):
             reaped = runs.latest("16640", ["7"])
             self.assertEqual(reaped["state"], "error")
             self.assertIn("ybtop-explain", reaped["error"])
-            nxt, busy = runs.start(_target(queryid="8"), ["ANALYZE"], 30, lambda r, ready: (time.sleep(0.3), {"error": None})[1])
+            nxt, busy = runs.start(_target(queryid="8"), ["ANALYZE"], 30, lambda r, ready, may: (time.sleep(0.3), {"error": None})[1])
             self.assertIsNone(busy)
             hang.set()
             late.wait(5)
@@ -560,12 +611,90 @@ class ExplainRunsTest(unittest.TestCase):
             X.ABANDON_GRACE_S, X._CONNECT_OPTS["connect_timeout"] = saved
             hang.set()
 
+    def test_a_reaped_run_is_stopped_and_its_statement_cancelled(self):
+        runs = X.ExplainRuns()
+        hang, cancelled, seen = threading.Event(), threading.Event(), {}
+
+        def work(run, ready, may):
+            ready(cancelled.set)
+            hang.wait(5)
+            seen["stop"], seen["may"] = run["_stop"].is_set(), may()
+            return {"error": None}
+
+        saved = X.ABANDON_GRACE_S, X._CONNECT_OPTS["connect_timeout"]
+        X.ABANDON_GRACE_S, X._CONNECT_OPTS["connect_timeout"] = 0, 0
+        try:
+            runs.start(_target(), ["ANALYZE"], 1, work)
+            time.sleep(1.2)
+            self.assertIsNone(runs.active())
+            self.assertTrue(cancelled.wait(2))  # sent from its own thread
+        finally:
+            X.ABANDON_GRACE_S, X._CONNECT_OPTS["connect_timeout"] = saved
+            hang.set()
+        for _ in range(200):
+            if seen:
+                break
+            time.sleep(0.01)
+        self.assertEqual(seen, {"stop": True, "may": False})
+
+    def test_a_late_worker_does_not_take_the_next_runs_cancel(self):
+        runs = X.ExplainRuns()
+        hang, done, got = threading.Event(), threading.Event(), []
+
+        def zombie(run, ready, may):
+            hang.wait(5)  # connects only after it was given up on
+            ready(lambda: got.append("zombie"))
+            done.set()
+            return {"error": None}
+
+        def current(run, ready, may):
+            ready(lambda: got.append("current"))
+            run["_stop"].wait(5)
+            return {"cancelled": True, "error": "Cancelled."}
+
+        saved = X.ABANDON_GRACE_S, X._CONNECT_OPTS["connect_timeout"]
+        X.ABANDON_GRACE_S, X._CONNECT_OPTS["connect_timeout"] = 0, 0
+        try:
+            runs.start(_target(), ["ANALYZE"], 1, zombie)
+            time.sleep(1.2)
+            self.assertIsNone(runs.active())
+        finally:
+            X.ABANDON_GRACE_S, X._CONNECT_OPTS["connect_timeout"] = saved
+        _, busy = runs.start(_target(), ["ANALYZE"], 30, current)  # the same statement again
+        self.assertIsNone(busy)
+        for _ in range(200):
+            if runs._cancels:
+                break
+            time.sleep(0.01)
+        hang.set()
+        done.wait(5)
+        runs.cancel("16640", "7")
+        self.assertEqual(got, ["current"])
+
+    def test_the_deadline_counts_from_the_analyze(self):
+        runs = X.ExplainRuns()
+        started, release = threading.Event(), threading.Event()
+
+        def work(run, ready, may):
+            run["_t0"] -= 1000  # a slow start: connecting and the preamble took long
+            may()
+            started.set()
+            release.wait(5)
+            return {"error": None}
+
+        try:
+            runs.start(_target(), ["ANALYZE"], 30, work)
+            started.wait(5)
+            self.assertEqual(runs.active()["state"], "running")  # its ANALYZE is inside its timeout
+        finally:
+            release.set()
+
     def test_cancel_before_the_connection_is_seen_by_the_run(self):
         runs = X.ExplainRuns()
         seen = {}
         entered = threading.Event()
 
-        def work(run, ready):
+        def work(run, ready, may):
             entered.set()
             for _ in range(200):  # "connecting": no cancel hook registered yet
                 if run["_stop"].is_set():
@@ -588,7 +717,7 @@ class ExplainRunsTest(unittest.TestCase):
         runs = X.ExplainRuns()
         stop = threading.Event()
 
-        def work(run, ready):
+        def work(run, ready, may):
             ready(stop.set)
             stop.wait(5)
             return {"cancelled": True, "error": "Cancelled."}
@@ -626,8 +755,9 @@ class ExplainEndpointTest(unittest.TestCase):
         self.seen = []
         self.release = threading.Event()
 
-        def fake_run(dsn, target, options, timeout_s, on_cancel_ready=None, connect=None, stop=None):
+        def fake_run(dsn, target, options, timeout_s, on_cancel_ready=None, connect=None, stop=None, may_analyze=None):
             self.seen.append((dsn, target, options, timeout_s))
+            self.hooks = (on_cancel_ready, stop, may_analyze)
             self.release.wait(5)
             return {"plan_text": "ok", "execution_ms": 1.0, "error": None}
 
@@ -682,6 +812,9 @@ class ExplainEndpointTest(unittest.TestCase):
         self.assertIn("host=n1", dsn)
         self.assertIn("dbname=app", dsn)
         self.assertEqual((options, timeout_s), (["ANALYZE", "DIST"], 45))
+        on_cancel_ready, stop, may_analyze = self.hooks  # the registry's, so Cancel and reaping reach it
+        self.assertTrue(callable(on_cancel_ready) and isinstance(stop, threading.Event))
+        self.assertTrue(may_analyze())
         # one at a time
         status, body = self.post(self.row(queryid="8", planid="2", plan_ref="bb"))
         self.assertEqual(status, 409)

@@ -10,11 +10,14 @@ an application once sent, so splicing them into a statement ybtop runs as a
 superuser would hand SQL injection to anyone who can write to that application.
 The inlined-literals text exists for display only.
 
-A run is always one transaction that is rolled back:
+A run is always one transaction that is rolled back. In outline -- the catalog
+reads (the role's name and its settings) and set_config calls are left out:
 
-    BEGIN [READ ONLY]                      -- READ ONLY unless the plan writes or locks
-    SET LOCAL ROLE <role that ran it>      -- plus that role's own ALTER ROLE settings
+    SET statement_timeout = <n>s           -- first, so the reads have a deadline too
+    BEGIN [READ ONLY]                      -- READ ONLY unless it writes or locks rows
+    SET LOCAL ROLE <role that ran it>      -- after that role's own ALTER ROLE settings
     SET LOCAL statement_timeout = <n>s     -- the client also cancels at <n>s
+    yb_disable_transactional_writes off    -- checked, so the ROLLBACK undoes every write
     EXPLAIN (FORMAT JSON) <statement>      -- the plan only, to match against QPM's
     EXPLAIN (ANALYZE[, DIST][, DEBUG]) <statement>
     ROLLBACK
@@ -76,11 +79,18 @@ _DOLLAR_QUOTE = re.compile(r"\$([A-Za-z_][A-Za-z_0-9]*)?\$")
 _WORD = re.compile(r"[A-Za-z]+")
 # What PostgreSQL's lexer treats as whitespace; Unicode spaces are not.
 _SQL_SPACE = " \t\n\r\f\v"
+# The lexer folds only ASCII letters, so names are matched on this: re.IGNORECASE
+# would also take "\u0131" (dotless i) for "i", which PostgreSQL does not.
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 
 # Calls whose effect a ROLLBACK does not undo: they act on other sessions, the
-# server, files, other databases, sequences or statistics. Checked on the code
-# only (strings and comments blanked). A user-defined function can still hide
-# such an effect; the dialog says that functions it calls do run.
+# server, files, other databases, a sequence's current value (setval) or
+# statistics. Checked on the code only (strings and comments blanked), in ASCII
+# lower case, with only the whitespace PostgreSQL's lexer knows before the "(":
+# anything else, a no-break space say, is part of the name. nextval() is let
+# through: like a serial or identity default in a replayed INSERT, it leaves a
+# gap in the sequence, as any rolled-back transaction does. A user-defined
+# function can still hide such an effect.
 _SIDE_EFFECT_CALL = re.compile(
     r'(?<![A-Za-z0-9_$\x80-\U0010ffff])"?('
     r"pg_terminate_backend|pg_cancel_backend|pg_reload_conf|pg_rotate_logfile|pg_promote"
@@ -91,8 +101,7 @@ _SIDE_EFFECT_CALL = re.compile(
     r"|dblink[a-z_]*|setval"
     r"|yb_pg_stat_plans_(?:reset|insert)[a-z_]*|yb_reset_analyze_statistics"
     r"|yb_cancel_transaction|yb_query_diagnostics|yb_increment_[a-z_]+"
-    r')"?\s*\(',
-    re.IGNORECASE,
+    r')"?[ \t\n\r\f\v]*\('
 )
 
 
@@ -340,23 +349,43 @@ def _first_verb(sql: str) -> str:
 _WRITE_PLAN_NODE = re.compile(r'"Node Type":\s*"(?:ModifyTable|LockRows)"')
 _WRITE_PLAN_TEXT = re.compile(r"^\s*(?:->\s+)?(?:(?:Insert|Update|Delete|Merge) on |LockRows)", re.M)
 _PLAN_OPERATION = re.compile(r'"Operation":\s*"(Insert|Update|Delete|Merge)"')
+# FOR UPDATE / NO KEY UPDATE / SHARE / KEY SHARE. The recorded plan shows
+# LockRows too, but a plan_ref can carry hints and no plan text.
+_LOCKING_CLAUSE = re.compile(
+    r"(?<![a-z0-9_$\x80-\U0010ffff])for[ \t\n\r\f\v]+"
+    r"(no[ \t\n\r\f\v]+key[ \t\n\r\f\v]+update|update|key[ \t\n\r\f\v]+share|share)"
+    r"(?![a-z0-9_$\x80-\U0010ffff])"
+)
+_QUOTED_NAME = re.compile(r'"(?:[^"]|"")*"?')
+
+
+def locking_clause(sql: str) -> Optional[str]:
+    """"UPDATE", "NO KEY UPDATE", "SHARE" or "KEY SHARE" if the statement locks rows
+    by its text; strings, comments and quoted names are not looked at."""
+    code = _QUOTED_NAME.sub(lambda m: " " * len(m.group(0)), _code_only(sql))
+    m = _LOCKING_CLAUSE.search(code.translate(_ASCII_LOWER))
+    return " ".join(m.group(1).upper().split()) if m else None
 
 
 def statement_kind(sql: str, plan_text: Optional[str]) -> "tuple[Optional[str], str]":
     """("read" | "write" | None, label) -- None means this is not something to replay.
 
-    "write" when the statement or its recorded plan modifies or locks rows: it then
-    runs in a read-write transaction that is rolled back. Everything else runs READ
-    ONLY, so a SELECT that writes after all (a data-modifying CTE, a volatile
-    function) fails instead of writing.
+    "write" when the statement modifies or locks rows by its text (INSERT, UPDATE,
+    DELETE, MERGE, a locking clause) or by its recorded plan (ModifyTable,
+    LockRows): it then runs in a read-write transaction that is rolled back.
+    Everything else runs READ ONLY, so a statement that writes after all (a
+    function that writes, a data-modifying WITH its recorded plan does not show)
+    fails instead of writing.
     """
     verb = _first_verb(sql)
     if verb not in _READ_VERBS and verb not in _WRITE_VERBS:
         return None, verb or "?"
     plan = plan_text or ""
     op = _PLAN_OPERATION.search(plan)
+    lock = locking_clause(sql)
     writes = (
         verb in _WRITE_VERBS
+        or lock is not None
         or bool(_WRITE_PLAN_NODE.search(plan))
         or bool(_WRITE_PLAN_TEXT.search(plan))
     )
@@ -365,7 +394,7 @@ def statement_kind(sql: str, plan_text: Optional[str]) -> "tuple[Optional[str], 
     elif op:
         label = verb + " … " + op.group(1).upper()
     elif writes:
-        label = "SELECT … FOR UPDATE" if verb == "SELECT" else verb + " (locks rows)"
+        label = "SELECT … FOR " + (lock or "UPDATE") if verb == "SELECT" else verb + " (locks rows)"
     else:
         label = verb
     return ("write" if writes else "read"), label
@@ -389,11 +418,8 @@ _NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?
 
 
 def clamp_timeout(value: Any) -> int:
-    """Seconds, 1..MAX_TIMEOUT_S; blank or not a plain number -> the default.
-
-    Same rule as the viewer's qpmClampTimeout: an emptied box must not become 1 s.
-    """
-    text = str(value).strip() if value is not None and not isinstance(value, bool) else ""
+    """Seconds, 1..MAX_TIMEOUT_S; blank or not a plain number -> the default, never 1 s."""
+    text = str(value).strip(" \t\n\r\f\v") if value is not None and not isinstance(value, bool) else ""
     if not _NUMBER.fullmatch(text):
         return DEFAULT_TIMEOUT_S
     secs = float(text)
@@ -454,11 +480,7 @@ def find_qpm_row(
 def resolve_target(
     doc: dict, *, queryid: str, planid: str, plan_ref: str, dbid: str, node: str, userid: str
 ) -> "tuple[Optional[dict], Optional[str]]":
-    """Everything a run needs, from the snapshot alone, or (None, why not).
-
-    The refusals are checked in the same order as the viewer's qpmExplainTarget,
-    so both report the same reason for the same row.
-    """
+    """Everything a run needs, from the snapshot alone, or (None, why not)."""
     row = find_qpm_row(
         doc, queryid=queryid, planid=planid, plan_ref=plan_ref, dbid=dbid, node=node, userid=userid
     )
@@ -471,7 +493,7 @@ def resolve_target(
     databases = qpm.get("databases") or {}
     datname = databases.get(str(dbid))
     if not datname:
-        return None, "this plan was recorded in a database that no longer exists (oid %s)" % dbid
+        return None, database_unknown_reason(databases, dbid)
     sql = statement_text(doc, queryid, datname, node)
     if not sql:
         return None, "pg_stat_statements text for this query_id is not in the snapshot"
@@ -507,6 +529,23 @@ def resolve_target(
     }, None
 
 
+def database_unknown_reason(databases: dict, dbid: str) -> str:
+    """Why the snapshot has no name for a plan's database.
+
+    The list is read once per snapshot, before the plans are; a cluster always
+    has databases, so an empty list is one that could not be read.
+    """
+    if not databases:
+        return (
+            "this snapshot has no list of databases (reading it failed), so this plan's "
+            "database (oid %s) is unknown; try a later snapshot" % dbid
+        )
+    return (
+        "this plan's database (oid %s) is not in the snapshot's list of databases: it was "
+        "dropped before the snapshot, or created while it was taken" % dbid
+    )
+
+
 def _code_only(sql: str) -> str:
     """The statement with strings, comments and dollar-quoted bodies blanked out."""
     chars = list(sql)
@@ -521,12 +560,12 @@ def _code_only(sql: str) -> str:
 
 def side_effect_call(sql: str) -> Optional[str]:
     """The first call in the statement whose effect a rollback would not undo."""
-    m = _SIDE_EFFECT_CALL.search(_code_only(sql))
-    return m.group(1).lower() if m else None
+    m = _SIDE_EFFECT_CALL.search(_code_only(sql).translate(_ASCII_LOWER))
+    return m.group(1) if m else None
 
 
 def not_replayable_reason(sql: str, label: str) -> str:
-    """Why statement_kind refused a statement. Mirrors the viewer's qpmNotReplayableReason."""
+    """Why statement_kind refused a statement."""
     if str(sql).lstrip(_SQL_SPACE).startswith("<"):
         return "pg_stat_statements does not show this statement's text to ybtop's login."
     return (
@@ -613,13 +652,15 @@ def run_explain(
     on_cancel_ready: "Optional[Callable[[Callable[[], None]], None]]" = None,
     connect: "Optional[Callable[..., Any]]" = None,
     stop: "Optional[threading.Event]" = None,
+    may_analyze: "Optional[Callable[[], bool]]" = None,
 ) -> dict:
     """Run one EXPLAIN ANALYZE as described in the module docstring. Never raises.
 
     `stop` is set when the user cancels. It is checked between steps, so a cancel
     that lands while the connection is still being made stops the run before
     anything executes; `on_cancel_ready` hands over the cancel for a statement
-    that is already running.
+    that is already running. `may_analyze` is asked last, right before the
+    ANALYZE; False stops the run there (see ExplainRuns._work).
     """
     import psycopg
 
@@ -706,6 +747,9 @@ def run_explain(
         result["plan_json"] = shape[0] if shape else None
 
         stop_requested()
+        if may_analyze is not None and not may_analyze():
+            cancelled_by.setdefault("by", "user")
+            raise _Failed("Cancelled.", "57014")
         # Same deadline on both sides: statement_timeout on the server, and a
         # cancel from here in case the server does not honour it in time.
         timer = threading.Timer(float(timeout_s), lambda: cancel("timeout"))
@@ -736,11 +780,19 @@ def run_explain(
             except Exception:  # noqa: BLE001
                 pass
     if result["sqlstate"] == "25006":
-        # YugabyteDB words this "cannot execute SELECT in a read-only transaction".
-        result["error"] = (
-            "Refused: this SELECT writes (a data-modifying WITH, or a function that "
-            "writes), and SELECTs are only replayed read-only. " + str(result["error"])
-        )
+        # "cannot execute UPDATE in a read-only transaction", and the like.
+        if target.get("kind") == "read":
+            why = (
+                "Refused: this statement ran READ ONLY, since neither its text nor its "
+                "recorded plan writes or locks rows, but it tried to (a function that "
+                "writes, say). "
+            )
+        else:
+            why = (
+                "Refused: the write ran in a read-only transaction -- is "
+                "default_transaction_read_only on for ybtop's login or this database? "
+            )
+        result["error"] = why + str(result["error"])
     if result["sqlstate"] == "57014":
         by = cancelled_by.get("by")
         if by == "user":
@@ -822,8 +874,10 @@ class ExplainRuns:
         """Give up on an active run that has gone silent well past its deadline.
 
         Called under the lock. Without this one hung node would hold the only slot
-        until the collector restarts. The worker may still return later; its
-        result is then dropped (see _work).
+        until the collector restarts. The run is stopped, and its statement
+        cancelled if it has a connection; a worker that gets an answer later stops
+        at its next step and never starts the ANALYZE (see may_analyze in _work).
+        Its result is dropped.
         """
         if self._active is None:
             return
@@ -831,8 +885,10 @@ class ExplainRuns:
         if run is None:
             self._active = None
             return
+        # From the ANALYZE once it has started: that is what its timeout bounds.
+        since = run.get("_analyze_t0", run["_t0"])
         limit = run["timeout_s"] + ABANDON_GRACE_S + _CONNECT_OPTS["connect_timeout"]
-        if time.monotonic() - run["_t0"] < limit:
+        if time.monotonic() - since < limit:
             return
         run.update(
             {
@@ -847,8 +903,13 @@ class ExplainRuns:
                 ),
             }
         )
-        self._cancels.pop(self._active, None)
+        run["_stop"].set()
+        fn = self._cancels.pop(self._active, None)
         self._active = None
+        if fn:
+            # Its node is not answering, so the cancel may block: send it from a
+            # thread of its own, not under the lock or in the request.
+            threading.Thread(target=fn, name="ybtop-explain-cancel", daemon=True).start()
 
     @staticmethod
     def key(dbid: str, queryid: str) -> str:
@@ -880,7 +941,7 @@ class ExplainRuns:
                     best = run
             return self._public(best) if best else None
 
-    def start(self, target: dict, options: "list[str]", timeout_s: int, work: Callable[[dict, Callable], dict]) -> "tuple[Optional[dict], Optional[dict]]":
+    def start(self, target: dict, options: "list[str]", timeout_s: int, work: Callable[[dict, Callable, Callable], dict]) -> "tuple[Optional[dict], Optional[dict]]":
         """(run, None) once started, or (None, the run already in flight)."""
         k = self.key(target["dbid"], target["queryid"])
         with self._lock:
@@ -937,13 +998,25 @@ class ExplainRuns:
             fn()
         return out
 
-    def _work(self, k: str, run: dict, work: Callable[[dict, Callable], dict]) -> None:
+    def _work(self, k: str, run: dict, work: Callable[[dict, Callable, Callable], dict]) -> None:
         def cancel_ready(fn: Callable[[], None]) -> None:
             with self._lock:
-                self._cancels[k] = fn
+                # Once reaped, the slot's cancel may belong to a newer run of the
+                # same statement; this worker is stopped by run["_stop"] instead.
+                if run["state"] == "running":
+                    self._cancels[k] = fn
+
+        def may_analyze() -> bool:
+            # Under the lock _reap and cancel take when they set _stop, so a run
+            # given up on or cancelled never starts its ANALYZE: one at a time holds.
+            with self._lock:
+                if run["_stop"].is_set():
+                    return False
+                run["_analyze_t0"] = time.monotonic()
+                return True
 
         try:
-            result = work(run, cancel_ready)
+            result = work(run, cancel_ready, may_analyze)
         except Exception as exc:  # noqa: BLE001
             result = {"error": str(exc) or exc.__class__.__name__}
         with self._lock:

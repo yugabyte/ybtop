@@ -365,9 +365,10 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
         options = X.explain_options(body.get("dist") is True, body.get("debug") is True)
         timeout_s = X.clamp_timeout(body.get("timeout_s"))
 
-        def work(run: dict, cancel_ready: object) -> dict:
+        def work(run: dict, cancel_ready: object, may_analyze: object) -> dict:
             return X.run_explain(
-                dsn, target, options, timeout_s, on_cancel_ready=cancel_ready, stop=run["_stop"]
+                dsn, target, options, timeout_s,
+                on_cancel_ready=cancel_ready, stop=run["_stop"], may_analyze=may_analyze,
             )
 
         run, busy = type(self).explain_runs.start(target, options, timeout_s, work)
@@ -767,8 +768,8 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/explain":
             qs = parse_qs(parsed.query or "")
             dbid = (qs.get("dbid") or [""])[0]
-            # A canonical family can span hundreds of query_ids; the page puts the
-            # one it would replay first.
+            # A canonical family can span hundreds of query_ids; only the first 200
+            # are read, so a client lists the one it would replay first.
             queryids = [q for q in ((qs.get("queryids") or [""])[0]).split(",") if q][:200]
             if (dbid and not _INT64_TEXT.match(dbid)) or not all(_INT64_TEXT.match(q) for q in queryids):
                 self._send_json({"error": "dbid and queryids must be integers"}, 400)

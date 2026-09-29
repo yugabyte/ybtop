@@ -323,8 +323,8 @@ def database_names(conn: psycopg.Connection) -> dict[str, str]:
 def role_names(conn: psycopg.Connection) -> dict[str, str]:
     """oid (as text) -> rolname for every role.
 
-    QPM rows carry only userid. The viewer names the role an EXPLAIN ANALYZE will
-    run as before anything connects, so the snapshot carries the names.
+    QPM rows carry only userid; with the names in the snapshot, an EXPLAIN
+    ANALYZE can name the role it will run as before anything connects.
     """
     rows = fetch_all(
         conn,
