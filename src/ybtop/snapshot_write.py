@@ -347,7 +347,11 @@ def _collect_one_node(
             if want_plans:
                 with stage_timer("yb_pg_stat_plans_rows", _log, node_id=nid) as st:
                     query_plans = _serialize_rows(
-                        Q.yb_pg_stat_plans_rows(conn, query_plans_per_node)
+                        Q.yb_pg_stat_plans_rows(
+                            conn,
+                            query_plans_per_node,
+                            [r["queryid"] for r in pg_stat if r.get("queryid") is not None],
+                        )
                     )
                     st.row_count = len(query_plans)
     return _NodeCollectResult(

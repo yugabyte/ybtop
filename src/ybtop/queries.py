@@ -447,7 +447,9 @@ def strip_hint_wrapper(hints: str) -> str:
     return body.strip()
 
 
-def yb_pg_stat_plans_rows(conn: psycopg.Connection, limit: int) -> list[dict[str, Any]]:
+def yb_pg_stat_plans_rows(
+    conn: psycopg.Connection, limit: int, top_queryids: "list[str] | None" = None
+) -> list[dict[str, Any]]:
     """QPM plan history for this node. Requires caps.qpm_stat_plans (YB 2025.2.3+).
 
     yb_pg_stat_plans is per-node storage, so this must run on every node: the same
@@ -456,8 +458,11 @@ def yb_pg_stat_plans_rows(conn: psycopg.Connection, limit: int) -> list[dict[str
     queryid/planid are int64 and are cast to text; JS numbers cannot hold them exactly.
     The __YB_STAT_PLANS_SKIP marker keeps ybtop's own collection out of QPM -- without
     it the collector's queries become QPM entries and pollute the data they report on.
-    Ordered by last_used DESC so that if `limit` truncates, the recently-used plans
-    (the ones that explain current behaviour) are the ones kept.
+    If `limit` truncates, what it keeps first is the plans of this node's
+    pg_stat_statements top N (`top_queryids`) -- the statements the snapshot is
+    scoped to afterwards -- and then the most recently used. Ordering by recency
+    alone let other statements' recent plans fill the budget and drop a heavy
+    statement's older plans before scoping ever saw them.
     """
     sql = """
     SELECT
@@ -475,10 +480,10 @@ def yb_pg_stat_plans_rows(conn: psycopg.Connection, limit: int) -> list[dict[str
         p.plan::text AS plan,
         p.hints::text AS hints
     FROM yb_pg_stat_plans p
-    ORDER BY p.last_used DESC
+    ORDER BY (p.queryid = ANY(%(top)s::bigint[])) DESC, p.last_used DESC
     LIMIT %(limit)s /* __YB_STAT_PLANS_SKIP */;
     """
-    return fetch_all(conn, sql, {"limit": limit})
+    return fetch_all(conn, sql, {"limit": limit, "top": [str(q) for q in (top_queryids or [])]})
 
 
 def yb_local_tablets_rows(conn: psycopg.Connection) -> list[dict[str, Any]]:

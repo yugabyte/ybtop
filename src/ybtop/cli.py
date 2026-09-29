@@ -17,7 +17,7 @@ from rich.text import Text
 
 from ybtop import __version__
 from ybtop import collect
-from ybtop.control import read_control, write_control
+from ybtop.control import read_control, read_control_locks, write_control
 from ybtop.config import (
     DEFAULT_ASH_WINDOW_MINUTES,
     DEFAULT_LOG_BACKUP_COUNT,
@@ -119,20 +119,42 @@ def _maybe_write_latency_analysis(
         log_event(log, "latency_analysis_error", level=logging.WARNING, error=str(exc))
 
 
+def apply_query_plans_flag(out_dir: Path, flag: "bool | None") -> None:
+    """Record watch's plan-collection flag in the data directory's toggle file.
+
+    An explicit flag sets the saved toggle; without one the viewer's last choice for
+    this directory persists across collector restarts. --no-snapshot-query-plans
+    also locks it, so the viewer cannot switch collection back on; a run without
+    that flag lifts a lock an earlier run left.
+    """
+    if flag is None and not read_control_locks(out_dir):
+        return
+    write_control(
+        out_dir,
+        {} if flag is None else {"query_plans": bool(flag)},
+        locks={"query_plans": "--no-snapshot-query-plans"} if flag is False else {},
+    )
+
+
+def query_plans_wanted(out_dir: Path, flag: "bool | None") -> bool:
+    """Collect plans this checkpoint? The toggle file, unless the flag forbade it.
+
+    Re-read every tick: this is what lets the viewer's button take effect on the
+    next checkpoint instead of needing a restart. --no-snapshot-query-plans wins
+    even over a file someone rewrote after startup.
+    """
+    return flag is not False and read_control(out_dir)["query_plans"]
+
+
 def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
     console = Console()
     out_dir = Path(settings.snapshot_output_dir)
     watch_log = get_logger("watch")
     iteration = 0
-    # An explicit flag sets the saved toggle; without one the viewer's last choice
-    # for this directory persists across collector restarts.
-    if settings.snapshot_query_plans is not None:
-        try:
-            write_control(out_dir, {"query_plans": bool(settings.snapshot_query_plans)})
-        except OSError as exc:
-            log_event(
-                watch_log, "control_write_failed", level=logging.WARNING, error=str(exc)
-            )
+    try:
+        apply_query_plans_flag(out_dir, settings.snapshot_query_plans)
+    except OSError as exc:
+        log_event(watch_log, "control_write_failed", level=logging.WARNING, error=str(exc))
     log_event(watch_log, "watch_started", output_dir=str(out_dir.resolve()))
     with Live(
         console=console,
@@ -161,9 +183,7 @@ def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
                     )
                 try:
                     ash_start, ash_end = resolve_ash_range(settings)
-                    # Re-read every tick: this is what lets the viewer's button take
-                    # effect on the next checkpoint instead of needing a restart.
-                    want_query_plans = read_control(out_dir)["query_plans"]
+                    want_query_plans = query_plans_wanted(out_dir, settings.snapshot_query_plans)
                     doc = build_snapshot_document(
                         seed_dsn=settings.seed_dsn,
                         ash_start=ash_start,
@@ -690,8 +710,16 @@ def main(argv: Optional[list[str]] = None) -> None:
         else:
             init_logging(log_path=None)
         if not args.no_serve:
-            from ybtop.serve import start_serve_background
+            from ybtop.serve import _allowed, start_serve_background, unguarded_bind_problem
 
+            problem = unguarded_bind_problem(
+                args.serve_bind,
+                _allowed(getattr(args, "serve_allowed_host", None)),
+                ["--allow-plan-pinning"] if settings.allow_plan_pinning else [],
+            )
+            if problem:
+                print("ybtop: " + problem, file=sys.stderr, flush=True)
+                raise SystemExit(2)
             if not start_serve_background(
                 data_dir=settings.snapshot_output_dir,
                 host=args.serve_bind,

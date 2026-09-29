@@ -28,8 +28,30 @@ CONTROL_DEFAULTS: dict[str, bool] = {
 }
 
 
+# Toggles a collector flag has fixed, with the flag that did: written by watch at
+# startup, never by a request, so the viewer cannot switch them back.
+LOCKS_KEY = "locked"
+
+
+class ControlLocked(Exception):
+    """A request tried to change a toggle that a collector flag has fixed."""
+
+    def __init__(self, toggle: str, flag: str):
+        super().__init__("%s is fixed by the collector's %s" % (toggle, flag))
+        self.toggle = toggle
+        self.flag = flag
+
+
 def control_path(data_dir: Path | str) -> Path:
     return Path(data_dir) / CONTROL_FILENAME
+
+
+def _read_doc(data_dir: Path | str) -> dict[str, Any]:
+    try:
+        doc = json.loads(control_path(data_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
 
 
 def read_control(data_dir: Path | str) -> dict[str, bool]:
@@ -38,35 +60,48 @@ def read_control(data_dir: Path | str) -> dict[str, bool]:
     Never raises: a collector must not die because someone hand-edited this file.
     """
     out = dict(CONTROL_DEFAULTS)
-    try:
-        raw = control_path(data_dir).read_text(encoding="utf-8")
-    except (OSError, ValueError):
-        return out
-    try:
-        doc = json.loads(raw)
-    except ValueError:
-        return out
-    if not isinstance(doc, dict):
-        return out
+    doc = _read_doc(data_dir)
     for key in CONTROL_DEFAULTS:
         if key in doc:
             out[key] = bool(doc[key])
     return out
 
 
-def write_control(data_dir: Path | str, updates: dict[str, Any]) -> dict[str, bool]:
+def read_control_locks(data_dir: Path | str) -> dict[str, str]:
+    """Toggle -> the collector flag that fixed it. Never raises, like read_control."""
+    raw = _read_doc(data_dir).get(LOCKS_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    return {k: str(v) for k, v in raw.items() if k in CONTROL_DEFAULTS and v}
+
+
+def write_control(
+    data_dir: Path | str, updates: dict[str, Any], *, locks: "dict[str, str] | None" = None
+) -> dict[str, bool]:
     """Merge `updates` into the control file and return the resulting state.
 
     Unknown keys are ignored rather than stored, so a stale or hostile request
     cannot plant fields the collector might later be taught to honour.
+    `locks` comes from the collector only and replaces the saved locks; without
+    it (a request) a locked toggle cannot change, and ControlLocked says why.
     Raises OSError when the directory is not writable (archive dirs served
     read-only), which the caller reports to the viewer.
     """
     state = read_control(data_dir)
+    saved_locks = read_control_locks(data_dir)
+    if locks is None:
+        for key in CONTROL_DEFAULTS:
+            if key in updates and key in saved_locks and bool(updates[key]) != state[key]:
+                raise ControlLocked(key, saved_locks[key])
+        new_locks = saved_locks
+    else:
+        new_locks = {k: str(v) for k, v in locks.items() if k in CONTROL_DEFAULTS and v}
     for key in CONTROL_DEFAULTS:
         if key in updates:
             state[key] = bool(updates[key])
-    doc = dict(state)
+    doc: dict[str, Any] = dict(state)
+    if new_locks:
+        doc[LOCKS_KEY] = new_locks
     doc["updated_utc"] = datetime.now(timezone.utc).isoformat()
     target = control_path(data_dir)
     fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".ybtop.control.", suffix=".tmp")

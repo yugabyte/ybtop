@@ -101,6 +101,27 @@ class GuardedEndpointTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(self.toggle())
 
+    def test_a_locked_toggle_is_reported_and_refused(self):
+        from ybtop.cli import apply_query_plans_flag
+
+        apply_query_plans_flag(Path(self.tmp.name), False)
+        self.assertEqual(json.loads(self.request("/api/control")[1])["locked"], "--no-snapshot-query-plans")
+        status, text = self.request("/api/control", {"query_plans": True})
+        self.assertEqual(status, 409)
+        self.assertIn("--no-snapshot-query-plans", json.loads(text)["error"])
+        self.assertFalse(self.toggle())
+
+    def test_the_refusal_names_the_flag_of_this_command(self):
+        H = serve.YbtopHTTPRequestHandler
+        saved = H.allowed_host_flag
+        try:
+            H.allowed_host_flag = "--allowed-host"  # what run_serve sets for ybtop serve
+            status, text = self.request("/api/control", headers={"Host": "evil.example:8765"})
+            self.assertEqual(status, 403)
+            self.assertIn("--allowed-host evil.example", json.loads(text)["error"])
+        finally:
+            H.allowed_host_flag = saved
+
     def test_a_rebound_host_is_refused(self):
         rebound = {"Host": "evil.example:8765"}
         status, text = self.request("/api/control", headers=rebound)
@@ -161,6 +182,90 @@ class SnapshotLoadTest(unittest.TestCase):
         self.assertEqual((error, status), (None, 200))
         self.assertEqual((target["datname"], target["hints"]), ("app", "/*+ SeqScan(t) */"))
         self.assertIn("dbname=app", target["dsn"])
+
+
+class UnguardedBindTest(unittest.TestCase):
+    """Cluster-writing features refuse a bind whose Host check has no names to use."""
+
+    def test_writes_need_names_on_a_non_loopback_bind(self):
+        p = serve.unguarded_bind_problem
+        pin = ["--allow-plan-pinning"]
+        self.assertIsNone(p("127.0.0.1", frozenset(), pin))
+        self.assertIsNone(p("localhost", frozenset(), pin))
+        self.assertIsNone(p("::1", frozenset(), pin))
+        self.assertIsNone(p("0.0.0.0", frozenset(), []))  # a read-only viewer is unchanged
+        self.assertIsNone(p("0.0.0.0", frozenset({"ybtop.example"}), pin))
+        for bind in ("0.0.0.0", "::", "10.0.0.5"):
+            self.assertIn("--serve-allowed-host", p(bind, frozenset(), pin), bind)
+
+    def test_watch_refuses_to_start(self):
+        import contextlib
+        import io
+
+        from ybtop import cli
+
+        def must_not_run(*a, **k):  # fail fast rather than start a viewer and a collector
+            raise AssertionError("watch got past the check")
+
+        saved = (serve.start_serve_background, cli.run_watch)
+        serve.start_serve_background, cli.run_watch = must_not_run, must_not_run
+        try:
+            with tempfile.TemporaryDirectory() as out:
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    cli.main(["watch", "--host", "127.0.0.1", "--output-dir", out, "--no-log-file",
+                              "--serve-bind", "0.0.0.0", "--allow-plan-pinning"])
+        finally:
+            serve.start_serve_background, cli.run_watch = saved
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--serve-allowed-host", err.getvalue())
+
+
+class DroppedDatabaseTest(unittest.TestCase):
+    """A database dropped after the snapshot: a clear 409, not a 500."""
+
+    def setUp(self):
+        import psycopg
+
+        self.tmp = tempfile.TemporaryDirectory()
+        with open(os.path.join(self.tmp.name, "ybtop.out.20260925_130000.json"), "w") as f:
+            json.dump(_qpm_doc(), f)
+        H = serve.YbtopHTTPRequestHandler
+        self.saved = (H.data_dir, H.seed_dsn, H.allow_plan_pinning, serve.connect)
+        H.data_dir = Path(self.tmp.name)
+        H.seed_dsn = "host=seed port=5433 dbname=yugabyte user=yugabyte"
+        H.allow_plan_pinning = True
+
+        def gone(dsn, *a, **k):
+            raise psycopg.OperationalError(
+                'connection failed: connection to server at "10.0.0.5", port 5433 failed: '
+                'FATAL:  database "app" does not exist')
+
+        serve.connect = gone
+        self.h = serve.YbtopHTTPRequestHandler.__new__(serve.YbtopHTTPRequestHandler)
+        self.sent = []
+        self.h._send_json = lambda body, status=200: self.sent.append((status, body))
+        self.fields = {"queryid": "7", "planid": "1", "plan_ref": "aa", "dbid": "16640",
+                       "file": "ybtop.out.20260925_130000.json"}
+
+    def tearDown(self):
+        H = serve.YbtopHTTPRequestHandler
+        H.data_dir, H.seed_dsn, H.allow_plan_pinning, serve.connect = self.saved
+        self.tmp.cleanup()
+
+    def test_every_pin_action_says_the_database_is_gone(self):
+        want = "this plan's database (app) no longer exists; there is nothing to pin into."
+        self.h._handle_pin("/api/pin", dict(self.fields))
+        self.h._handle_pin("/api/unpin", dict(self.fields))
+        self.h._handle_install_hint_plan(dict(self.fields))
+        self.h._handle_hinting(dict(self.fields, enable=True))
+        self.assertEqual(self.sent, [(409, {"error": want})] * 4)
+        target, _, _ = self.h._resolve_plan_target(self.fields)
+        self.assertEqual(self.h._pin_state(target)["reason"], want)
+
+    def test_other_connection_errors_are_not_mistaken_for_it(self):
+        self.assertFalse(serve._database_gone(Exception("connection refused")))
+        self.assertFalse(serve._database_gone(Exception('relation "hint_plan.hints" does not exist')))
 
 
 if __name__ == "__main__":

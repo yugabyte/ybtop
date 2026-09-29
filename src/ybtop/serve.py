@@ -16,7 +16,7 @@ from rich.console import Console
 from ybtop import __version__ as _ybtop_version
 from ybtop import pinscan
 from ybtop import queries as Q
-from ybtop.control import CONTROL_DEFAULTS, read_control, write_control
+from ybtop.control import CONTROL_DEFAULTS, ControlLocked, read_control, read_control_locks, write_control
 from ybtop.db import connect, dsn_for_database
 
 _INT64_TEXT = re.compile(r"^-?\d{1,20}$")
@@ -85,6 +85,32 @@ def cross_site_problem(headers: "object", allowed: "frozenset[str]" = frozenset(
             return "cross-origin request refused"
     return None
 
+
+
+def unguarded_bind_problem(bind_host: str, allowed: "frozenset[str]", features: "list[str]") -> "str | None":
+    """Why the viewer's cluster-writing features must not start on this bind, or None.
+
+    A viewer bound to a non-loopback address checks the Host header only against
+    names it is given (see host_allowed); without any, a DNS-rebinding page is
+    same-origin with it and could drive every POST endpoint.
+    """
+    if not features or _is_loopback(_host_name(bind_host)) or allowed:
+        return None
+    return (
+        "%s on a viewer bound to %s needs --serve-allowed-host NAME (the host names it is "
+        "reached by), or bind it to 127.0.0.1: otherwise a page whose DNS is rebound to this "
+        "address could use them." % (" and ".join(features), bind_host)
+    )
+
+
+def _database_gone(exc: BaseException) -> bool:
+    """A connection refused because its database no longer exists.
+
+    psycopg reports it as a bare OperationalError (no SQLSTATE on a failed
+    connect), so the server's message is what tells it apart.
+    """
+    msg = str(exc)
+    return "FATAL:" in msg and 'database "' in msg and '" does not exist' in msg
 
 
 def find_recorded_plan(
@@ -171,9 +197,10 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
     # unavailable rather than half-working.
     seed_dsn: "str | None" = None
     allow_plan_pinning: bool = False
-    # DNS-rebinding guard; see host_allowed.
+    # DNS-rebinding guard; see host_allowed. The flag differs between watch and serve.
     bind_host: str = "127.0.0.1"
     allowed_hosts: "frozenset[str]" = frozenset()
+    allowed_host_flag: str = "--serve-allowed-host"
 
     def _host_ok(self) -> bool:
         cls = type(self)
@@ -183,7 +210,7 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
         msg = (
             "Host %r is not one this viewer is reached by, so the request is refused "
             "(DNS-rebinding guard). If this is how you reach it, start ybtop with "
-            "--serve-allowed-host %s." % (name, name)
+            "%s %s." % (name, cls.allowed_host_flag, name)
         )
         if urlparse(self.path).path.startswith("/api/"):
             self._send_json({"error": msg}, 403)
@@ -212,6 +239,7 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
         # The viewer needs to know whether enabling can even be persisted: an
         # archive directory served read-only will reject the write.
         state["writable"] = os.access(str(root), os.W_OK)
+        state["locked"] = read_control_locks(root).get("query_plans")
         return state
 
     def _pinning_unavailable_reason(self) -> "str | None":
@@ -250,6 +278,8 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
                     st = Q.qpm_status(own)
                     row = Q.hint_table_row(own, queryid) if st.get("hint_table_present") else None
         except Exception as exc:  # noqa: BLE001 - surface as a UI message, never a 500
+            if _database_gone(exc):
+                return {"available": False, "reason": "this plan's database (%s) no longer exists; there is nothing to pin into." % target["datname"], "pinned": False}
             return {"available": False, "reason": "database error: %s" % exc, "pinned": False}
         state = pin_state_from_status(st, row)
         state["database"] = target["datname"]
@@ -308,8 +338,9 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
             return None, "that plan is not recorded in %s for this database" % vals["file"], 404
         datname = ((doc.get("yb_pg_stat_plans") or {}).get("databases") or {}).get(vals["dbid"])
         if datname is None:
-            # Snapshots written before the database map, or a database dropped
-            # since: ask the cluster.
+            # Only a snapshot built while the database map could not be read has no
+            # name here; ask the cluster. A database dropped after the snapshot is
+            # still in its map -- that shows up when connecting (_database_gone).
             try:
                 with connect(str(type(self).seed_dsn)) as conn:
                     rows = Q.database_name(conn, vals["dbid"])
@@ -452,6 +483,12 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             write_control(type(self).data_dir, body)
+        except ControlLocked as exc:
+            self._send_json(
+                {"error": "Plan collection is fixed off for this data directory by the "
+                 "collector's %s." % exc.flag}, 409
+            )
+            return
         except OSError as exc:
             self._send_json(
                 {"error": "data directory is not writable: %s" % exc}, 409
@@ -497,6 +534,9 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
                     Q.pin_hint(conn, target["queryid"], body_text)
                     state = self._pin_state(target, conn)
         except Exception as exc:  # noqa: BLE001
+            if _database_gone(exc):
+                self._send_json({"error": "this plan's database (%s) no longer exists; there is nothing to pin into." % target["datname"]}, 409)
+                return
             verb = "remove hint" if route == "/api/unpin" else "pin plan"
             self._send_json({"error": "could not %s: %s" % (verb, exc)}, 500)
             return
@@ -524,6 +564,9 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
                     pinscan.forget_database(target["datname"])
                 state = self._pin_state(target, conn)
         except Exception as exc:  # noqa: BLE001
+            if _database_gone(exc):
+                self._send_json({"error": "this plan's database (%s) no longer exists; there is nothing to pin into." % target["datname"]}, 409)
+                return
             self._send_json({"error": "could not install pg_hint_plan: %s" % exc}, 500)
             return
         self._send_json(state)
@@ -544,6 +587,9 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
             with connect(str(target["dsn"])) as conn:
                 result = Q.set_hint_table_gucs(conn, bool(body["enable"]))
         except Exception as exc:  # noqa: BLE001
+            if _database_gone(exc):
+                self._send_json({"error": "this plan's database (%s) no longer exists; there is nothing to pin into." % target["datname"]}, 409)
+                return
             self._send_json({"error": "could not change hint settings: %s" % exc}, 500)
             return
         # Report from a NEW session: ALTER DATABASE ... SET only reaches sessions
@@ -617,6 +663,7 @@ def run_serve(*, data_dir: str, host: str, port: int, allowed_hosts: "list[str] 
     YbtopHTTPRequestHandler.data_dir = root
     YbtopHTTPRequestHandler.bind_host = host
     YbtopHTTPRequestHandler.allowed_hosts = _allowed(allowed_hosts)
+    YbtopHTTPRequestHandler.allowed_host_flag = "--allowed-host"
 
     httpd = ThreadingHTTPServer((host, port), YbtopHTTPRequestHandler)
     url = f"http://{host}:{port}/"
