@@ -2,6 +2,18 @@
 
 All notable functional changes to **ybtop** are listed here by release. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) (newest first).
 
+## [0.1.14] — 2026-09-28
+
+### Added
+
+- **Query plan history (opt-in):** Snapshots can carry **Query Plan Management** data (**`yb_pg_stat_plans`**, YugabyteDB 2025.2.3+) as a **`yb_pg_stat_plans`** section: per-node rows (calls, average / slowest time, the slowest execution's parameters, first / last use) for the statements in the `pg_stat_statements` top N, plan and hint text stored once per snapshot (**`plans`**, by `plan_ref`), **`databases`** (oid → name) and **`pinned`**. Off by default; switch it on with **`watch --snapshot-query-plans`**, or per data directory through the viewer's collection toggle (`POST /api/control`, kept in **`ybtop.control.json`** and read at every checkpoint). **`--no-snapshot-query-plans`** keeps it off; **`--snapshot-query-plans-per-node`** (default `2000`) caps rows per node. Every snapshot records whether QPM is present and tracking (`yb_pg_stat_plans_track`), so the viewer can say why there is nothing to show.
+- **Plan pinning, server side (opt-in, `watch --allow-plan-pinning`):** The viewer that `watch` starts can install **pg_hint_plan**, enable the hint table for a database (`ALTER DATABASE … SET pg_hint_plan.enable_hint_table`, `pg_hint_plan.yb_use_query_id_for_hinting`, read back on a new session), pin a recorded plan's hints for its query_id, and remove the pin. A request names a recorded plan only; the hint text and the database come from ybtop's own snapshot, and `ybtop serve` never writes to the cluster.
+- **Viewer request guards:** POSTs must be same-origin JSON (`Content-Type: application/json`, `Sec-Fetch-Site`, `Origin`), so a page on another site cannot drive the collection toggle or pinning.
+
+### Changed
+
+- **Viewer Host check (DNS-rebinding guard):** Requests whose `Host` header is not a name the viewer is reached by are refused with 403. Loopback names always work and a loopback-bound viewer accepts only those; list other names — a proxy's public name, or the host name of a viewer bound to another address — with **`watch --serve-allowed-host`** / **`serve --allowed-host`** (repeatable).
+
 ## [0.1.13] — 2026-08-12
 
 ### Added

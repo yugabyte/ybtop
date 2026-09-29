@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from typing import Any, Optional, Union
 
 import psycopg
+import psycopg.conninfo
 from psycopg.rows import dict_row
 
 # Prepended to every YSQL statement so logs / pg_stat / ASH can attribute load to ybtop.
@@ -44,6 +45,13 @@ def connect(dsn: str) -> Iterator[psycopg.Connection]:
         yield conn
     finally:
         conn.close()
+
+
+def dsn_for_database(seed_dsn: str, dbname: str) -> str:
+    """The seed DSN pointed at another database of the same cluster."""
+    info = psycopg.conninfo.conninfo_to_dict(seed_dsn)
+    info["dbname"] = dbname
+    return psycopg.conninfo.make_conninfo(**info)
 
 
 def fetch_all(
