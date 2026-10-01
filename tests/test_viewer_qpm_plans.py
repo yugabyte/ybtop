@@ -42,7 +42,7 @@ const NAMES = ["qpmPlanShapeSignature", "qpmScopeQueryIds", "aggregateQpmPlans",
   "withQpmPlansColumn", "qpmEffectivePinned", "qpmPanelDbids", "qpmPinButtonStates",
   "qpmMaskPlanParams", "qpmPlanTwinKey", "qpmTwinKeysFor", "qpmVariantsNote", "qpmCallsText",
   "qpmTemplateMembers", "collapseStatementsByTemplate", "statementMergeKey", "deltaSrcFromRowFallback",
-  "ycqlPreparedTruthy", "deltaPgStatMergedRows", "queryTemplateKey"];
+  "ycqlPreparedTruthy", "deltaPgStatMergedRows", "queryTemplateKey", "qpmPanelApplies"];
 // Template normalization (the consts and normalizeQueryTemplate), for queryTemplateKey.
 const norm = src.slice(src.indexOf("const HIST_REWRITE_COMMENT_RE"), src.indexOf("function queryTemplateKey("));
 // Helpers only some versions of the delta pipeline have (#7 adds this one).
@@ -453,8 +453,38 @@ async function enableWaitCases() {
   }
   return r;
 }
+{ // the QUERY PLANS block only where QPM can say something: YSQL, on a cluster with QPM
+  const ap = (qpm, qid, fam) => A.qpmPanelApplies({ yb_pg_stat_plans: qpm, pg_stat_statements:
+    { per_node: { n1: [{ queryid: "y" }] } }, ycql_stat_statements: { per_node: { n1: [{ queryid: "c" }] } } }, qid, fam);
+  const on = { supported: true, track: "all", collected: false };
+  out.applies = [ap(null, "y"), ap({ supported: false }, "y"), ap(on, "c"), ap(on, "y"), ap(on, "unknown"),
+    ap(on, "c", { source: "ysql" }), ap(on, "y", { source: "ycql" })];
+}
+async function pinStateCases() {
+  const e = { qpmPinStates: new Map(), QPM_PIN_STATE_TTL_MS: 60000, asked: 0, t: 0, Date: { now: () => e.t } };
+  e.qpmFetchPinState = async (t) => { e.asked += 1; return { pinned: false, q: t.queryid }; };
+  const P = new Function("env", "with (env) { " + [fn("qpmPinStateKey"), fn("qpmCachedPinState"),
+    fn("qpmPinStateChanged"), "return { qpmCachedPinState, qpmPinStateChanged };"].join("\n") + " }")(e);
+  const a = { dbid: "1", queryid: "7", planid: "p", plan_ref: "r" }, b = Object.assign({}, a, { planid: "q" });
+  await P.qpmCachedPinState(a); await P.qpmCachedPinState(a); await P.qpmCachedPinState(b);
+  const cached = e.asked;
+  P.qpmPinStateChanged(a, { pinned: true }); await P.qpmCachedPinState(b);  // b is dropped too
+  const afterChange = e.asked, st = await P.qpmCachedPinState(a);
+  e.t = 61000; await P.qpmCachedPinState(a);
+  // the pin row asks only once its hints row is opened, and only once
+  const d = { open: false, on: [], addEventListener: (k, f) => d.on.push(f) };
+  const node = () => ({ dataset: {}, appendChild() {}, addEventListener() {} });
+  let rowAsks = 0;
+  const R = new Function("env", "with (env) { " + fn("qpmPinControls") + " return qpmPinControls; }")({
+    el: node, qpmCachedPinState: () => { rowAsks += 1; return new Promise(() => {}); } });
+  R({ planid: "p", plan_ref: "r", dbid: "1" }, "7", "f.json", d);
+  const closed = rowAsks;
+  d.open = true; d.on.forEach((f) => f()); d.on.forEach((f) => f());
+  return { cached, afterChange, kept: st.pinned, expired: e.asked, closed, opened: rowAsks };
+}
 (async () => {
   out.enableWait = await enableWaitCases();
+  out.pinState = await pinStateCases();
   console.log(JSON.stringify(out));
 })();
 """
@@ -577,6 +607,16 @@ class ViewerQpmPlansTest(unittest.TestCase):
         self.assertIn("MergeJoin(a b)", sig)
         self.assertNotIn("Set(", sig)
         self.assertNotIn("/*+", sig)
+
+    def test_plans_block_only_for_ysql_on_a_cluster_with_qpm(self):
+        # no section, no QPM, a YCQL statement: no block; a YSQL or unknown one: yes
+        self.assertEqual(self.out["applies"], [False, False, False, True, True, True, False])
+
+    def test_pin_state_is_asked_when_the_hints_row_opens_and_kept_a_minute(self):
+        p = self.out["pinState"]
+        self.assertEqual((p["cached"], p["afterChange"], p["expired"]), (2, 3, 4))
+        self.assertTrue(p["kept"])  # what a pin answered, not asked again
+        self.assertEqual((p["closed"], p["opened"]), (0, 1))
 
     def test_guardrail_picks_the_right_block_per_snapshot(self):
         m = self.out["mode"]

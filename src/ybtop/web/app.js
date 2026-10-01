@@ -2126,7 +2126,7 @@
           })
         );
       } else if (pinTargets.length === 1) {
-        hintWrap.appendChild(qpmPinControls(group, pinTargets[0], snapshotFile));
+        hintWrap.appendChild(qpmPinControls(group, pinTargets[0], snapshotFile, hintWrap));
       } else if (pinTargets.length > 1) {
         hintWrap.appendChild(
           el("div", {
@@ -2460,6 +2460,31 @@
     }
   }
 
+  // Pin state per plan, for a minute: each ask costs the collector a snapshot parse and a
+  // database round trip. A pin, install or hint-table change drops its database's entries.
+  const QPM_PIN_STATE_TTL_MS = 60000;
+  const qpmPinStates = new Map();
+
+  function qpmPinStateKey(t) {
+    return [t.dbid, t.queryid, t.planid, t.plan_ref].join("|");
+  }
+
+  function qpmCachedPinState(target) {
+    const hit = qpmPinStates.get(qpmPinStateKey(target));
+    if (hit && Date.now() - hit.at < QPM_PIN_STATE_TTL_MS) return Promise.resolve(hit.state);
+    return qpmFetchPinState(target).then((st) => {
+      if (st) qpmPinStates.set(qpmPinStateKey(target), { state: st, at: Date.now() });
+      return st;
+    });
+  }
+
+  function qpmPinStateChanged(target, st) {
+    Array.from(qpmPinStates.keys()).forEach((k) => {
+      if (k.split("|")[0] === String(target.dbid)) qpmPinStates.delete(k);
+    });
+    if (st) qpmPinStates.set(qpmPinStateKey(target), { state: st, at: Date.now() });
+  }
+
   async function qpmSetHinting(enable, target) {
     const res = await fetch("api/hinting", {
       method: "POST",
@@ -2544,13 +2569,14 @@
   }
 
   /**
-   * Pin / remove controls under a plan's hints.
+   * Pin / remove controls under a plan's hints (`details`); they ask the collector
+   * for the pin state only once that is opened.
    *
    * The request names which recorded plan to pin (snapshot file + queryid + planid
    * + plan_ref); the hint text itself is read server-side from that snapshot, so
    * the browser never supplies the SQL payload.
    */
-  function qpmPinControls(group, queryIdForPin, snapshotFile) {
+  function qpmPinControls(group, queryIdForPin, snapshotFile, details) {
     // Everything the server needs to find this exact recorded plan, database included.
     const target = {
       queryid: String(queryIdForPin),
@@ -2569,9 +2595,10 @@
       type: "button",
       textContent: "Pin this plan",
       title:
-        "Pins this plan for query_id " + queryIdForPin + ": the statement as the application "
-        + "sends it. The same SQL with literal values, or with other parameter types, is a "
-        + "different query_id and keeps its own plan.",
+        "Pins this plan for query_id " + queryIdForPin + " in this database, for every "
+        + "application and role that runs it: the statement as the application sends it. The "
+        + "same SQL with literal values, or with other parameter types, is a different query_id "
+        + "and keeps its own plan.",
     });
     const rmBtn = el("button", {
       className: "qpm-enable-btn qpm-enable-btn--danger",
@@ -2646,7 +2673,7 @@
           ? "Pinning will insert the hint, but it cannot take effect while "
             + warnings.join(" and ") + " for your application's sessions."
           : "Pins this plan for query_id " + queryIdForPin + " in "
-            + (st.database || "this database") + ".";
+            + (st.database || "this database") + ", for every application and role that runs it.";
       }
     }
 
@@ -2656,6 +2683,7 @@
       btn.textContent = label;
       try {
         const st = await qpmPostPin(route, target);
+        qpmPinStateChanged(target, st);
         qpmRecordPinEdit(target.dbid, target.queryid, st.pinned, st._serverMs);
         btn.textContent = was;
         applyState(st);
@@ -2672,6 +2700,7 @@
       installBtn.textContent = "Installing\u2026";
       try {
         const st = await qpmPostPin("hint-plan/install", target);
+        qpmPinStateChanged(target, st);
         installBtn.textContent = "Install pg_hint_plan";
         applyState(st);
       } catch (e) {
@@ -2691,7 +2720,8 @@
       try {
         const res = await qpmSetHinting(turningOn, target);
         const db = (res.applied && res.applied.database) || "this database";
-        const fresh = await qpmFetchPinState(target);
+        qpmPinStateChanged(target, null);
+        const fresh = await qpmCachedPinState(target);
         applyState(fresh);
         status.className = "qpm-note";
         status.textContent =
@@ -2711,8 +2741,15 @@
 
     pinBtn.disabled = true;
     gucBtn.hidden = true;
-    status.textContent = "Checking hint table\u2026";
-    qpmFetchPinState(target).then(applyState);
+    let asked = false;
+    const ask = () => {
+      if (asked || !details.open) return;
+      asked = true;
+      status.textContent = "Checking hint table\u2026";
+      qpmCachedPinState(target).then(applyState);
+    };
+    details.addEventListener("toggle", ask);
+    ask();
     return wrap;
   }
 
@@ -2756,24 +2793,28 @@
   }
 
   /**
-   * The QUERY PLANS block for a scoped ASH drilldown. Without plans in the snapshot
-   * it is the collection-off panel (no QPM section, or collection off) or a notice
-   * (no QPM on the cluster, tracking off). Null only when this query has no plans on
-   * record -- the panel should be absent, not empty.
+   * Whether a drilldown gets a QUERY PLANS block at all. QPM records YSQL plans
+   * only, and a cluster without it -- or a snapshot from a ybtop that did not
+   * collect it -- has nothing to say there.
+   */
+  function qpmPanelApplies(doc, queryId, canonicalFamily) {
+    const mode = qpmPanelMode(doc && doc.yb_pg_stat_plans);
+    if (mode === "legacy" || mode === "unsupported") return false;
+    if (canonicalFamily) return canonicalFamily.source !== "ycql";
+    const has = (sec) => Object.values((sec && sec.per_node) || {})
+      .some((rows) => (rows || []).some((r) => r && String(r.queryid) === String(queryId)));
+    return has(doc.pg_stat_statements) || !has(doc.ycql_stat_statements);
+  }
+
+  /**
+   * The QUERY PLANS block for a scoped ASH drilldown where QPM applies: without plans,
+   * the collection-off panel or the tracking-off notice; null when none are on record.
    */
   function qpmPlansPanel(doc, queryId, canonicalFamily, clusterNodeCount, snapshotFile, dbname) {
-    const qpm = doc && doc.yb_pg_stat_plans;
+    if (!qpmPanelApplies(doc, queryId, canonicalFamily)) return null;
+    const qpm = doc.yb_pg_stat_plans;
     const mode = qpmPanelMode(qpm);
-    if (mode === "legacy" || mode === "collection-off") {
-      return qpmCollectionOffPanel(qpmCollectionState);
-    }
-    if (mode === "unsupported") {
-      return qpmNoticePanel(
-        "this cluster has no Query Plan Management",
-        "yb_pg_stat_plans is not present. QPM needs YugabyteDB 2025.2.3 or later.",
-        false
-      );
-    }
+    if (mode === "collection-off") return qpmCollectionOffPanel(qpmCollectionState);
     if (mode === "tracking-off") {
       // Offer the fix, not a button that would only ever collect empty plan sets.
       return qpmNoticePanel(
