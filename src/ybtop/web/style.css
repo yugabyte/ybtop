@@ -938,3 +938,458 @@ tr:nth-child(even) {
   margin-bottom: 1rem;
   border: 1px solid var(--yb-danger);
 }
+
+/* ---------- QPM query plans panel (ASH query drilldown) ---------- */
+
+.qpm-panel {
+  margin: 0 0 0.85rem;
+  border: 1px solid var(--yb-border);
+  border-left: 4px solid var(--yb-link);
+  border-radius: 4px;
+  background: rgba(17, 29, 46, 0.45);
+}
+
+.qpm-panel-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.15rem 0.6rem;
+  padding: 0.5rem 0.75rem;
+}
+
+.qpm-panel-toggle {
+  flex: 0 0 auto;
+  padding: 0;
+  width: 1.1rem;
+  border: 0;
+  background: none;
+  color: var(--yb-muted);
+  font-size: 0.8rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.qpm-panel-title {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--yb-muted);
+}
+
+.qpm-panel-verdict {
+  font-size: 0.82rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--yb-muted);
+}
+
+.qpm-panel-verdict--ok {
+  color: var(--yb-groupby-emphasis);
+}
+
+.qpm-panel-verdict--underused {
+  color: #f5b544;
+}
+
+.qpm-panel-verdict--abandoned {
+  color: var(--yb-danger);
+}
+
+.qpm-panel-body {
+  padding: 0 0.75rem 0.6rem;
+}
+
+.qpm-card {
+  border: 1px solid var(--yb-border);
+  border-radius: 3px;
+  background: rgba(11, 20, 38, 0.55);
+  margin-bottom: 0.35rem;
+}
+
+.qpm-card:last-child {
+  margin-bottom: 0;
+}
+
+.qpm-card--best {
+  border-color: rgba(246, 82, 31, 0.55);
+  background: rgba(246, 82, 31, 0.05);
+}
+
+.qpm-card-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 0.5rem;
+  padding: 0.4rem 0.55rem;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.qpm-card-head:hover {
+  background: rgba(94, 184, 255, 0.06);
+}
+
+.qpm-card-head:focus-visible {
+  outline: 1px solid var(--yb-link);
+  outline-offset: -1px;
+}
+
+.qpm-caret {
+  flex: 0 0 auto;
+  width: 0.8rem;
+  color: var(--yb-muted);
+  font-size: 0.7rem;
+}
+
+.qpm-badge {
+  flex: 0 0 auto;
+  padding: 0.05rem 0.42rem;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.qpm-badge--best {
+  color: var(--yb-bg);
+  background: var(--yb-accent);
+}
+
+.qpm-badge--live {
+  color: var(--yb-groupby-emphasis);
+  border-color: rgba(94, 234, 212, 0.45);
+}
+
+.qpm-badge--minor {
+  color: #f5b544;
+  border-color: rgba(245, 181, 68, 0.45);
+}
+
+.qpm-badge--stale {
+  color: var(--yb-muted);
+  border-color: var(--yb-border);
+}
+
+.qpm-card-ms {
+  flex: 0 0 auto;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.88rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--yb-text);
+}
+
+.qpm-card-calls {
+  flex: 0 0 auto;
+  font-size: 0.74rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--yb-muted);
+}
+
+.qpm-card-shape {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.72rem;
+  color: var(--yb-link);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: right;
+}
+
+.qpm-card-body {
+  padding: 0.1rem 0.55rem 0.5rem;
+  border-top: 1px solid var(--yb-border);
+}
+
+.qpm-metrics {
+  display: grid;
+  /* Wide enough that a planid or timestamp never wraps mid-value; capped so six
+     metrics cluster instead of spreading across a very wide window. */
+  grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+  gap: 0 1.1rem;
+  max-width: 72rem;
+  margin: 0.4rem 0 0.5rem;
+}
+
+.qpm-metric {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  font-size: 0.76rem;
+  line-height: 1.6;
+  min-width: 0;
+}
+
+.qpm-metric--full {
+  grid-column: 1 / -1;
+}
+
+.qpm-metric-k {
+  flex: 0 0 auto;
+  font-size: 0.64rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--yb-muted);
+}
+
+.qpm-metric-v {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--yb-text);
+  overflow-wrap: anywhere;
+}
+
+.qpm-sub-k {
+  font-size: 0.64rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--yb-muted);
+  margin: 0.35rem 0 0.2rem;
+}
+
+.qpm-tree {
+  margin: 0;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--yb-border);
+  border-radius: 3px;
+  background: rgba(11, 20, 38, 0.7);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.73rem;
+  line-height: 1.5;
+  color: var(--yb-text);
+  white-space: pre;
+  overflow-x: auto;
+  max-height: 44vh;
+}
+
+.qpm-hints {
+  margin-top: 0.45rem;
+}
+
+.qpm-hints > summary {
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-weight: 700;
+  color: var(--yb-muted);
+  cursor: pointer;
+}
+
+.qpm-hints > summary:hover {
+  color: var(--yb-link);
+}
+
+.qpm-hints > pre {
+  margin-top: 0.3rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.qpm-note {
+  font-size: 0.74rem;
+  line-height: 1.5;
+  color: var(--yb-muted);
+  margin: 0.3rem 0;
+}
+
+.qpm-note--warn {
+  color: #f5b544;
+}
+
+/* QPM: collection-off placeholder and its enable button */
+
+.qpm-panel--off {
+  border-left-color: var(--yb-border);
+}
+
+.qpm-enable-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  padding: 0.15rem 0 0.1rem;
+}
+
+.qpm-enable-row .qpm-note {
+  flex: 1 1 18rem;
+  min-width: 0;
+  margin: 0;
+}
+
+.qpm-enable-btn {
+  flex: 0 0 auto;
+  padding: 0.28rem 0.7rem;
+  border: 1px solid var(--yb-link);
+  border-radius: 3px;
+  background: rgba(94, 184, 255, 0.1);
+  color: var(--yb-link);
+  font-family: inherit;
+  font-size: 0.76rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+
+.qpm-enable-btn:hover:not(:disabled) {
+  background: rgba(94, 184, 255, 0.2);
+}
+
+.qpm-enable-btn:disabled {
+  border-color: var(--yb-border);
+  background: none;
+  color: var(--yb-muted);
+  cursor: default;
+}
+
+.qpm-panel-off-btn {
+  margin-left: auto;
+  padding: 0.05rem 0.4rem;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: none;
+  color: var(--yb-muted);
+  font-family: inherit;
+  font-size: 0.68rem;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+
+.qpm-panel-off-btn:hover:not(:disabled) {
+  border-color: var(--yb-border);
+  color: var(--yb-danger);
+}
+
+.qpm-panel-off-btn:disabled {
+  cursor: default;
+  color: var(--yb-muted);
+}
+
+/* QPM: pin / remove-hint controls under a plan's hints */
+
+.qpm-pin-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.6rem;
+  margin-top: 0.45rem;
+  padding-top: 0.45rem;
+  border-top: 1px solid var(--yb-border);
+}
+
+.qpm-pin-row .qpm-note {
+  flex: 1 1 16rem;
+  min-width: 0;
+  margin: 0;
+}
+
+.qpm-enable-btn--danger {
+  border-color: rgba(255, 107, 107, 0.55);
+  background: rgba(255, 107, 107, 0.08);
+  color: var(--yb-danger);
+}
+
+.qpm-enable-btn--danger:hover:not(:disabled) {
+  background: rgba(255, 107, 107, 0.18);
+}
+
+/* QPM: collection states (enabling / predates) and the live header toggle */
+
+.qpm-panel--enabling {
+  border-left-color: var(--yb-link);
+}
+
+.qpm-panel-verdict--enabling {
+  color: var(--yb-link);
+}
+
+.qpm-spinner {
+  flex: 0 0 auto;
+  width: 0.8rem;
+  height: 0.8rem;
+  border: 2px solid rgba(94, 184, 255, 0.25);
+  border-top-color: var(--yb-link);
+  border-radius: 50%;
+  animation: qpm-spin 0.9s linear infinite;
+}
+
+@keyframes qpm-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .qpm-spinner {
+    animation: none;
+    border-top-color: rgba(94, 184, 255, 0.25);
+    background: var(--yb-link);
+    opacity: 0.6;
+  }
+}
+
+.qpm-panel-off-btn--off {
+  color: #f5b544;
+  border-color: rgba(245, 181, 68, 0.35);
+}
+
+.qpm-panel-off-btn--off:hover:not(:disabled) {
+  color: var(--yb-link);
+  border-color: var(--yb-border);
+}
+
+/* PGSS "plans" column: as small and quiet as a column can be */
+
+td.qpm-plans-cell {
+  width: 1%;
+  white-space: nowrap;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.qpm-plans-n {
+  color: var(--yb-muted);
+  font-size: 0.78em;
+}
+
+/* More than one plan is the case worth a glance: normal text, still small. */
+.qpm-plans-n--multi {
+  color: var(--yb-text);
+  font-weight: 600;
+}
+
+.qpm-plans-pin {
+  display: inline-block;
+  margin-left: 0.3em;
+  padding: 0 0.28em;
+  border: 1px solid rgba(94, 234, 212, 0.45);
+  border-radius: 2px;
+  color: var(--yb-groupby-emphasis);
+  font-size: 0.66em;
+  font-weight: 700;
+  line-height: 1.35;
+  vertical-align: 0.08em;
+}
+
+/* The unified statement headers give every column min-width: 6rem; "plans" holds a
+   one-digit count, so it opts out and keeps only a little padding. */
+th[data-sort-key="qpm_plans"],
+th.th-per-call-metric[data-sort-key="qpm_plans"] {
+  min-width: 0;
+  width: 1%;
+  padding-left: 0.3rem;
+  padding-right: 0.3rem;
+}
+
+td.qpm-plans-cell {
+  padding-left: 0.3rem;
+  padding-right: 0.3rem;
+}

@@ -1317,6 +1317,1554 @@
   }
 
   /** ASH: same banner layout as delta pg_stat, but the interval is the snapshot’s ash_window, not time between snapshots. */
+  /* ------------------------------------------------------------------ *
+   * QPM: Query Plan Management (yb_pg_stat_plans) panel
+   * ------------------------------------------------------------------ */
+
+  /** A plan still counts as in use if its last_used is within this of the newest. */
+  const QPM_PLAN_ACTIVE_WINDOW_MS = 300000;
+  /** Below both of these, "fastest" is more likely sampling noise than a real win. */
+  const QPM_LOW_CONFIDENCE_CALLS = 50;
+  const QPM_LOW_CONFIDENCE_SHARE = 0.05;
+
+  /** Plan-node attributes worth printing under a node; anything else is noise here. */
+  const QPM_PLAN_DETAIL_KEYS = [
+    "Relation Name",
+    "Index Name",
+    "Index Cond",
+    "Hash Cond",
+    "Merge Cond",
+    "Join Filter",
+    "Storage Filter",
+    "Filter",
+    "Sort Key",
+    "Cache Key",
+  ];
+
+  /**
+   * Hints minus the Set(...) GUC boilerplate: a one-line shape fingerprint.
+   *
+   * QPM hints are ~19 clauses, of which ~18 are Set(...) planner settings identical
+   * across every plan of a query. What distinguishes two plans is the join/scan
+   * clauses, so those are all this keeps.
+   */
+  function qpmPlanShapeSignature(hints) {
+    if (hints == null) return "";
+    return String(hints)
+      .replace(/^\s*\/\*\+/, "")
+      .replace(/\*\/\s*$/, "")
+      .replace(/Set\([^)]*\)/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  // A type name as the deparser writes it after a constant: bigint, text[],
+  // timestamp without time zone, character varying(20), sch.enum_t, "Mixed".
+  const QPM_TYPE_NAME_SRC =
+    '(?:"(?:[^"]|"")*"\\.)?(?:"(?:[^"]|"")*"|bit varying|character varying|double precision'
+    + "|(?:time|timestamp)(?:\\(\\d+\\))? with(?:out)? time zone"
+    + "|[A-Za-z_][A-Za-z_0-9$]*(?:\\.[A-Za-z_][A-Za-z_0-9$]*)?)(?:\\(\\d+(?:,\\d+)?\\))?(?:\\[\\])*";
+  const QPM_MASK_CONST = new RegExp("'\\?'(?:::" + QPM_TYPE_NAME_SRC + ")?", "g");
+  const QPM_MASK_ARRAY = /ARRAY\[\?(?:, (?:\?|\.\.\.))*\]/g;
+  const QPM_MASK_CAST = new RegExp("\\(\\?\\)::" + QPM_TYPE_NAME_SRC, "g");
+
+  /**
+   * Plan text with every parameter and constant reduced to "?".
+   *
+   * QPM records a prepared statement's plan twice, under two planids: its first
+   * executions are planned with their values (a custom plan, where QPM writes
+   * '?'::bigint) and later ones generically ($1). An IN list is ARRAY[$1, $2]
+   * in the generic plan and one '?'::text[] constant in the custom one.
+   */
+  function qpmMaskPlanParams(text) {
+    return String(text == null ? "" : text)
+      .replace(QPM_MASK_CONST, "?")
+      .replace(/\$\d+/g, "?")
+      .replace(QPM_MASK_ARRAY, "?")
+      .replace(QPM_MASK_CAST, "?");
+  }
+
+  /**
+   * What makes two recorded plans one plan, for the panel and for pinning: the same
+   * hints, and the same text once parameters are masked. Null without the text.
+   */
+  function qpmPlanTwinKey(entry) {
+    if (!entry || entry.plan == null) return null;
+    return (entry.hints == null ? "" : String(entry.hints)) + "\u0000" + qpmMaskPlanParams(entry.plan);
+  }
+
+  /** qpmPlanTwinKey by plan_ref, each text masked once (they run to KBs). */
+  function qpmTwinKeysFor(texts) {
+    const memo = new Map();
+    return (ref) => {
+      const k = ref == null ? "" : String(ref);
+      if (!memo.has(k)) memo.set(k, k === "" ? null : qpmPlanTwinKey((texts || {})[k]));
+      return memo.get(k);
+    };
+  }
+
+  /**
+   * Why one card stands for several planids, naming each. The generic plan is the
+   * one whose text keeps more $N parameters (a custom plan has '?' in their place;
+   * batched nested loops add $N of their own to both).
+   */
+  function qpmVariantsNote(variants, texts, queryIdCount) {
+    const params = variants.map(
+      (v) => (String(((texts || {})[v.plan_ref] || {}).plan || "").match(/\$\d+/g) || []).length
+    );
+    // Across query_ids (a merged family) $N counts tell IN-list lengths apart, not
+    // custom from generic plans, so no labels there.
+    const several = (queryIdCount || 1) > 1;
+    const most = several ? 0 : Math.max.apply(null, params);
+    const least = several ? 0 : Math.min.apply(null, params);
+    const listed = variants.map((v, i) => {
+      const form = most > least ? (params[i] === most ? "generic plan, " : "custom plan, ") : "";
+      return v.planid + " (" + form + qpmCallsText(v.calls) + ", " + qpmFmtMs(v.avg_exec_time) + ")";
+    });
+    const refs = new Set(variants.map((v) => v.plan_ref));
+    let text = "One plan, recorded under " + variants.length + " planids: " + listed.join(" · ") + ".";
+    if (refs.size > 1) {
+      text +=
+        most > least
+          ? " They differ only in how the parameters appear: $1 in the generic plan, '?' in a custom"
+            + " plan, which PostgreSQL makes with the values for a prepared statement's first executions."
+          : " Their texts differ only in how parameter values are written.";
+    }
+    if (refs.size < variants.length) {
+      text +=
+        " Where the text is identical, the difference lives in cost and row estimates, which this"
+        + " text omits — set yb_pg_stat_plans_verbose_plans = on to see it.";
+    }
+    return text + (several
+      ? " The hints are the same, but a hint is pinned per query_id -- open one of its "
+        + queryIdCount + " query_ids to pin it."
+      : " The hints are the same, so one pin covers them all.");
+  }
+
+  /** Plans are keyed by queryid; a canonical family spans several, so union them. */
+  function qpmScopeQueryIds(queryId, canonicalFamily) {
+    const out = new Set();
+    if (canonicalFamily && canonicalFamily.queryIds && canonicalFamily.queryIds.forEach) {
+      canonicalFamily.queryIds.forEach((q) => out.add(String(q)));
+    }
+    if (queryId != null && String(queryId) !== "") out.add(String(queryId));
+    return out;
+  }
+
+  /**
+   * dbids carrying the drilldown's database name, from the snapshot's oid->name
+   * map. Returns a Set (possibly empty) to filter by, or null for no filter when
+   * the snapshot predates the map or the drilldown names no database.
+   *
+   * Without this the panel merged every database's plans for a queryid --
+   * including databases dropped long ago, which QPM keeps -- so "fastest" and
+   * "in use" could be judged against a database the query no longer runs in.
+   */
+  function qpmDbidsForName(qpmSection, dbname) {
+    const map = qpmSection && qpmSection.databases;
+    if (!map || dbname == null || String(dbname) === "") return null;
+    const out = new Set();
+    Object.keys(map).forEach((oid) => {
+      if (String(map[oid]) === String(dbname)) out.add(String(oid));
+    });
+    return out;
+  }
+
+  /**
+   * Databases the plan panel and a replay scope to. The drilldown's own, when it
+   * names one; otherwise the live ones, if the statement has plans in any. The
+   * busiest pg_stat_statements row can belong to a dropped database (pgss and QPM
+   * both keep them), and mixing its plans in made "fastest plan no longer in use"
+   * a dropped database's plan. No filter when only dropped databases have plans.
+   */
+  function qpmPanelDbids(qpmSection, dbname, queryIds) {
+    const named = qpmDbidsForName(qpmSection, dbname);
+    if (named) return named;
+    const map = qpmSection && qpmSection.databases;
+    if (!map) return null;
+    const live = new Set(Object.keys(map));
+    const perNode = (qpmSection && qpmSection.per_node) || {};
+    const inScope = (r) => r && (!queryIds || !queryIds.size || queryIds.has(String(r.queryid)));
+    const anyLive = Object.keys(perNode).some((nid) =>
+      (perNode[nid] || []).some((r) => inScope(r) && live.has(String(r.dbid)))
+    );
+    return anyLive ? live : null;
+  }
+
+  /** The queryids a statement row stands for: itself, or every member of a template row. */
+  function qpmRowQueryIds(r, templateMembers) {
+    if (!r) return [];
+    if (Array.isArray(r._tmpl_queryids) && r._tmpl_queryids.length) return r._tmpl_queryids.map(String);
+    if (Array.isArray(r.query_members) && r.query_members.length) {
+      return r.query_members.map((m) => String(m && m.query_id));
+    }
+    // A template row that a delta pass rebuilt without its members: find them by its
+    // template key (see qpmTemplateMembers).
+    const members = templateMembers ? templateMembers.get(statementMergeKey(r)) : null;
+    if (members && members.length) return members.map(String);
+    return r.queryid != null ? [String(r.queryid)] : [];
+  }
+
+  /**
+   * Template key -> member queryids, from the snapshot's own statements. The plans
+   * column counts a merged row's plans across its members, and must not depend on
+   * how a delta pass rebuilds grouped rows: one that subtracts collapsed rows drops
+   * their member list, one that collapses per-statement deltas keeps it.
+   */
+  function qpmTemplateMembers(mergedRows) {
+    const out = new Map();
+    collapseStatementsByTemplate(mergedRows).forEach((r) => out.set(statementMergeKey(r), r._tmpl_queryids || []));
+    return out;
+  }
+
+  /**
+   * "queryid|dbid" -> Set of plan keys, plus "queryid|*" across all databases.
+   * Same plan identity the drilldown groups by (qpmPlanTwinKey, else planid +
+   * plan_ref), so for a row in one database the count is the number of cards the
+   * drilldown shows for that database.
+   */
+  function qpmPlanIndex(qpmSection) {
+    const idx = new Map();
+    const add = (k, v) => {
+      let set = idx.get(k);
+      if (!set) {
+        set = new Set();
+        idx.set(k, set);
+      }
+      set.add(v);
+    };
+    const perNode = (qpmSection && qpmSection.per_node) || {};
+    const twinKey = qpmTwinKeysFor(qpmSection && qpmSection.plans);
+    Object.keys(perNode).forEach((nid) => {
+      (perNode[nid] || []).forEach((r) => {
+        if (!r || r.queryid == null) return;
+        const twin = twinKey(r.plan_ref);
+        const plan =
+          twin != null
+            ? "t" + twin
+            : "p" + String(r.planid == null ? "" : r.planid) + "|" + String(r.plan_ref == null ? "" : r.plan_ref);
+        add(String(r.queryid) + "|" + String(r.dbid == null ? "" : r.dbid), plan);
+        add(String(r.queryid) + "|*", plan);
+      });
+    });
+    return idx;
+  }
+
+  /**
+   * Pins and unpins made from this page: "dbid|queryid" -> { pinned, at }, with
+   * `at` on the server's clock. The collector only learns about a pin at its next
+   * checkpoint and the viewer keeps showing the snapshot you were reading, so
+   * without this a fresh pin did not show as P until a later snapshot landed and
+   * you moved to it.
+   */
+  const qpmPinEdits = new Map();
+
+  function qpmRecordPinEdit(dbid, queryid, pinned, serverMs) {
+    // The Date header has 1 s resolution; count the edit from the end of its
+    // second so a snapshot stamped within it is never taken to already include it.
+    const at = isFinite(serverMs) ? serverMs + 1000 : Date.now();
+    qpmPinEdits.set(String(dbid) + "|" + String(queryid), { pinned: !!pinned, at });
+  }
+
+  /**
+   * dbid -> Set(queryid): the snapshot's pinned map with this page's edits applied
+   * over it -- but only edits newer than the snapshot. A snapshot taken after an
+   * edit read the hint table itself, so it is already right.
+   */
+  function qpmEffectivePinned(qpmSection, snapshotUtcMs, edits) {
+    const out = new Map();
+    const raw = (qpmSection && qpmSection.pinned) || {};
+    Object.keys(raw).forEach((d) => out.set(String(d), new Set((raw[d] || []).map(String))));
+    (edits || qpmPinEdits).forEach((e, key) => {
+      if (isFinite(snapshotUtcMs) && snapshotUtcMs >= e.at) return;
+      const cut = key.indexOf("|");
+      const d = key.slice(0, cut);
+      const q = key.slice(cut + 1);
+      if (!out.has(d)) out.set(d, new Set());
+      if (e.pinned) out.get(d).add(q);
+      else out.get(d).delete(q);
+    });
+    return out;
+  }
+
+  /**
+   * Adds qpm_plans (distinct plans) and qpm_pinned to statement rows for the PGSS
+   * "plans" column: the row's own database when the snapshot can map its name,
+   * otherwise every database (a plan in two counts once), and all queryids a
+   * template row stands for. Where it can differ from the drilldown: that scopes a
+   * nameless row to live databases with a card per database, and a row's link
+   * names no database, so a statement that also runs in another database opens
+   * on its busiest one.
+   */
+  function annotateRowsWithQpmPlans(rows, qpmSection, pinnedByDbOverride, templateMembers) {
+    const idx = qpmPlanIndex(qpmSection);
+    const pinnedByDb = pinnedByDbOverride || qpmEffectivePinned(qpmSection, NaN, new Map());
+    return (rows || []).map((r) => {
+      const dbids = qpmDbidsForName(qpmSection, r && r.dbname);
+      const plans = new Set();
+      let pinned = false;
+      qpmRowQueryIds(r, templateMembers).forEach((q) => {
+        const keys = dbids ? Array.from(dbids, (d) => q + "|" + d) : [q + "|*"];
+        keys.forEach((k) => {
+          const set = idx.get(k);
+          if (set) set.forEach((pk) => plans.add(pk));
+        });
+        pinnedByDb.forEach((qs, d) => {
+          if ((!dbids || dbids.has(d)) && qs.has(q)) pinned = true;
+        });
+      });
+      return Object.assign({}, r, { qpm_plans: plans.size, qpm_pinned: pinned });
+    });
+  }
+
+  const QPM_PLANS_COL = {
+    key: "qpm_plans",
+    label: "plans",
+    type: "number",
+    align: "right",
+    title:
+      "Distinct plans Query Plan Management recorded for this statement in its database. "
+      + "P = a hint is pinned for it.",
+    // At equal counts a pinned statement sorts above an unpinned one.
+    sortValue: (r) => (Number(r && r.qpm_plans) || 0) + (r && r.qpm_pinned ? 0.5 : 0),
+  };
+
+  /** Statement columns with "plans" placed just before dbname (or last, if absent). */
+  function withQpmPlansColumn(cols) {
+    const out = (cols || []).slice();
+    const at = out.findIndex((c) => c && c.key === "dbname");
+    out.splice(at >= 0 ? at : out.length, 0, QPM_PLANS_COL);
+    return out;
+  }
+
+  /** "2" or "2 P", deliberately quiet: one plan is muted, blank when QPM saw none. */
+  function appendQpmPlansCell(td, row) {
+    td.classList.add("qpm-plans-cell");
+    const n = Number(row && row.qpm_plans) || 0;
+    if (n > 0) {
+      td.appendChild(
+        el("span", {
+          className: n > 1 ? "qpm-plans-n qpm-plans-n--multi" : "qpm-plans-n",
+          textContent: String(n),
+        })
+      );
+    }
+    if (row && row.qpm_pinned) {
+      td.appendChild(
+        el("span", { className: "qpm-plans-pin", textContent: "P", title: "A hint is pinned for this statement" })
+      );
+    }
+  }
+
+  /** Human label for a plan's database; a dbid missing from the map was dropped. */
+  function qpmDatabaseLabel(qpmSection, dbid) {
+    if (dbid == null || String(dbid) === "") return null;
+    const map = qpmSection && qpmSection.databases;
+    if (!map) return "oid " + dbid;
+    return map[String(dbid)] != null ? String(map[String(dbid)]) : "oid " + dbid + " (dropped)";
+  }
+
+  /**
+   * Fold per-node QPM rows into one group per distinct plan, fastest first.
+   *
+   * One group per plan as a user would count them (qpmPlanTwinKey): same hints and
+   * same text but for how parameters appear. QPM gives a prepared statement's
+   * custom and generic plans separate planids, and on a JDBC workload that made
+   * two cards -- and a "fastest plan" verdict -- out of nearly every statement.
+   * The planids behind a group are its `variants`, most calls first; the first
+   * stands for the group (planid, plan_ref: its text is shown and a pin names it).
+   * Without the text, planid + plan_ref: planid ignores FROM-list and AND-clause
+   * ordering, so one planid can carry two different rendered texts.
+   *
+   * avg_exec_time arrives as per-node averages and is recombined
+   * call-weighted. A plain mean of means misreports any plan whose calls are
+   * lopsided across nodes -- which is the normal case, since QPM is per-node.
+   */
+  function aggregateQpmPlans(qpmSection, queryIds, dbids) {
+    const perNode = (qpmSection && qpmSection.per_node) || {};
+    const twinKey = qpmTwinKeysFor(qpmSection && qpmSection.plans);
+    const byKey = new Map();
+    Object.keys(perNode).forEach((nid) => {
+      (perNode[nid] || []).forEach((r) => {
+        if (!r || r.queryid == null) return;
+        if (queryIds && queryIds.size && !queryIds.has(String(r.queryid))) return;
+        // A Set -- even an empty one -- is a strict database filter; null means none.
+        if (dbids && !dbids.has(String(r.dbid))) return;
+        const dbid = r.dbid == null ? "" : String(r.dbid);
+        const planid = String(r.planid == null ? "" : r.planid);
+        const ref = r.plan_ref == null ? "" : String(r.plan_ref);
+        const twin = twinKey(ref);
+        // Database is part of a plan's identity: stats, hint table and pin target
+        // are all per database, and the same queryid often runs in several.
+        const key = (twin != null ? "t" + twin : "p" + planid + "|" + ref) + "|" + dbid;
+        let g = byKey.get(key);
+        if (!g) {
+          g = {
+            planid,
+            plan_ref: ref,
+            dbid: dbid,
+            queryIds: new Set(),
+            nodes: [],
+            calls: 0,
+            _wsumAvg: 0,
+            _weight: 0,
+            _variants: new Map(),
+            max_exec_time: null,
+            first_used: null,
+            last_used: null,
+            max_exec_time_params: null,
+          };
+          byKey.set(key, g);
+        }
+        const calls = Number(r.calls) || 0;
+        const w = calls > 0 ? calls : 1;
+        g.calls += calls;
+        g._weight += w;
+        g.queryIds.add(String(r.queryid));
+        if (g.nodes.indexOf(nid) === -1) g.nodes.push(nid);
+        const avg = Number(r.avg_exec_time);
+        if (isFinite(avg)) g._wsumAvg += avg * w;
+        const vk = planid + "|" + ref;
+        let v = g._variants.get(vk);
+        if (!v) {
+          v = { planid, plan_ref: ref, calls: 0, _wsumAvg: 0, _weight: 0 };
+          g._variants.set(vk, v);
+        }
+        v.calls += calls;
+        v._weight += w;
+        if (isFinite(avg)) v._wsumAvg += avg * w;
+        const mx = Number(r.max_exec_time);
+        // The parameters travel with the max: QPM records them per node, for that
+        // node's slowest execution, so "slowest params" is the slowest node's.
+        if (isFinite(mx) && (g.max_exec_time == null || mx > g.max_exec_time)) {
+          g.max_exec_time = mx;
+          g.max_exec_time_params = r.max_exec_time_params ? String(r.max_exec_time_params) : null;
+        }
+        const fu = r.first_used ? Date.parse(r.first_used) : NaN;
+        if (isFinite(fu) && (g.first_used == null || fu < g.first_used)) g.first_used = fu;
+        const lu = r.last_used ? Date.parse(r.last_used) : NaN;
+        if (isFinite(lu) && (g.last_used == null || lu > g.last_used)) g.last_used = lu;
+      });
+    });
+    const groups = Array.from(byKey.values()).map((g) => {
+      const w = g._weight > 0 ? g._weight : 1;
+      g.avg_exec_time = g._wsumAvg / w;
+      g.variants = Array.from(g._variants.values())
+        .map((v) => ({
+          planid: v.planid,
+          plan_ref: v.plan_ref,
+          calls: v.calls,
+          avg_exec_time: v._wsumAvg / (v._weight > 0 ? v._weight : 1),
+        }))
+        .sort((a, b) => b.calls - a.calls || (a.planid < b.planid ? -1 : a.planid > b.planid ? 1 : 0));
+      g.planid = g.variants[0].planid;
+      g.plan_ref = g.variants[0].plan_ref;
+      delete g._wsumAvg;
+      delete g._weight;
+      delete g._variants;
+      return g;
+    });
+    // Hints fix scans, joins and join order -- not aggregation, sorting or where a
+    // filter runs -- so two different plans can share them, and a pin allows both.
+    const texts = (qpmSection && qpmSection.plans) || {};
+    const hintsKey = (g) => {
+      const h = (texts[g.plan_ref] || {}).hints;
+      return h == null ? null : g.dbid + "\u0000" + h;
+    };
+    const byHints = new Map();
+    groups.forEach((g) => {
+      const k = hintsKey(g);
+      if (k == null) return;
+      if (!byHints.has(k)) byHints.set(k, []);
+      byHints.get(k).push(g);
+    });
+    groups.forEach((g) => {
+      const k = hintsKey(g);
+      g.sameHintsAs = k == null ? [] : byHints.get(k).filter((o) => o !== g).map((o) => o.planid);
+    });
+    groups.sort((a, b) => a.avg_exec_time - b.avg_exec_time || b.calls - a.calls);
+    return groups;
+  }
+
+  /**
+   * Whether the fastest plan is the one actually serving traffic, plus the numbers
+   * the panel headline quotes. Mutates each group with `active`.
+   *
+   * "active" is judged against the newest last_used among this query's own plans,
+   * never against wall clock: a query that simply stopped running must not be
+   * reported as a plan regression.
+   *
+   *   single     -- only one plan on record, nothing to compare
+   *   ok         -- fastest plan is also the one taking the most calls
+   *   underused  -- fastest plan is live but a minority of calls run it
+   *   abandoned  -- fastest plan is no longer being used at all
+   */
+  function qpmPlanVerdict(groups) {
+    if (!groups || groups.length === 0) return null;
+    let newest = null;
+    groups.forEach((g) => {
+      if (g.last_used != null && (newest == null || g.last_used > newest)) newest = g.last_used;
+    });
+    groups.forEach((g) => {
+      g.active =
+        newest == null || g.last_used == null
+          ? false
+          : newest - g.last_used <= QPM_PLAN_ACTIVE_WINDOW_MS;
+    });
+    // planid can differ while the rendered plan is byte-identical: with
+    // yb_pg_stat_plans_verbose_plans off the text carries no costs or row
+    // estimates, and that is exactly where two such plans differ. With the text
+    // at hand they are one group (see aggregateQpmPlans); without it, flag them,
+    // or the panel shows two indistinguishable rows and reads as a bug.
+    const byRef = new Map();
+    groups.forEach((g) => {
+      if (!g.plan_ref) return;
+      const k = g.plan_ref + "|" + g.dbid;
+      if (!byRef.has(k)) byRef.set(k, []);
+      byRef.get(k).push(g);
+    });
+    groups.forEach((g) => {
+      g.sameTextAs = (byRef.get(g.plan_ref + "|" + g.dbid) || []).filter((o) => o !== g).map((o) => o.planid);
+    });
+    const totalCalls = groups.reduce((s, g) => s + (g.calls || 0), 0);
+    const fastest = groups[0];
+    const activeGroups = groups.filter((g) => g.active);
+    const pool = activeGroups.length ? activeGroups : groups;
+    let current = null;
+    pool.forEach((g) => {
+      if (current == null || (g.calls || 0) > (current.calls || 0)) current = g;
+    });
+    const fastestShare = totalCalls > 0 ? (fastest.calls || 0) / totalCalls : 0;
+    const slowerRatio =
+      current && fastest.avg_exec_time > 0 ? current.avg_exec_time / fastest.avg_exec_time : 1;
+    let status;
+    if (groups.length === 1) status = "single";
+    else if (!fastest.active) status = "abandoned";
+    else if (current === fastest) status = "ok";
+    else status = "underused";
+    return {
+      status,
+      fastest,
+      current,
+      totalCalls,
+      fastestShare,
+      slowerRatio,
+      planCount: groups.length,
+      activeCount: activeGroups.length,
+      newestLastUsed: newest,
+      // "Fastest" off a handful of calls is not a finding; say so rather than imply one.
+      lowConfidence:
+        (fastest.calls || 0) < QPM_LOW_CONFIDENCE_CALLS && fastestShare < QPM_LOW_CONFIDENCE_SHARE,
+    };
+  }
+
+  /** One-line summary for the panel header. */
+  function qpmVerdictHeadline(v) {
+    if (!v) return "";
+    const n = v.planCount;
+    const plural = n === 1 ? "1 plan" : n + " plans";
+    if (v.status === "single") return plural + " · no plan change recorded";
+    const ratio = v.slowerRatio >= 1.005 ? v.slowerRatio.toFixed(2) + "×" : null;
+    // A "fastest" measured on a handful of calls is what the ratio is against; say so here,
+    // not only inside the card.
+    const fastest =
+      "fastest plan"
+      + (v.lowConfidence ? " (" + qpmCallsText(v.fastest.calls || 0) + ", provisional)" : "");
+    if (v.status === "abandoned") {
+      return (
+        plural +
+        " · " + fastest + " no longer in use" +
+        (ratio ? " · current plan " + ratio + " slower" : "")
+      );
+    }
+    if (v.status === "underused") {
+      return (
+        plural +
+        " · " + fastest + " serves " +
+        Math.round(v.fastestShare * 100) +
+        "% of calls" +
+        (ratio ? " · current plan " + ratio + " slower" : "")
+      );
+    }
+    return plural + " · " + v.activeCount + " active · fastest plan is the one in use";
+  }
+
+  function qpmCallsText(n) {
+    return Number(n).toLocaleString() + (Number(n) === 1 ? " call" : " calls");
+  }
+
+  function qpmFmtMs(v) {
+    if (v == null || !isFinite(v)) return "—";
+    if (v >= 60000) return (v / 1000).toFixed(0) + " s";
+    if (v >= 1000) return (v / 1000).toFixed(2) + " s";
+    if (v >= 100) return v.toFixed(0) + " ms";
+    if (v >= 10) return v.toFixed(2) + " ms";
+    return v.toFixed(3) + " ms";
+  }
+
+  /** "2026-09-17 11:32" -- minute precision; seconds only cost column width here. */
+  function qpmFmtStamp(ms) {
+    return new Date(ms).toISOString().replace("T", " ").slice(0, 16);
+  }
+
+  /** Relative gap, rendered as a bare duration: call sites supply the "before X" framing. */
+  function qpmFmtAge(ms) {
+    if (ms == null || !isFinite(ms)) return "—";
+    const s = Math.max(0, Math.round(ms / 1000));
+    if (s < 90) return s + "s";
+    const m = Math.round(s / 60);
+    if (m < 90) return m + "m";
+    const h = Math.round(m / 60);
+    if (h < 48) return h + "h";
+    return Math.round(h / 24) + "d";
+  }
+
+  /** EXPLAIN-style indented tree from a QPM json plan payload. */
+  function qpmRenderPlanTree(planText) {
+    const pre = el("pre", { className: "qpm-tree" });
+    let root = null;
+    try {
+      root = JSON.parse(String(planText));
+    } catch (e) {
+      root = null;
+    }
+    if (root == null) {
+      pre.textContent = planText == null || String(planText) === "" ? "(no plan text)" : String(planText);
+      return pre;
+    }
+    const lines = [];
+    function walk(node, depth) {
+      if (!node || typeof node !== "object") return;
+      const pad = "  ".repeat(depth);
+      const type = node["Node Type"] == null ? "(node)" : String(node["Node Type"]);
+      let head = pad + (depth > 0 ? "-> " : "") + type;
+      if (node["Join Type"] && /Join|Nested Loop/.test(type)) head += " (" + node["Join Type"] + ")";
+      lines.push(head);
+      QPM_PLAN_DETAIL_KEYS.forEach((k) => {
+        if (node[k] == null) return;
+        const v = Array.isArray(node[k]) ? node[k].join(", ") : String(node[k]);
+        lines.push(pad + "     " + k + ": " + v);
+      });
+      (node.Plans || []).forEach((c) => walk(c, depth + 1));
+    }
+    (Array.isArray(root) ? root : [root]).forEach((e) => walk(e && e.Plan ? e.Plan : e, 0));
+    pre.textContent = lines.join("\n");
+    return pre;
+  }
+
+  /**
+   * True when max_exec_time_params carries at least one real value.
+   *
+   * With yb_pg_stat_plans_show_max_exec_params off (the default) every parameter
+   * renders as '?', so the column exists but says nothing; showing it only adds a
+   * row that looks like data.
+   */
+  function qpmParamsHaveValues(params) {
+    if (params == null || String(params) === "") return false;
+    return (
+      String(params)
+        .replace(/\$\d+\s*=\s*'\?'/g, "")
+        .replace(/[\s,]+/g, "").length > 0
+    );
+  }
+
+  function qpmBadge(text, kind) {
+    return el("span", { className: "qpm-badge qpm-badge--" + kind, textContent: text });
+  }
+
+  function qpmMetric(parent, key, value, extraClass) {
+    const row = el("div", { className: "qpm-metric" + (extraClass ? " " + extraClass : "") });
+    row.appendChild(el("span", { className: "qpm-metric-k", textContent: key }));
+    row.appendChild(el("span", { className: "qpm-metric-v", textContent: value }));
+    parent.appendChild(row);
+  }
+
+  /** One plan: a clickable summary line plus a body that expands. */
+  function qpmPlanCard(group, verdict, texts, index, clusterNodeCount, snapshotFile, queryId, reportDbname) {
+    const isFastest = group === verdict.fastest;
+    const isCurrent = verdict.current === group;
+    const openByDefault = isFastest;
+    const card = el("div", {
+      className: "qpm-card" + (isFastest ? " qpm-card--best" : ""),
+    });
+
+    const head = el("div", { className: "qpm-card-head", role: "button", tabindex: "0" });
+    const caret = el("span", { className: "qpm-caret", textContent: openByDefault ? "▾" : "▸" });
+    head.appendChild(caret);
+    if (isFastest) head.appendChild(qpmBadge("FASTEST", "best"));
+    const share = verdict.totalCalls > 0 ? Math.round((group.calls / verdict.totalCalls) * 100) : 0;
+    if (isCurrent) head.appendChild(qpmBadge("in use", "live"));
+    else if (!group.active) head.appendChild(qpmBadge("not in use", "stale"));
+    else head.appendChild(qpmBadge("minority use", "minor"));
+    head.appendChild(el("span", { className: "qpm-card-ms", textContent: qpmFmtMs(group.avg_exec_time) }));
+    head.appendChild(
+      el("span", {
+        className: "qpm-card-calls",
+        textContent: qpmCallsText(group.calls) + " · " + share + "%",
+      })
+    );
+    const sig = qpmPlanShapeSignature((texts[group.plan_ref] || {}).hints);
+    head.appendChild(
+      el("span", {
+        className: "qpm-card-shape",
+        textContent:
+          (group.sameTextAs && group.sameTextAs.length
+            ? "= same plan text · "
+            : group.sameHintsAs && group.sameHintsAs.length
+              ? "= same hints · "
+              : "") + (sig || "planid " + group.planid),
+        title: sig,
+      })
+    );
+    card.appendChild(head);
+
+    const body = el("div", { className: "qpm-card-body" });
+    body.hidden = !openByDefault;
+
+    if (isFastest && verdict.lowConfidence) {
+      body.appendChild(
+        el("div", {
+          className: "qpm-note qpm-note--warn",
+          textContent:
+            "Fastest by average over only " +
+            qpmCallsText(group.calls) +
+            " (" +
+            share +
+            "% of this query) — treat as provisional.",
+        })
+      );
+    }
+
+    const metrics = el("div", { className: "qpm-metrics" });
+    qpmMetric(metrics, "avg", qpmFmtMs(group.avg_exec_time));
+    qpmMetric(metrics, "max", qpmFmtMs(group.max_exec_time));
+    qpmMetric(metrics, "calls", group.calls.toLocaleString());
+    qpmMetric(
+      metrics,
+      "nodes",
+      group.nodes.length + (clusterNodeCount ? " of " + clusterNodeCount : "")
+    );
+    const variants = group.variants || [];
+    qpmMetric(
+      metrics,
+      variants.length > 1 ? "planids" : "planid",
+      group.planid + (variants.length > 1 ? " + " + (variants.length - 1) + " more" : "")
+    );
+    // The report's banner already names its database; say it here only when it doesn't.
+    if (group.dbLabel && group.dbLabel !== reportDbname) qpmMetric(metrics, "database", group.dbLabel);
+    if (group.first_used != null) {
+      qpmMetric(metrics, "first used", qpmFmtStamp(group.first_used));
+    }
+    if (group.last_used != null) {
+      const rel = verdict.newestLastUsed != null ? verdict.newestLastUsed - group.last_used : null;
+      qpmMetric(
+        metrics,
+        "last used",
+        qpmFmtStamp(group.last_used) +
+          (rel != null && rel > QPM_PLAN_ACTIVE_WINDOW_MS ? "  (" + qpmFmtAge(rel) + " before newest)" : "")
+      );
+    }
+    if (qpmParamsHaveValues(group.max_exec_time_params)) {
+      qpmMetric(metrics, "slowest params", group.max_exec_time_params, "qpm-metric--full");
+    }
+    body.appendChild(metrics);
+
+    if (variants.length > 1) {
+      body.appendChild(el("div", {
+        className: "qpm-note",
+        textContent: qpmVariantsNote(variants, texts, (group.queryIds && group.queryIds.size) || 1),
+      }));
+    }
+    if (group.sameTextAs && group.sameTextAs.length > 0) {
+      body.appendChild(
+        el("div", {
+          className: "qpm-note",
+          textContent:
+            "Identical plan text and hints to planid " +
+            group.sameTextAs.join(", ") +
+            ", yet QPM recorded a separate planid. The difference lives in cost and " +
+            "row estimates, which this text omits — set " +
+            "yb_pg_stat_plans_verbose_plans = on to see it.",
+        })
+      );
+    }
+
+    // Plans exist per node; say so when this one is not on all of them.
+    if (clusterNodeCount && group.nodes.length < clusterNodeCount) {
+      body.appendChild(
+        el("div", {
+          className: "qpm-note",
+          textContent:
+            "Recorded on " +
+            group.nodes.length +
+            " of " +
+            clusterNodeCount +
+            " nodes: " +
+            group.nodes.join(", "),
+        })
+      );
+    }
+
+    const entry = texts[group.plan_ref] || {};
+    body.appendChild(el("div", { className: "qpm-sub-k", textContent: "PLAN" }));
+    body.appendChild(qpmRenderPlanTree(entry.plan));
+
+    if (entry.hints) {
+      const hintWrap = el("details", { className: "qpm-hints" });
+      hintWrap.appendChild(el("summary", { textContent: "hints (pin this plan)" }));
+      hintWrap.appendChild(el("pre", { className: "qpm-tree", textContent: String(entry.hints) }));
+      // A hint is keyed by queryid, so a canonical family spanning several has no
+      // single pin target; offer pinning only when the plan maps to exactly one.
+      const pinTargets = Array.from(group.queryIds || []);
+      if (group.dbDropped) {
+        hintWrap.appendChild(
+          el("div", {
+            className: "qpm-note",
+            textContent:
+              "Recorded in a database that has since been dropped (" + group.dbLabel
+              + "), so there is nothing to pin into.",
+          })
+        );
+      } else if (pinTargets.length === 1) {
+        hintWrap.appendChild(qpmPinControls(group, pinTargets[0], snapshotFile, hintWrap));
+      } else if (pinTargets.length > 1) {
+        hintWrap.appendChild(
+          el("div", {
+            className: "qpm-note",
+            textContent:
+              "This plan is recorded under " + pinTargets.length + " query_ids, and a hint "
+              + "is pinned per query_id -- open a single query_id to pin it.",
+          })
+        );
+      }
+      body.appendChild(hintWrap);
+    }
+
+    card.appendChild(body);
+
+    function toggle() {
+      body.hidden = !body.hidden;
+      caret.textContent = body.hidden ? "▸" : "▾";
+      head.setAttribute("aria-expanded", body.hidden ? "false" : "true");
+    }
+    head.setAttribute("aria-expanded", openByDefault ? "true" : "false");
+    head.addEventListener("click", toggle);
+    head.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        toggle();
+      }
+    });
+    return card;
+  }
+
+  /* ---- collection toggle: see ybtop/control.py ---- */
+
+  const QPM_ENABLE_POLL_MS = 5000;
+  /* ~3 checkpoints at the default 60 s interval before we stop waiting. */
+  const QPM_ENABLE_GIVE_UP_MS = 180000;
+
+  /** Toggle state for this data directory, or null when the endpoint is unavailable. */
+  let qpmCollectionState = null;
+
+  async function qpmFetchCollectionState() {
+    try {
+      const res = await fetch("api/control", { cache: "no-store" });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function qpmSetCollection(on) {
+    const res = await fetch("api/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query_plans: !!on }),
+    });
+    let body = {};
+    try {
+      body = await res.json();
+    } catch (e) {
+      body = {};
+    }
+    if (!res.ok) throw new Error(body.error || "HTTP " + res.status);
+    qpmCollectionState = body;
+    return body;
+  }
+
+  /**
+   * What to show when the snapshot on screen carries no plans. Pure, so the
+   * state model is testable without a DOM.
+   *
+   * The snapshot alone cannot answer this: it only records whether plans were
+   * collected when IT was taken. After someone enables collection, every older
+   * snapshot still says "not collected", and the viewer stays pinned to the one
+   * you were reading -- so deciding from the snapshot alone offers "Enable" again
+   * on every navigation. The live toggle is the other half of the answer.
+   *
+   *   "unavailable" -- no control endpoint (files served without watch)
+   *   "locked"      -- toggle off and fixed by the collector (--no-snapshot-query-plans)
+   *   "readonly"    -- toggle off and this data directory cannot be written
+   *   "off"         -- toggle off: offer Enable
+   *   "enabling"    -- toggle on, on the newest snapshot, first plans not in yet
+   *   "predates"    -- toggle on, but this is an older snapshot from before it
+   */
+  function qpmCollectionOffState(state, viewingNewest) {
+    if (state == null) return "unavailable";
+    if (!state.query_plans) return state.locked ? "locked" : state.writable === false ? "readonly" : "off";
+    return viewingNewest ? "enabling" : "predates";
+  }
+
+  /** Header label for a panel that has plans: reflects the live toggle, not the click. */
+  function qpmCollectionHeaderLabel(state) {
+    if (state && state.locked && !state.query_plans) return "collection off \u00b7 locked";
+    return state && state.query_plans ? "disable collection" : "collection off \u00b7 enable";
+  }
+
+  function qpmViewingNewestSnapshot() {
+    return currentIndex >= 0 && currentIndex >= manifestEntries.length - 1;
+  }
+
+  /** Move to the newest snapshot -- what Last does -- after refreshing the manifest. */
+  async function qpmShowLatestSnapshot() {
+    try {
+      const fresh = await loadManifest();
+      if (Array.isArray(fresh) && fresh.length) manifestEntries = fresh;
+    } catch (e) {
+      /* use the manifest we already have */
+    }
+    if (manifestEntries.length) showSnapshotAt(manifestEntries.length - 1);
+  }
+
+  /**
+   * One wait-for-the-first-collected-snapshot for the whole page.
+   *
+   * Panels are rebuilt on every navigation, so a timer per panel multiplied and
+   * each one eventually reloaded the page, long after the user had moved on. Now
+   * an "enabling" panel just attaches here, and when the snapshot lands the page
+   * advances to it only if a waiting panel is still on screen -- advancing, not
+   * reloading, so the page keeps what it holds (this page's pins, open cards).
+   *
+   * A snapshot has landed when the manifest's newest file changes, not when the
+   * manifest grows: past its retention window each checkpoint adds one entry and
+   * GC drops one.
+   */
+  let qpmEnableWait = null;
+
+  function qpmNewestFile(entries) {
+    const last = Array.isArray(entries) && entries.length ? entries[entries.length - 1] : null;
+    return last && last.file ? String(last.file) : null;
+  }
+
+  function qpmWaitForCollectedSnapshot() {
+    if (qpmEnableWait) return qpmEnableWait;
+    const wait = { startNewest: qpmNewestFile(manifestEntries), t0: Date.now(), gaveUp: false };
+    qpmEnableWait = wait;
+    const tick = async () => {
+      let fresh = null;
+      try {
+        fresh = await loadManifest();
+      } catch (e) {
+        fresh = null;
+      }
+      const newest = qpmNewestFile(fresh);
+      if (newest && newest !== wait.startNewest) {
+        qpmEnableWait = null;
+        adoptManifest(fresh);
+        if (document.querySelector(".qpm-panel--enabling")) {
+          showSnapshotAt(manifestEntries.length - 1);
+        }
+        return;
+      }
+      if (Date.now() - wait.t0 > QPM_ENABLE_GIVE_UP_MS) {
+        wait.gaveUp = true;
+        // Not for the rest of the page's life: a panel drawn later waits afresh.
+        qpmEnableWait = null;
+        document.querySelectorAll(".qpm-panel--enabling").forEach(qpmMarkEnablingStalled);
+        return;
+      }
+      setTimeout(tick, QPM_ENABLE_POLL_MS);
+    };
+    setTimeout(tick, QPM_ENABLE_POLL_MS);
+    return wait;
+  }
+
+  function qpmMarkEnablingStalled(section) {
+    const note = section.querySelector(".qpm-enable-row .qpm-note");
+    if (note) {
+      note.className = "qpm-note qpm-note--warn";
+      note.textContent =
+        "Collection is on, but no new snapshot has arrived. Is `ybtop watch` running "
+        + "against this directory?";
+    }
+  }
+
+  /**
+   * Stands in for the plan panel when this snapshot has no plans, in whichever of
+   * the qpmCollectionOffState states applies. Rebuilt from state on every render,
+   * so it shows the same thing however the user got here.
+   */
+  function qpmCollectionOffPanel(state) {
+    const mode = qpmCollectionOffState(state, qpmViewingNewestSnapshot());
+    const section = el("section", {
+      className:
+        "ybtop-section qpm-panel qpm-panel--off" + (mode === "enabling" ? " qpm-panel--enabling" : ""),
+    });
+    const head = el("div", { className: "qpm-panel-head" });
+    head.appendChild(el("span", { className: "qpm-panel-title", textContent: "QUERY PLANS" }));
+    const verdict = el("span", { className: "qpm-panel-verdict" });
+    head.appendChild(verdict);
+    section.appendChild(head);
+    const body = el("div", { className: "qpm-panel-body" });
+    const row = el("div", { className: "qpm-enable-row" });
+    const note = el("span", { className: "qpm-note" });
+    body.appendChild(row);
+    section.appendChild(body);
+
+    if (mode === "enabling") {
+      verdict.className = "qpm-panel-verdict qpm-panel-verdict--enabling";
+      verdict.textContent = "enabling \u2014 plans start with the next checkpoint";
+      row.appendChild(el("span", { className: "qpm-spinner", "aria-hidden": "true" }));
+      note.textContent =
+        "Collection is on. The collector writes plans on its next checkpoint, and this "
+        + "view moves to that snapshot when it lands.";
+      row.appendChild(note);
+      if (qpmWaitForCollectedSnapshot().gaveUp) qpmMarkEnablingStalled(section);
+      return section;
+    }
+
+    if (mode === "predates") {
+      verdict.className = "qpm-panel-verdict qpm-panel-verdict--ok";
+      verdict.textContent = "collection on";
+      const latest = el("button", {
+        className: "qpm-enable-btn",
+        type: "button",
+        textContent: "Show latest snapshot",
+      });
+      latest.addEventListener("click", () => {
+        latest.disabled = true;
+        qpmShowLatestSnapshot();
+      });
+      note.textContent = "This snapshot was taken before plan collection was enabled.";
+      row.appendChild(latest);
+      row.appendChild(note);
+      return section;
+    }
+
+    verdict.textContent = "collection off for this data directory";
+    const btn = el("button", {
+      className: "qpm-enable-btn",
+      type: "button",
+      textContent: "Enable plan collection",
+    });
+    row.appendChild(btn);
+    row.appendChild(note);
+
+    if (mode === "unavailable" || mode === "readonly" || mode === "locked") {
+      btn.disabled = true;
+      note.className = "qpm-note qpm-note--warn";
+      note.textContent =
+        mode === "unavailable"
+          ? "This viewer is serving files without the control endpoint, so collection "
+            + "cannot be enabled from here. Restart the collector with --snapshot-query-plans."
+          : mode === "locked"
+            ? "The collector was started with " + qpmCollectionState.locked + ", which keeps "
+              + "plan collection off for this data directory."
+            : "This data directory is not writable, so collection cannot be enabled from "
+              + "here. Restart the collector with --snapshot-query-plans.";
+      return section;
+    }
+
+    note.textContent =
+      "Adds yb_pg_stat_plans to each snapshot (about +30% size). Takes effect on the "
+      + "collector's next checkpoint.";
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      btn.textContent = "Enabling\u2026";
+      try {
+        await qpmSetCollection(true);
+      } catch (e) {
+        btn.textContent = "Enable plan collection";
+        btn.disabled = false;
+        note.className = "qpm-note qpm-note--warn";
+        note.textContent = "Could not enable: " + (e.message || e);
+        return;
+      }
+      // Rebuild from the new state rather than patching this one: same code path
+      // as every later render, so what you see now is what you see after navigating.
+      section.replaceWith(qpmCollectionOffPanel(qpmCollectionState));
+    });
+    return section;
+  }
+
+  /** Tracking modes in which QPM actually records plans. */
+  const QPM_TRACK_MODES_ON = ["all", "top"];
+
+  /**
+   * Which QUERY PLANS block a snapshot calls for. Pure, so the guardrail is
+   * testable without a DOM.
+   *
+   *   "legacy"       -- snapshot predates the QPM section; nothing to reason about
+   *   "unsupported"  -- cluster has no yb_pg_stat_plans view
+   *   "tracking-off" -- view exists but yb_pg_stat_plans_track records nothing, so
+   *                     offering to enable collection would only write empty sets
+   *   "collection-off" -- QPM works and is tracking; ybtop just is not collecting
+   *   "plans"        -- section has data
+   */
+  function qpmPanelMode(qpm) {
+    if (!qpm) return "legacy";
+    if (qpm.supported === false) return "unsupported";
+    if (qpm.track != null && QPM_TRACK_MODES_ON.indexOf(String(qpm.track).toLowerCase()) < 0) {
+      return "tracking-off";
+    }
+    if (qpm.collected === false) return "collection-off";
+    return "plans";
+  }
+
+  /** Bare panel carrying one explanatory line and no controls. */
+  function qpmNoticePanel(statusText, detailText, warn) {
+    const section = el("section", { className: "ybtop-section qpm-panel qpm-panel--off" });
+    const head = el("div", { className: "qpm-panel-head" });
+    head.appendChild(el("span", { className: "qpm-panel-title", textContent: "QUERY PLANS" }));
+    head.appendChild(el("span", { className: "qpm-panel-verdict", textContent: statusText }));
+    section.appendChild(head);
+    if (detailText) {
+      const body = el("div", { className: "qpm-panel-body" });
+      body.appendChild(
+        el("div", {
+          className: warn ? "qpm-note qpm-note--warn" : "qpm-note",
+          textContent: detailText,
+        })
+      );
+      section.appendChild(body);
+    }
+    return section;
+  }
+
+  /** Query string naming one recorded plan -- the server resolves the database from it. */
+  function qpmPinQuery(target) {
+    return ["queryid", "planid", "plan_ref", "dbid", "file"]
+      .map((k) => k + "=" + encodeURIComponent(String(target[k] == null ? "" : target[k])))
+      .join("&");
+  }
+
+  async function qpmFetchPinState(target) {
+    try {
+      const res = await fetch("api/pin?" + qpmPinQuery(target), { cache: "no-store" });
+      if (!res.ok) return null;
+      return await res.json();
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Pin state per plan, for a minute: each ask costs the collector a snapshot parse and a
+  // database round trip. A pin, install or hint-table change drops its database's entries.
+  const QPM_PIN_STATE_TTL_MS = 60000;
+  const qpmPinStates = new Map();
+
+  function qpmPinStateKey(t) {
+    return [t.dbid, t.queryid, t.planid, t.plan_ref].join("|");
+  }
+
+  function qpmCachedPinState(target) {
+    const hit = qpmPinStates.get(qpmPinStateKey(target));
+    if (hit && Date.now() - hit.at < QPM_PIN_STATE_TTL_MS) return Promise.resolve(hit.state);
+    return qpmFetchPinState(target).then((st) => {
+      if (st) qpmPinStates.set(qpmPinStateKey(target), { state: st, at: Date.now() });
+      return st;
+    });
+  }
+
+  function qpmPinStateChanged(target, st) {
+    Array.from(qpmPinStates.keys()).forEach((k) => {
+      if (k.split("|")[0] === String(target.dbid)) qpmPinStates.delete(k);
+    });
+    if (st) qpmPinStates.set(qpmPinStateKey(target), { state: st, at: Date.now() });
+  }
+
+  async function qpmSetHinting(enable, target) {
+    const res = await fetch("api/hinting", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(Object.assign({ enable: !!enable }, target)),
+    });
+    let body = {};
+    try {
+      body = await res.json();
+    } catch (e) {
+      body = {};
+    }
+    if (!res.ok) throw new Error(body.error || "HTTP " + res.status);
+    return body;
+  }
+
+  async function qpmPostPin(route, payload) {
+    const res = await fetch("api/" + route, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    // Server clock, so edits compare against snapshot times without browser skew.
+    const serverMs = Date.parse(res.headers.get("Date") || "");
+    let body = {};
+    try {
+      body = await res.json();
+    } catch (e) {
+      body = {};
+    }
+    if (!res.ok) throw new Error(body.error || "HTTP " + res.status);
+    body._serverMs = serverMs;
+    return body;
+  }
+
+  /**
+   * Why a pinned hint would not change any plans yet.
+   *
+   * Inserting the row is not enough: pg_hint_plan only consults the hint table
+   * when enable_hint_table is on, and only matches ybtop's queryid keys when
+   * yb_use_query_id_for_hinting is on. Both are read here from the seed node, and
+   * both must hold for the sessions whose plans you want changed -- setting them
+   * in ybtop's own session does nothing for the application.
+   */
+  function qpmPinEffectWarnings(prereq) {
+    const out = [];
+    if (!prereq) return out;
+    if (prereq.enable_hint_table === false) out.push("pg_hint_plan.enable_hint_table is off");
+    if (prereq.use_query_id_for_hinting === false) {
+      out.push("pg_hint_plan.yb_use_query_id_for_hinting is off");
+    }
+    return out;
+  }
+
+  /**
+   * What the pin row offers, from /api/pin state. Pure, so it is testable.
+   *   "ready"        -- hint table exists: Pin / Remove / hint-table toggle
+   *   "installable"  -- pg_hint_plan ships but is not created here: Install
+   *   "unavailable"  -- pinning is off, or cannot work on this cluster: say why
+   */
+  function qpmPinRowMode(st) {
+    if (!st) return "unavailable";
+    if (st.available) return "ready";
+    if (st.installable) return "installable";
+    return "unavailable";
+  }
+
+  /**
+   * Every pin-row button's state, from /api/pin state alone. Pure, and applied in
+   * full on every redraw: Remove disables itself when clicked, and a redraw that
+   * only un-hid it left it dead after Pin -> Remove -> Pin on the same page.
+   */
+  function qpmPinButtonStates(st) {
+    const mode = qpmPinRowMode(st);
+    const ready = mode === "ready";
+    return {
+      install: { hidden: mode !== "installable", disabled: false },
+      pin: { hidden: false, disabled: !ready },
+      remove: { hidden: !(ready && st.pinned), disabled: false },
+      guc: { hidden: !ready, disabled: false, enable: ready && qpmPinEffectWarnings(st.prereq).length > 0 },
+    };
+  }
+
+  /**
+   * Pin / remove controls under a plan's hints (`details`); they ask the collector
+   * for the pin state only once that is opened.
+   *
+   * The request names which recorded plan to pin (snapshot file + queryid + planid
+   * + plan_ref); the hint text itself is read server-side from that snapshot, so
+   * the browser never supplies the SQL payload.
+   */
+  function qpmPinControls(group, queryIdForPin, snapshotFile, details) {
+    // Everything the server needs to find this exact recorded plan, database included.
+    const target = {
+      queryid: String(queryIdForPin),
+      planid: String(group.planid),
+      plan_ref: String(group.plan_ref),
+      dbid: String(group.dbid || ""),
+      file: String(snapshotFile || ""),
+    };
+    const wrap = el("div", { className: "qpm-pin-row" });
+    const status = el("span", { className: "qpm-note" });
+    // A query_id covers the statement exactly as the application sends it: the same
+    // SQL with literal values (typed into ysqlsh, say) or other parameter types is a
+    // different query_id, which the pin does not touch.
+    const pinBtn = el("button", {
+      className: "qpm-enable-btn",
+      type: "button",
+      textContent: "Pin this plan",
+      title:
+        "Pins this plan for query_id " + queryIdForPin + " in this database, for every "
+        + "application and role that runs it: the statement as the application sends it. The "
+        + "same SQL with literal values, or with other parameter types, is a different query_id "
+        + "and keeps its own plan.",
+    });
+    const rmBtn = el("button", {
+      className: "qpm-enable-btn qpm-enable-btn--danger",
+      type: "button",
+      textContent: "Remove pinned hint",
+    });
+    rmBtn.hidden = true;
+    // Turning hint-table lookup on changes plan selection for every new session in
+    // the database, so it is its own control rather than a side effect of pinning.
+    const gucBtn = el("button", {
+      className: "qpm-enable-btn",
+      type: "button",
+      textContent: "Enable hint table",
+      title:
+        "ALTER DATABASE ... SET pg_hint_plan.enable_hint_table = on and "
+        + "yb_use_query_id_for_hinting = on. Applies to new sessions.",
+    });
+    gucBtn.hidden = true;
+    // Replaces what used to be an instruction to go run CREATE EXTENSION by hand.
+    const installBtn = el("button", {
+      className: "qpm-enable-btn",
+      type: "button",
+      textContent: "Install pg_hint_plan",
+      title: "CREATE EXTENSION pg_hint_plan in this database",
+    });
+    installBtn.hidden = true;
+    wrap.appendChild(installBtn);
+    wrap.appendChild(pinBtn);
+    wrap.appendChild(rmBtn);
+    wrap.appendChild(gucBtn);
+    wrap.appendChild(status);
+
+    function applyState(st) {
+      const mode = qpmPinRowMode(st);
+      const b = qpmPinButtonStates(st);
+      [[installBtn, b.install], [pinBtn, b.pin], [rmBtn, b.remove], [gucBtn, b.guc]].forEach(([btn, v]) => {
+        btn.hidden = v.hidden;
+        btn.disabled = v.disabled;
+      });
+      if (mode !== "ready") {
+        status.className = "qpm-note";
+        status.textContent =
+          mode === "installable"
+            ? "pg_hint_plan isn't installed in " + ((st && st.database) || "this database")
+              + " yet. Installing it creates an empty hint table; no plan changes until "
+              + "you pin one."
+            : (st && st.reason) || "Pinning is not available from this viewer.";
+        return;
+      }
+      const warnings = qpmPinEffectWarnings(st.prereq);
+      // Offer the fix only while it is needed; offer the undo once it is not.
+      if (b.guc.enable) {
+        gucBtn.textContent = "Enable hint table";
+        gucBtn.className = "qpm-enable-btn";
+        gucBtn.dataset.enable = "1";
+      } else {
+        gucBtn.textContent = "Disable hint table";
+        gucBtn.className = "qpm-enable-btn qpm-enable-btn--danger";
+        gucBtn.dataset.enable = "0";
+      }
+      if (st.pinned) {
+        status.className = warnings.length ? "qpm-note qpm-note--warn" : "qpm-note";
+        status.textContent =
+          "A hint is pinned for query_id " + queryIdForPin + " in " + (st.database || "this database") + "."
+          + (warnings.length
+            ? " It will not change any plans while " + warnings.join(" and ")
+              + " for your application's sessions."
+            : "");
+      } else {
+        status.className = warnings.length ? "qpm-note qpm-note--warn" : "qpm-note";
+        status.textContent = warnings.length
+          ? "Pinning will insert the hint, but it cannot take effect while "
+            + warnings.join(" and ") + " for your application's sessions."
+          : "Pins this plan for query_id " + queryIdForPin + " in "
+            + (st.database || "this database") + ", for every application and role that runs it.";
+      }
+    }
+
+    async function act(route, btn, label) {
+      const was = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = label;
+      try {
+        const st = await qpmPostPin(route, target);
+        qpmPinStateChanged(target, st);
+        qpmRecordPinEdit(target.dbid, target.queryid, st.pinned, st._serverMs);
+        btn.textContent = was;
+        applyState(st);
+      } catch (e) {
+        btn.textContent = was;
+        btn.disabled = false;
+        status.className = "qpm-note qpm-note--warn";
+        status.textContent = String(e.message || e);
+      }
+    }
+
+    installBtn.addEventListener("click", async () => {
+      installBtn.disabled = true;
+      installBtn.textContent = "Installing\u2026";
+      try {
+        const st = await qpmPostPin("hint-plan/install", target);
+        qpmPinStateChanged(target, st);
+        installBtn.textContent = "Install pg_hint_plan";
+        applyState(st);
+      } catch (e) {
+        installBtn.textContent = "Install pg_hint_plan";
+        installBtn.disabled = false;
+        status.className = "qpm-note qpm-note--warn";
+        status.textContent = String(e.message || e);
+      }
+    });
+    pinBtn.addEventListener("click", () => act("pin", pinBtn, "Pinning\u2026"));
+    rmBtn.addEventListener("click", () => act("unpin", rmBtn, "Removing\u2026"));
+    gucBtn.addEventListener("click", async () => {
+      const turningOn = gucBtn.dataset.enable === "1";
+      const was = gucBtn.textContent;
+      gucBtn.disabled = true;
+      gucBtn.textContent = turningOn ? "Enabling\u2026" : "Disabling\u2026";
+      try {
+        const res = await qpmSetHinting(turningOn, target);
+        const db = (res.applied && res.applied.database) || "this database";
+        qpmPinStateChanged(target, null);
+        const fresh = await qpmCachedPinState(target);
+        applyState(fresh);
+        status.className = "qpm-note";
+        status.textContent =
+          (turningOn
+            ? "Hint table enabled on " + db + "."
+            : "Hint table disabled on " + db + ".")
+          + " This applies to sessions started from now on -- existing connections, "
+          + "and backends held by a pooler such as YSQL Connection Manager, keep the "
+          + "old setting until they are recycled.";
+      } catch (e) {
+        gucBtn.disabled = false;
+        gucBtn.textContent = was;
+        status.className = "qpm-note qpm-note--warn";
+        status.textContent = String(e.message || e);
+      }
+    });
+
+    pinBtn.disabled = true;
+    gucBtn.hidden = true;
+    let asked = false;
+    const ask = () => {
+      if (asked || !details.open) return;
+      asked = true;
+      status.textContent = "Checking hint table\u2026";
+      qpmCachedPinState(target).then(applyState);
+    };
+    details.addEventListener("toggle", ask);
+    ask();
+    return wrap;
+  }
+
+  /**
+   * Collection on/off control in the header of a panel that has plans. Its label
+   * is derived from the live toggle every time it is drawn, so after "disable" it
+   * still says "off" when the user navigates away and back.
+   */
+  function qpmCollectionHeaderControl() {
+    const btn = el("button", { className: "qpm-panel-off-btn", type: "button" });
+    function paint() {
+      const on = !!(qpmCollectionState && qpmCollectionState.query_plans);
+      const locked = !on && !!(qpmCollectionState && qpmCollectionState.locked);
+      btn.textContent = qpmCollectionHeaderLabel(qpmCollectionState);
+      btn.disabled = locked;
+      btn.title = locked
+        ? "Kept off by the collector's " + qpmCollectionState.locked
+        : on
+          ? "Stop writing yb_pg_stat_plans into new snapshots"
+          : "Collect yb_pg_stat_plans again from the next checkpoint";
+      btn.classList.toggle("qpm-panel-off-btn--off", !on);
+    }
+    paint();
+    btn.addEventListener("click", async () => {
+      const on = !!(qpmCollectionState && qpmCollectionState.query_plans);
+      btn.disabled = true;
+      try {
+        await qpmSetCollection(!on);
+        btn.title = on
+          ? "Off from the next checkpoint; snapshots already taken keep their plans"
+          : "On from the next checkpoint";
+      } catch (e) {
+        btn.title = "Could not change collection: " + String(e.message || e);
+      }
+      btn.disabled = false;
+      const title = btn.title;
+      paint();
+      btn.title = title;
+    });
+    return btn;
+  }
+
+  /**
+   * Whether a drilldown gets a QUERY PLANS block at all. QPM records YSQL plans
+   * only, and a cluster without it -- or a snapshot from a ybtop that did not
+   * collect it -- has nothing to say there.
+   */
+  function qpmPanelApplies(doc, queryId, canonicalFamily) {
+    const mode = qpmPanelMode(doc && doc.yb_pg_stat_plans);
+    if (mode === "legacy" || mode === "unsupported") return false;
+    if (canonicalFamily) return canonicalFamily.source !== "ycql";
+    const has = (sec) => Object.values((sec && sec.per_node) || {})
+      .some((rows) => (rows || []).some((r) => r && String(r.queryid) === String(queryId)));
+    return has(doc.pg_stat_statements) || !has(doc.ycql_stat_statements);
+  }
+
+  /**
+   * The QUERY PLANS block for a scoped ASH drilldown where QPM applies: without plans,
+   * the collection-off panel or the tracking-off notice; null when none are on record.
+   */
+  function qpmPlansPanel(doc, queryId, canonicalFamily, clusterNodeCount, snapshotFile, dbname) {
+    if (!qpmPanelApplies(doc, queryId, canonicalFamily)) return null;
+    const qpm = doc.yb_pg_stat_plans;
+    const mode = qpmPanelMode(qpm);
+    if (mode === "collection-off") return qpmCollectionOffPanel(qpmCollectionState);
+    if (mode === "tracking-off") {
+      // Offer the fix, not a button that would only ever collect empty plan sets.
+      return qpmNoticePanel(
+        "plan tracking is disabled on this cluster"
+          + (qpm.track ? " (yb_pg_stat_plans_track = " + qpm.track + ")" : ""),
+        "QPM records nothing until yb_pg_stat_plans_track is 'all' (every statement) or "
+          + "'top' (top-level statements only). Set it in the cluster's YSQL "
+          + "configuration -- for example ysql_pg_conf_csv=yb_pg_stat_plans_track=all -- "
+          + "then plan collection can be enabled here.",
+        true
+      );
+    }
+    const scopeQids = qpmScopeQueryIds(queryId, canonicalFamily);
+    const groups = aggregateQpmPlans(qpm, scopeQids, qpmPanelDbids(qpm, dbname, scopeQids));
+    groups.forEach((g) => {
+      g.dbLabel = qpmDatabaseLabel(qpm, g.dbid);
+      g.dbDropped = /\(dropped\)$/.test(String(g.dbLabel || ""));
+    });
+    if (groups.length === 0) return null;
+    const verdict = qpmPlanVerdict(groups);
+    const texts = qpm.plans || {};
+
+    const section = el("section", { className: "ybtop-section qpm-panel" });
+    const head = el("div", { className: "qpm-panel-head" });
+    const toggleBtn = el("button", { className: "qpm-panel-toggle", type: "button" });
+    head.appendChild(toggleBtn);
+    head.appendChild(el("span", { className: "qpm-panel-title", textContent: "QUERY PLANS" }));
+    head.appendChild(
+      el("span", {
+        className: "qpm-panel-verdict qpm-panel-verdict--" + verdict.status,
+        textContent: qpmVerdictHeadline(verdict),
+      })
+    );
+    if (qpmCollectionState && qpmCollectionState.writable !== false) {
+      head.appendChild(qpmCollectionHeaderControl());
+    }
+    section.appendChild(head);
+
+    const body = el("div", { className: "qpm-panel-body" });
+    groups.forEach((g, i) =>
+      body.appendChild(
+        qpmPlanCard(g, verdict, texts, i, clusterNodeCount, snapshotFile, queryId, dbname)
+      )
+    );
+    section.appendChild(body);
+    // Collapsed until opened, like the report's other sections; the headline stays visible.
+    wireSubsectionCollapse(section, "sec-qpm-plans", body, toggleBtn);
+    return section;
+  }
+
   function ashWindowActivityBanner(doc, file) {
     const w = doc && doc.ash_window;
     if (
@@ -3119,6 +4667,7 @@
       }
       th.textContent = col.label != null ? String(col.label) : String(col.key);
     }
+    if (col.title) th.title = String(col.title);
     if (col.sortable === false) {
       th.classList.add("th-no-sort");
     }
@@ -3229,6 +4778,8 @@
             } else {
               appendQueryCell(td, v);
             }
+          } else if (col.key === "qpm_plans") {
+            appendQpmPlansCell(td, row);
           } else if (col.key === "per_node_counts") {
             appendTabletCountStripCell(td, v);
           } else if (col.key === "load_pct" || col.key === "time_pct") {
@@ -3518,6 +5069,8 @@
               navigateToAshForQueryId(row.queryid);
             });
             td.appendChild(a);
+          } else if (col.key === "qpm_plans") {
+            appendQpmPlansCell(td, row);
           } else if (col.key === "per_node_counts") {
             appendTabletCountStripCell(td, v);
           } else if (col.key === "load_pct" || col.key === "time_pct") {
@@ -5030,16 +6583,24 @@
         })
       );
 
-      const pgSummary = mergeSimilarSql ? statementTemplateSummaryRows(baseRows) : [];
+      // "plans" column appears only once collection has produced plans for this snapshot.
+      const pgssQpm = doc.yb_pg_stat_plans;
+      const pgssShowPlans = qpmPanelMode(pgssQpm) === "plans";
+      let pgSummary = mergeSimilarSql ? statementTemplateSummaryRows(baseRows) : [];
+      const pgssPinned = pgssShowPlans
+        ? qpmEffectivePinned(pgssQpm, Date.parse(doc.generated_at_utc || ""))
+        : null;
+      if (pgssShowPlans) pgSummary = annotateRowsWithQpmPlans(pgSummary, pgssQpm, pgssPinned);
       if (showRecurringTemplates && pgSummary.length) {
+        const summaryCols = statementTemplateSummaryColumns({
+          callsPerSec: isDelta,
+          dbname: pgSummary.some((r) => Object.prototype.hasOwnProperty.call(r, "dbname")),
+        });
         panelPgss.appendChild(
           buildSortableTable(
             `Recurring query templates (${pgSummary.length})`,
             pgSummary,
-            statementTemplateSummaryColumns({
-              callsPerSec: isDelta,
-              dbname: pgSummary.some((r) => Object.prototype.hasOwnProperty.call(r, "dbname")),
-            }),
+            pgssShowPlans ? withQpmPlansColumn(summaryCols) : summaryCols,
             "sec-pgss-templates",
             { ashQueryTextLinks: true, canonicalizeFamily: true },
             STATEMENT_TEMPLATE_SUMMARY_SORT
@@ -5094,6 +6655,12 @@
           : "Top 25 — pg_stat_statements";
       }
 
+      if (pgssShowPlans) {
+        pgRows = annotateRowsWithQpmPlans(
+          pgRows, pgssQpm, pgssPinned, mergeSimilarSql ? qpmTemplateMembers(merged) : null
+        );
+        pgCols = withQpmPlansColumn(pgCols);
+      }
       panelPgss.appendChild(
         buildSortablePaginatedTable(pgTitle, pgRows, pgCols, 25, "sec-pgss-main", pgSort, {
           unifyStatementHeaders: true,
@@ -5378,6 +6945,22 @@
         note.appendChild(row);
         appendAshScopedQueryStatementLines(note, doc, prevDoc, qF, ash, canonicalFamily);
         panelAsh.appendChild(note);
+        const qpmRowDb = !canonicalFamily && st ? mergedStatementRowForQuery(st, mergeStatements, qF) : null;
+        const qpmPanel = qpmPlansPanel(
+          doc,
+          qF,
+          canonicalFamily,
+          ashSnapshotClusterNodeCount(doc, ash),
+          currentIndex >= 0 && manifestEntries[currentIndex]
+            ? manifestEntries[currentIndex].file
+            : null,
+          canonicalFamily && canonicalFamily.dbname
+            ? canonicalFamily.dbname
+            : qpmRowDb && qpmRowDb.dbname
+              ? qpmRowDb.dbname
+              : null
+        );
+        if (qpmPanel) panelAsh.appendChild(qpmPanel);
       }
       const ashClusterNodes = ashSnapshotClusterNodeCount(doc, ash);
       const ashShowNodeLoadDist = ashClusterNodes > 1 && !nodeF;
@@ -6008,31 +7591,40 @@
    * snapshot file when possible (so a new arrival doesn't yank them off the window they're reading).
    * Chart + nav controls are re-rendered after; the active doc itself is not refetched.
    */
+  /** Take a fresh manifest while staying on the snapshot on screen, whose index can move. */
+  function adoptManifest(fresh) {
+    const prevFile =
+      currentIndex >= 0 && manifestEntries[currentIndex]
+        ? manifestEntries[currentIndex].file
+        : null;
+    manifestEntries = fresh;
+    currentIndex = prevFile
+      ? manifestEntries.findIndex((e) => e && e.file === prevFile)
+      : manifestEntries.length - 1;
+    const btnPrev = document.getElementById("btn-prev");
+    const btnNext = document.getElementById("btn-next");
+    const btnFirst = document.getElementById("btn-first");
+    const btnLast = document.getElementById("btn-last");
+    if (btnPrev) btnPrev.disabled = currentIndex <= 0;
+    if (btnNext) btnNext.disabled = currentIndex < 0 || currentIndex >= manifestEntries.length - 1;
+    if (btnFirst) btnFirst.disabled = currentIndex <= 0;
+    if (btnLast) btnLast.disabled = currentIndex < 0 || currentIndex >= manifestEntries.length - 1;
+    const ent = currentIndex >= 0 ? manifestEntries[currentIndex] : null;
+    updateNavDisplay(currentIndex >= 0 ? currentIndex : 0, manifestEntries.length, ent, lastDoc);
+    renderWindowChart();
+  }
+
   async function refreshManifest() {
     if (manifestRefreshInFlight) return;
     manifestRefreshInFlight = true;
     try {
       const fresh = await loadManifest();
+      // Another tab (or person) may have flipped plan collection; re-learn it here.
+      qpmFetchCollectionState().then((st) => {
+        if (st) qpmCollectionState = st;
+      });
       if (!Array.isArray(fresh) || !fresh.length) return;
-      const prevFile =
-        currentIndex >= 0 && manifestEntries[currentIndex]
-          ? manifestEntries[currentIndex].file
-          : null;
-      manifestEntries = fresh;
-      currentIndex = prevFile
-        ? manifestEntries.findIndex((e) => e && e.file === prevFile)
-        : manifestEntries.length - 1;
-      const btnPrev = document.getElementById("btn-prev");
-      const btnNext = document.getElementById("btn-next");
-      const btnFirst = document.getElementById("btn-first");
-      const btnLast = document.getElementById("btn-last");
-      if (btnPrev) btnPrev.disabled = currentIndex <= 0;
-      if (btnNext) btnNext.disabled = currentIndex < 0 || currentIndex >= manifestEntries.length - 1;
-      if (btnFirst) btnFirst.disabled = currentIndex <= 0;
-      if (btnLast) btnLast.disabled = currentIndex < 0 || currentIndex >= manifestEntries.length - 1;
-      const ent = currentIndex >= 0 ? manifestEntries[currentIndex] : null;
-      updateNavDisplay(currentIndex >= 0 ? currentIndex : 0, manifestEntries.length, ent, lastDoc);
-      renderWindowChart();
+      adoptManifest(fresh);
     } catch (_e) {
       /* ignore transient manifest fetch failures; retry on the next tick. */
     } finally {
@@ -6244,6 +7836,7 @@
         updateAshFilterToolbar();
       }
     });
+    qpmCollectionState = await qpmFetchCollectionState();
     try {
       manifestEntries = await loadManifest();
     } catch (e) {
