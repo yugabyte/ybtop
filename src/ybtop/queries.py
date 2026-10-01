@@ -476,7 +476,6 @@ def yb_pg_stat_plans_rows(
         p.avg_est_cost::float8 AS avg_est_cost,
         p.first_used AS first_used,
         p.last_used AS last_used,
-        p.max_exec_time_params::text AS max_exec_time_params,
         p.plan::text AS plan,
         p.hints::text AS hints
     FROM yb_pg_stat_plans p

@@ -54,6 +54,8 @@ class QpmRowsQueryTest(unittest.TestCase):
         )
         Q.yb_pg_stat_plans_rows(_Conn(seen), 10)
         self.assertEqual(seen["params"]["top"], [])
+        # Recorded parameter values are application data; nothing here uses them.
+        self.assertNotIn("max_exec_time_params", seen["sql"])
 
     def test_collect_passes_the_nodes_top_queryids(self):
         passed = {}
@@ -92,6 +94,60 @@ class QpmRowsQueryTest(unittest.TestCase):
             (snapshot_write.connect, Q.pg_stat_statements_top, Q.ycql_stat_statements_top,
              Q.ash_aggregated, Q.yb_local_tablets_rows, Q.yb_pg_stat_plans_rows) = saved
         self.assertEqual(passed["args"], (2000, ["11", "-22"]))
+
+
+class QpmStatusTest(unittest.TestCase):
+    """The seed connection for QPM status: every checkpoint only while plans are collected."""
+
+    def setUp(self):
+        self.calls = {"connect": 0, "status": 0, "databases": 0}
+        self.saved = (snapshot_write.connect, Q.qpm_status, Q.database_names,
+                      snapshot_write.QPM_STATUS_OFF_MAX_AGE_S)
+        snapshot_write._qpm_status_cache.clear()
+
+        @contextlib.contextmanager
+        def fake_connect(dsn):
+            self.calls["connect"] += 1
+            yield object()
+
+        def fake_status(conn):
+            self.calls["status"] += 1
+            return {"view_present": True, "track": "all"}
+
+        def fake_databases(conn):
+            self.calls["databases"] += 1
+            return {"16640": "app"}
+
+        snapshot_write.connect, Q.qpm_status, Q.database_names = fake_connect, fake_status, fake_databases
+
+    def tearDown(self):
+        (snapshot_write.connect, Q.qpm_status, Q.database_names,
+         snapshot_write.QPM_STATUS_OFF_MAX_AGE_S) = self.saved
+        snapshot_write._qpm_status_cache.clear()
+
+    @staticmethod
+    def caps(qpm):
+        return Capabilities(pg_stat_use_exec_time=True, yb_ash_range_function=True, pg_stat_docdb_metrics=False,
+                            pg_stat_latency_histogram=False, qpm_stat_plans=qpm)
+
+    def test_a_cluster_without_qpm_is_not_asked(self):
+        self.assertEqual(snapshot_write._qpm_status_for_snapshot("dsn", self.caps(False), True), ({}, {}))
+        self.assertEqual(self.calls["connect"], 0)
+
+    def test_collecting_reads_status_and_names_every_checkpoint(self):
+        for _ in range(3):
+            st, dbs = snapshot_write._qpm_status_for_snapshot("dsn", self.caps(True), True)
+        self.assertEqual((st["track"], dbs), ("all", {"16640": "app"}))
+        self.assertEqual(self.calls, {"connect": 3, "status": 3, "databases": 3})
+
+    def test_off_reads_status_now_and_then_and_never_the_names(self):
+        for _ in range(3):
+            st, dbs = snapshot_write._qpm_status_for_snapshot("dsn", self.caps(True), False)
+        self.assertEqual((st["track"], dbs), ("all", {}))  # the viewer still sees track
+        self.assertEqual(self.calls, {"connect": 1, "status": 1, "databases": 0})
+        snapshot_write.QPM_STATUS_OFF_MAX_AGE_S = 0.0
+        snapshot_write._qpm_status_for_snapshot("dsn", self.caps(True), False)
+        self.assertEqual(self.calls["status"], 2)
 
 
 if __name__ == "__main__":

@@ -127,6 +127,19 @@ class GuardedEndpointTest(unittest.TestCase):
         finally:
             H.allowed_host_flag = saved
 
+    def test_an_unguarded_bind_refuses_the_collection_switch(self):
+        H = serve.YbtopHTTPRequestHandler
+        H.bind_host = "0.0.0.0"  # no --serve-allowed-host: any Host is accepted
+        self.assertFalse(json.loads(self.request("/api/control")[1])["writable"])
+        status, text = self.request("/api/control", {"query_plans": True})
+        self.assertEqual(status, 403)
+        self.assertIn("--serve-allowed-host", json.loads(text)["error"])
+        self.assertFalse(self.toggle())
+        H.allowed_hosts = frozenset({"ybtop.example"})
+        self.assertTrue(json.loads(self.request("/api/control")[1])["writable"])
+        self.assertEqual(self.request("/api/control", {"query_plans": True})[0], 200)
+        self.assertTrue(self.toggle())
+
     def test_a_rebound_host_is_refused(self):
         rebound = {"Host": "evil.example:8765"}
         status, text = self.request("/api/control", headers=rebound)
@@ -164,6 +177,7 @@ class SnapshotLoadTest(unittest.TestCase):
             f.write(gzip.compress(raw))
         # A handler with no request behind it: these methods only read the class state.
         self.h = serve.YbtopHTTPRequestHandler.__new__(serve.YbtopHTTPRequestHandler)
+        serve.YbtopHTTPRequestHandler._snapshot_cache = None
 
     def tearDown(self):
         H = serve.YbtopHTTPRequestHandler
@@ -175,6 +189,16 @@ class SnapshotLoadTest(unittest.TestCase):
         packed = self.h._load_snapshot("ybtop.out.20260925_130100.json.gz")
         self.assertEqual(plain, _qpm_doc())
         self.assertEqual(packed, plain)
+
+    def test_a_snapshot_is_parsed_once_until_it_changes(self):
+        name = "ybtop.out.20260925_130100.json.gz"
+        first = self.h._load_snapshot(name)
+        self.assertIs(self.h._load_snapshot(name), first)  # each pin GET asks again
+        changed = _qpm_doc()
+        changed["yb_pg_stat_plans"]["databases"]["16641"] = "other"
+        with open(os.path.join(self.tmp.name, name), "wb") as f:
+            f.write(gzip.compress(json.dumps(changed).encode()))
+        self.assertEqual(self.h._load_snapshot(name)["yb_pg_stat_plans"]["databases"]["16641"], "other")
 
     def test_only_files_in_the_data_directory(self):
         for name in ("", "../x.json", "sub/x.json", "missing.json", "ybtop.out.20260925_130000.json/.."):

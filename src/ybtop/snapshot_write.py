@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -444,6 +445,42 @@ def _collect_nodes_parallel(
     return statements_out, ycql_out, ash_out, tablets_out, histograms_out, query_plans_out
 
 
+# While plan collection is off, QPM status only feeds the viewer's switch to turn it
+# on, so it is re-read at most this often instead of on its own connection every
+# checkpoint.
+QPM_STATUS_OFF_MAX_AGE_S = 600.0
+_qpm_status_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def _qpm_status_for_snapshot(
+    seed_dsn: str, caps: Capabilities, collecting: bool
+) -> "tuple[dict[str, Any], dict[str, str]]":
+    """(QPM status, dbid -> name) for this checkpoint's yb_pg_stat_plans section.
+
+    Read fresh every checkpoint while plans are collected: an operator can change
+    yb_pg_stat_plans_track at any time and the viewer's guardrail must notice.
+    The database names are only needed with plans. A cluster without QPM is
+    never asked.
+    """
+    if not caps.qpm_stat_plans:
+        return {}, {}
+    cached = _qpm_status_cache.get(seed_dsn)
+    if not collecting and cached and time.monotonic() - cached[0] < QPM_STATUS_OFF_MAX_AGE_S:
+        return cached[1], {}
+    status: dict[str, Any] = {}
+    databases: dict[str, str] = {}
+    with stage_timer("qpm_status", _log):
+        try:
+            with connect(seed_dsn) as conn:
+                status = Q.qpm_status(conn)
+                if collecting:
+                    databases = Q.database_names(conn)
+            _qpm_status_cache[seed_dsn] = (time.monotonic(), status)
+        except Exception as exc:  # noqa: BLE001 - status is advisory; never fail a snapshot
+            log_event(_log, "qpm_status_failed", level=logging.WARNING, error=str(exc))
+    return status, databases
+
+
 def _build_snapshot_document_impl(
     *,
     seed_dsn: str,
@@ -480,17 +517,7 @@ def _build_snapshot_document_impl(
     with stage_timer("detect_capabilities", _log):
         caps = detect_capabilities(seed_dsn)
 
-    # Read fresh every checkpoint, not from cached Capabilities: an operator can change
-    # yb_pg_stat_plans_track at any time and the viewer's guardrail must notice.
-    qpm_st: dict[str, Any] = {}
-    qpm_databases: dict[str, str] = {}
-    with stage_timer("qpm_status", _log):
-        try:
-            with connect(seed_dsn) as conn:
-                qpm_st = Q.qpm_status(conn)
-                qpm_databases = Q.database_names(conn)
-        except Exception as exc:  # noqa: BLE001 - status is advisory; never fail a snapshot
-            log_event(_log, "qpm_status_failed", level=logging.WARNING, error=str(exc))
+    qpm_st, qpm_databases = _qpm_status_for_snapshot(seed_dsn, caps, bool(query_plans))
     qpm_track = str(qpm_st.get("track") or "").lower()
     # track=none means QPM records nothing, so the per-node fan-out would return
     # empty rows on every node. Skip it rather than pay 6 round trips for nothing.

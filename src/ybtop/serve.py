@@ -245,10 +245,26 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
         root = type(self).data_dir
         state: dict[str, object] = dict(read_control(root))
         # The viewer needs to know whether enabling can even be persisted: an
-        # archive directory served read-only will reject the write.
-        state["writable"] = os.access(str(root), os.W_OK)
+        # archive directory served read-only will reject the write, and an
+        # unguarded viewer refuses it (_collection_switch_problem).
+        state["writable"] = os.access(str(root), os.W_OK) and self._collection_switch_problem() is None
         state["locked"] = read_control_locks(root).get("query_plans")
         return state
+
+    def _collection_switch_problem(self) -> "str | None":
+        """Why the page may not switch plan collection, or None.
+
+        A viewer bound to a non-loopback address with no --serve-allowed-host names
+        accepts any Host, so a DNS-rebinding page is same-origin with it.
+        """
+        cls = type(self)
+        if _is_loopback(_host_name(cls.bind_host)) or cls.allowed_hosts:
+            return None
+        return (
+            "Switching plan collection from this page is refused: the viewer is bound to %s "
+            "without %s NAME, so it cannot tell its own pages from a DNS-rebinding one. List "
+            "the host names it is reached by, or bind it to 127.0.0.1." % (cls.bind_host, cls.allowed_host_flag)
+        )
 
     def _pinning_unavailable_reason(self) -> "str | None":
         """Why pinning cannot be offered, or None when it can."""
@@ -293,11 +309,17 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
         state["database"] = target["datname"]
         return state
 
+    # The last snapshot parsed for the API, by (path, mtime, size): the page asks
+    # about one snapshot's plans many times, and a parse is the cost of each ask.
+    _snapshot_cache: "tuple[tuple[str, int, int], dict] | None" = None
+    _snapshot_cache_lock = threading.Lock()
+
     def _load_snapshot(self, file_name: str) -> "dict | None":
         """Parse one of our own snapshot files, or None. Never sends a response.
 
         Resolved here rather than via _resolve_static, which sends a 404 as a side
         effect -- that would commit a response before the caller picks its own.
+        The document may be shared with other requests: read it, never change it.
         """
         if not file_name or "/" in file_name or ".." in file_name:
             return None
@@ -309,15 +331,25 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
             return None
         if not path.is_file():
             return None
+        cls = YbtopHTTPRequestHandler
         try:
+            st = path.stat()
+            key = (str(path), st.st_mtime_ns, st.st_size)
+            with cls._snapshot_cache_lock:
+                if cls._snapshot_cache is not None and cls._snapshot_cache[0] == key:
+                    return cls._snapshot_cache[1]
             raw = path.read_bytes()
             if file_name.endswith(".gz"):
                 import gzip
 
                 raw = gzip.decompress(raw)
-            return json.loads(raw.decode("utf-8"))
+            doc = json.loads(raw.decode("utf-8"))
         except (OSError, ValueError, UnicodeDecodeError):
             return None
+        if isinstance(doc, dict):
+            with cls._snapshot_cache_lock:
+                cls._snapshot_cache = (key, doc)
+        return doc
 
     def _resolve_plan_target(self, fields: dict) -> "tuple[dict | None, str | None, int]":
         """Validate a pin-row request and resolve the recorded plan it names.
@@ -484,6 +516,10 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
             return
         if route == "/api/hint-plan/install":
             self._handle_install_hint_plan(body)
+            return
+        problem = self._collection_switch_problem()
+        if problem is not None:
+            self._send_json({"error": problem}, 403)
             return
         unknown = sorted(set(body) - set(CONTROL_DEFAULTS))
         if unknown:
