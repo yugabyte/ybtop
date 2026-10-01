@@ -19,6 +19,9 @@ DEFAULT_SNAPSHOT_OUTPUT_DIR = "."
 DEFAULT_SNAPSHOT_RETENTION_HOURS = 3.0
 SNAPSHOT_STATEMENTS_PER_NODE = 200
 SNAPSHOT_ASH_PER_NODE = 1000
+# QPM rows per node. Generous vs the 5000-entry default cache: plan text is
+# content-deduped, so extra rows cost ~80 bytes each, not a copy of the plan.
+SNAPSHOT_QUERY_PLANS_PER_NODE = 2000
 SNAPSHOT_ASH_TOP_TABLES = 25
 MANIFEST_FILENAME = "ybtop.manifest.json"
 SNAPSHOT_FILE_PREFIX = "ybtop.out."
@@ -51,6 +54,11 @@ class Settings:
     snapshot_ash_top_tables: int = SNAPSHOT_ASH_TOP_TABLES
     snapshot_collect_table_ddl: bool = False
     snapshot_latency_histograms: bool = False
+    # None = use the data directory's saved toggle (see ybtop.control).
+    snapshot_query_plans: Optional[bool] = None
+    snapshot_query_plans_per_node: int = SNAPSHOT_QUERY_PLANS_PER_NODE
+    # Lets the viewer write pg_hint_plan rows; off unless the operator opts in.
+    allow_plan_pinning: bool = False
     snapshot_latency_analysis: bool = False
     snapshot_compress: bool = False
     log_enabled: bool = True

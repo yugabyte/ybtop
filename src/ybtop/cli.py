@@ -17,6 +17,7 @@ from rich.text import Text
 
 from ybtop import __version__
 from ybtop import collect
+from ybtop.control import read_control, read_control_locks, write_control
 from ybtop.config import (
     DEFAULT_ASH_WINDOW_MINUTES,
     DEFAULT_LOG_BACKUP_COUNT,
@@ -32,6 +33,7 @@ from ybtop.config import (
     DEFAULT_YSQL_PORT,
     DEFAULT_YSQL_USER,
     SNAPSHOT_ASH_PER_NODE,
+    SNAPSHOT_QUERY_PLANS_PER_NODE,
     SNAPSHOT_ASH_TOP_TABLES,
     SNAPSHOT_STATEMENTS_PER_NODE,
     Settings,
@@ -117,11 +119,42 @@ def _maybe_write_latency_analysis(
         log_event(log, "latency_analysis_error", level=logging.WARNING, error=str(exc))
 
 
+def apply_query_plans_flag(out_dir: Path, flag: "bool | None") -> None:
+    """Record watch's plan-collection flag in the data directory's toggle file.
+
+    An explicit flag sets the saved toggle; without one the viewer's last choice for
+    this directory persists across collector restarts. --no-snapshot-query-plans
+    also locks it, so the viewer cannot switch collection back on; a run without
+    that flag lifts a lock an earlier run left.
+    """
+    if flag is None and not read_control_locks(out_dir):
+        return
+    write_control(
+        out_dir,
+        {} if flag is None else {"query_plans": bool(flag)},
+        locks={"query_plans": "--no-snapshot-query-plans"} if flag is False else {},
+    )
+
+
+def query_plans_wanted(out_dir: Path, flag: "bool | None") -> bool:
+    """Collect plans this checkpoint? The toggle file, unless the flag forbade it.
+
+    Re-read every tick: this is what lets the viewer's button take effect on the
+    next checkpoint instead of needing a restart. --no-snapshot-query-plans wins
+    even over a file someone rewrote after startup.
+    """
+    return flag is not False and read_control(out_dir)["query_plans"]
+
+
 def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
     console = Console()
     out_dir = Path(settings.snapshot_output_dir)
     watch_log = get_logger("watch")
     iteration = 0
+    try:
+        apply_query_plans_flag(out_dir, settings.snapshot_query_plans)
+    except OSError as exc:
+        log_event(watch_log, "control_write_failed", level=logging.WARNING, error=str(exc))
     log_event(watch_log, "watch_started", output_dir=str(out_dir.resolve()))
     with Live(
         console=console,
@@ -150,6 +183,7 @@ def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
                     )
                 try:
                     ash_start, ash_end = resolve_ash_range(settings)
+                    want_query_plans = query_plans_wanted(out_dir, settings.snapshot_query_plans)
                     doc = build_snapshot_document(
                         seed_dsn=settings.seed_dsn,
                         ash_start=ash_start,
@@ -160,6 +194,8 @@ def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
                         ash_top_tables=settings.snapshot_ash_top_tables,
                     collect_table_ddl=settings.snapshot_collect_table_ddl,
                     latency_histograms=settings.snapshot_latency_histograms,
+                    query_plans=want_query_plans,
+                    query_plans_per_node=settings.snapshot_query_plans_per_node,
                     node_parallelism=settings.node_parallelism,
                 )
                     snap_path = write_snapshot_and_update_manifest(output_dir=out_dir, document=doc, compress=settings.snapshot_compress)
@@ -403,6 +439,54 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     w.add_argument(
+        "--snapshot-query-plans",
+        dest="snapshot_query_plans",
+        action="store_true",
+        default=None,
+        help=(
+            "Collect Query Plan Management history (yb_pg_stat_plans) into each snapshot "
+            "(default: off). Plan and hint text is content-deduped into a shared dictionary "
+            "and scoped to the pg_stat_statements top-N, costing roughly 30%% of a snapshot. "
+            "The viewer can turn this on per data directory without a restart, so the flag "
+            "is only needed to have it on from the first checkpoint. "
+            "No-op on clusters without QPM (YugabyteDB 2025.2.3+)."
+        ),
+    )
+    w.add_argument(
+        "--no-snapshot-query-plans",
+        dest="snapshot_query_plans",
+        action="store_false",
+        default=None,
+        help=(
+            "Never collect QPM plan history, ignoring the viewer's toggle for this "
+            "data directory."
+        ),
+    )
+    w.add_argument(
+        "--snapshot-query-plans-per-node",
+        type=int,
+        default=SNAPSHOT_QUERY_PLANS_PER_NODE,
+        metavar="N",
+        help=(
+            "Max QPM rows per node per snapshot, most-recently-used first. A runaway guard, "
+            "not a top-N: truncating can split a query's plan set, so the viewer flags it."
+        ),
+    )
+    w.add_argument(
+        "--allow-plan-pinning",
+        action="store_true",
+        help=(
+            "Let the viewer pin and unpin query plans, writing rows to "
+            "pg_hint_plan's hint_plan.hints table on this cluster (default: off). "
+            "The viewer has no authentication, so only enable this when you are the "
+            "only user of this machine. Pinning also needs the pg_hint_plan "
+            "extension created, and pg_hint_plan.enable_hint_table plus "
+            "pg_hint_plan.yb_use_query_id_for_hinting set ON for the sessions whose "
+            "plans you want changed -- setting them only in ybtop's session has no "
+            "effect on your application."
+        ),
+    )
+    w.add_argument(
         "--snapshot-latency-histograms",
         action="store_true",
         help=(
@@ -456,6 +540,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_SERVE_PORT,
         help="HTTP listen port for the embedded viewer.",
+    )
+    v.add_argument(
+        "--serve-allowed-host",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help=(
+            "A host name the viewer is reached by (repeatable). Requests carrying any "
+            "other Host header are refused, which stops DNS-rebinding pages. Loopback "
+            "names are always allowed; a loopback-bound viewer allows only them by default."
+        ),
     )
     lg = w.add_argument_group("logging")
     lg.add_argument(
@@ -522,6 +617,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SERVE_PORT,
         help="Listen port for HTTP.",
     )
+    serve_p.add_argument(
+        "--allowed-host",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="A host name the viewer is reached by (repeatable); see watch --serve-allowed-host.",
+    )
     return p
 
 
@@ -567,6 +669,12 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
             getattr(args, "snapshot_ash_top_tables", SNAPSHOT_ASH_TOP_TABLES)
         ),
         snapshot_collect_table_ddl=bool(getattr(args, "snapshot_table_ddl", False)),
+        # None = leave the data directory's saved toggle alone (viewer owns it).
+        snapshot_query_plans=getattr(args, "snapshot_query_plans", None),
+        allow_plan_pinning=bool(getattr(args, "allow_plan_pinning", False)),
+        snapshot_query_plans_per_node=int(
+            getattr(args, "snapshot_query_plans_per_node", SNAPSHOT_QUERY_PLANS_PER_NODE)
+        ),
         # --snapshot-latency-analysis needs the histograms in the snapshot, so it implies collection.
         snapshot_latency_histograms=bool(getattr(args, "snapshot_latency_histograms", False))
         or bool(getattr(args, "snapshot_latency_analysis", False)),
@@ -586,7 +694,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.command == "serve":
         from ybtop.serve import run_serve
 
-        run_serve(data_dir=args.data_dir, host=args.bind, port=args.port)
+        run_serve(data_dir=args.data_dir, host=args.bind, port=args.port, allowed_hosts=args.allowed_host)
         return
 
     settings = _settings_from_args(args)
@@ -602,12 +710,23 @@ def main(argv: Optional[list[str]] = None) -> None:
         else:
             init_logging(log_path=None)
         if not args.no_serve:
-            from ybtop.serve import start_serve_background
+            from ybtop.serve import _allowed, start_serve_background, unguarded_bind_problem
 
+            problem = unguarded_bind_problem(
+                args.serve_bind,
+                _allowed(getattr(args, "serve_allowed_host", None)),
+                ["--allow-plan-pinning"] if settings.allow_plan_pinning else [],
+            )
+            if problem:
+                print("ybtop: " + problem, file=sys.stderr, flush=True)
+                raise SystemExit(2)
             if not start_serve_background(
                 data_dir=settings.snapshot_output_dir,
                 host=args.serve_bind,
                 port=int(args.serve_port),
+                seed_dsn=settings.seed_dsn,
+                allow_plan_pinning=settings.allow_plan_pinning,
+                allowed_hosts=getattr(args, "serve_allowed_host", None),
             ):
                 tail = (
                     "Use --no-serve to run the terminal dashboard without HTTP."

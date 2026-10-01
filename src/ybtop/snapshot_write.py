@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import contextvars
 import glob
+import hashlib
 import gzip
 import json
+import logging
 import os
 import re
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -16,10 +19,12 @@ from typing import Any, Optional
 
 import psycopg.conninfo
 
+from ybtop import pinscan
 from ybtop import queries as Q
 from ybtop.capabilities import Capabilities, detect_capabilities
 from ybtop.config import (
     DEFAULT_NODE_PARALLELISM,
+    SNAPSHOT_QUERY_PLANS_PER_NODE,
     LATENCY_ANALYSIS_FILE_PREFIX,
     MANIFEST_FILENAME,
     SNAPSHOT_FILE_PREFIX,
@@ -147,6 +152,8 @@ def build_snapshot_document(
     ash_top_tables: int = 25,
     collect_table_ddl: bool = False,
     latency_histograms: bool = False,
+    query_plans: bool = False,
+    query_plans_per_node: int = SNAPSHOT_QUERY_PLANS_PER_NODE,
     node_parallelism: int = DEFAULT_NODE_PARALLELISM,
 ) -> dict[str, Any]:
     with stage_timer("build_snapshot", _log, scope_total=True):
@@ -161,8 +168,117 @@ def build_snapshot_document(
                 ash_top_tables=ash_top_tables,
                 collect_table_ddl=collect_table_ddl,
                 latency_histograms=latency_histograms,
+                query_plans=query_plans,
+                query_plans_per_node=query_plans_per_node,
                 node_parallelism=node_parallelism,
             )
+
+
+PLAN_REF_LEN = 16
+
+
+def _plan_ref(plan_text: str, hints_text: str) -> str:
+    """Content digest of one plan's rendered text, used as its dictionary key."""
+    h = hashlib.sha1()
+    h.update(plan_text.encode("utf-8", "replace"))
+    h.update(b"\x00")
+    h.update(hints_text.encode("utf-8", "replace"))
+    return h.hexdigest()[:PLAN_REF_LEN]
+
+
+def _statement_queryids(statements_per_node: dict[str, list[dict[str, Any]]]) -> set[str]:
+    """Cluster-wide union of queryids in the snapshot's pg_stat_statements top-N."""
+    out: set[str] = set()
+    for rows in (statements_per_node or {}).values():
+        for r in rows or []:
+            if isinstance(r, dict) and r.get("queryid") is not None:
+                out.add(str(r["queryid"]))
+    return out
+
+
+def _scope_and_dedupe_plans(
+    plans_per_node: dict[str, list[dict[str, Any]]],
+    keep_queryids: Optional[set[str]] = None,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, str]]]:
+    """Lift plan/hints text out of the per-node rows into one shared dictionary.
+
+    Keyed on a digest of the text, deliberately NOT on planid: planid ignores
+    FROM-list and AND-clause ordering, so one planid can carry several distinct
+    rendered texts (measured: 1 planid in 679 on this 6-node cluster, differing
+    only in AND-clause order). Keying by planid would hand one query another
+    query's plan text, silently.
+
+    Plan text is immutable for a given digest, so this dedupes across nodes and
+    across queryids sharing a plan.
+
+    `keep_queryids` scopes rows to the queryids in this snapshot's
+    pg_stat_statements top-N -- the only ones the viewer can drill into. QPM
+    tracks every statement the node has seen, so on this cluster only ~25% of
+    its queryids were reachable; keeping the rest stored plan text for queries
+    no page can open. Scoping is applied to the cluster-wide union, not per
+    node, so a plan that exists on only one node is still kept (that divergence
+    is the point of collecting per node).
+
+    Measured on a 6-node cluster: 2405 rows / 581 plans / 2.48 MB unscoped,
+    versus 1263 rows / 175 plans / 0.95 MB scoped, against a 3.22 MB baseline.
+    """
+    texts: dict[str, dict[str, str]] = {}
+    slim_per_node: dict[str, list[dict[str, Any]]] = {}
+    for nid, rows in plans_per_node.items():
+        slim_rows: list[dict[str, Any]] = []
+        for raw in rows or []:
+            if keep_queryids is not None:
+                qid = raw.get("queryid") if isinstance(raw, dict) else None
+                if qid is None or str(qid) not in keep_queryids:
+                    continue
+            row = dict(raw)
+            plan_text = row.pop("plan", None) or ""
+            hints_text = row.pop("hints", None) or ""
+            if plan_text == "" and hints_text == "":
+                row["plan_ref"] = None
+            else:
+                ref = _plan_ref(plan_text, hints_text)
+                if ref not in texts:
+                    texts[ref] = {"plan": plan_text, "hints": hints_text}
+                row["plan_ref"] = ref
+            slim_rows.append(row)
+        slim_per_node[nid] = slim_rows
+    return slim_per_node, texts
+
+
+# Never hold user data; skipping them saves a connection each per checkpoint.
+_PIN_SCAN_SKIP_DATABASES = frozenset({"template0", "template1"})
+
+
+def _collect_pinned_queryids(
+    seed_dsn: str,
+    statements_per_node: dict[str, list[dict[str, Any]]],
+    databases: dict[str, str],
+) -> dict[str, list[str]]:
+    """dbid -> queryids with a pinned hint, for the databases the statements ran in.
+
+    Hint tables are per database; ybtop.pinscan does the per-database reads in
+    parallel and skips databases recently seen without a hint table. Advisory, so
+    a failing database is logged and skipped, never raised.
+    """
+    oid_for_name = {name: oid for oid, name in (databases or {}).items()}
+    names = sorted(
+        {
+            str(r["dbname"])
+            for rows in (statements_per_node or {}).values()
+            for r in rows or []
+            if isinstance(r, dict) and r.get("dbname")
+        }
+        - _PIN_SCAN_SKIP_DATABASES
+    )
+    return pinscan.scan_pinned(
+        seed_dsn,
+        names,
+        oid_for_name,
+        on_error=lambda name, exc: log_event(
+            _log, "hint_table_pins_failed", level=logging.WARNING, database=name, error=str(exc)
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -173,6 +289,7 @@ class _NodeCollectResult:
     ash: list[dict[str, Any]]
     tablets: list[dict[str, Any]]
     latency_histograms: list[dict[str, Any]]
+    query_plans: list[dict[str, Any]]
 
 
 def _collect_one_node(
@@ -187,11 +304,15 @@ def _collect_one_node(
     statements_per_node: int,
     ash_per_node: int,
     collect_latency_histograms: bool,
+    collect_query_plans: bool,
+    query_plans_per_node: int,
 ) -> _NodeCollectResult:
     nid = node_id(node)
     dsn = dsn_for_node(seed_dsn, node)
     latency_histograms: list[dict[str, Any]] = []
+    query_plans: list[dict[str, Any]] = []
     want_hist = collect_latency_histograms and caps.pg_stat_latency_histogram
+    want_plans = collect_query_plans and caps.qpm_stat_plans
     with stage_timer("collect_node", _log, node_id=nid, node_total=True, node_count=node_count):
         with connect(dsn) as conn:
             with stage_timer("pg_stat_statements_top", _log, node_id=nid) as st:
@@ -224,6 +345,16 @@ def _collect_one_node(
             with stage_timer("yb_local_tablets_rows", _log, node_id=nid) as st:
                 tablets = _serialize_rows(Q.yb_local_tablets_rows(conn))
                 st.row_count = len(tablets)
+            if want_plans:
+                with stage_timer("yb_pg_stat_plans_rows", _log, node_id=nid) as st:
+                    query_plans = _serialize_rows(
+                        Q.yb_pg_stat_plans_rows(
+                            conn,
+                            query_plans_per_node,
+                            [r["queryid"] for r in pg_stat if r.get("queryid") is not None],
+                        )
+                    )
+                    st.row_count = len(query_plans)
     return _NodeCollectResult(
         nid=nid,
         pg_stat=pg_stat,
@@ -231,6 +362,7 @@ def _collect_one_node(
         ash=ash,
         tablets=tablets,
         latency_histograms=latency_histograms,
+        query_plans=query_plans,
     )
 
 
@@ -245,8 +377,11 @@ def _collect_nodes_parallel(
     statements_per_node: int,
     ash_per_node: int,
     collect_latency_histograms: bool,
+    collect_query_plans: bool,
+    query_plans_per_node: int,
     node_parallelism: int,
 ) -> tuple[
+    dict[str, list[dict[str, Any]]],
     dict[str, list[dict[str, Any]]],
     dict[str, list[dict[str, Any]]],
     dict[str, list[dict[str, Any]]],
@@ -258,6 +393,7 @@ def _collect_nodes_parallel(
     ash_out: dict[str, list[dict[str, Any]]] = {}
     tablets_out: dict[str, list[dict[str, Any]]] = {}
     histograms_out: dict[str, list[dict[str, Any]]] = {}
+    query_plans_out: dict[str, list[dict[str, Any]]] = {}
     workers = min(max(1, int(node_parallelism)), len(nodes))
     node_count = len(nodes)
     collect_kw = {
@@ -270,6 +406,8 @@ def _collect_nodes_parallel(
         "statements_per_node": statements_per_node,
         "ash_per_node": ash_per_node,
         "collect_latency_histograms": collect_latency_histograms,
+        "collect_query_plans": collect_query_plans,
+        "query_plans_per_node": query_plans_per_node,
     }
 
     def _run(node: YsqlNode) -> _NodeCollectResult:
@@ -302,7 +440,45 @@ def _collect_nodes_parallel(
         tablets_out[r.nid] = r.tablets
         if collect_latency_histograms:
             histograms_out[r.nid] = r.latency_histograms
-    return statements_out, ycql_out, ash_out, tablets_out, histograms_out
+        if collect_query_plans:
+            query_plans_out[r.nid] = r.query_plans
+    return statements_out, ycql_out, ash_out, tablets_out, histograms_out, query_plans_out
+
+
+# While plan collection is off, QPM status only feeds the viewer's switch to turn it
+# on, so it is re-read at most this often instead of on its own connection every
+# checkpoint.
+QPM_STATUS_OFF_MAX_AGE_S = 600.0
+_qpm_status_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def _qpm_status_for_snapshot(
+    seed_dsn: str, caps: Capabilities, collecting: bool
+) -> "tuple[dict[str, Any], dict[str, str]]":
+    """(QPM status, dbid -> name) for this checkpoint's yb_pg_stat_plans section.
+
+    Read fresh every checkpoint while plans are collected: an operator can change
+    yb_pg_stat_plans_track at any time and the viewer's guardrail must notice.
+    The database names are only needed with plans. A cluster without QPM is
+    never asked.
+    """
+    if not caps.qpm_stat_plans:
+        return {}, {}
+    cached = _qpm_status_cache.get(seed_dsn)
+    if not collecting and cached and time.monotonic() - cached[0] < QPM_STATUS_OFF_MAX_AGE_S:
+        return cached[1], {}
+    status: dict[str, Any] = {}
+    databases: dict[str, str] = {}
+    with stage_timer("qpm_status", _log):
+        try:
+            with connect(seed_dsn) as conn:
+                status = Q.qpm_status(conn)
+                if collecting:
+                    databases = Q.database_names(conn)
+            _qpm_status_cache[seed_dsn] = (time.monotonic(), status)
+        except Exception as exc:  # noqa: BLE001 - status is advisory; never fail a snapshot
+            log_event(_log, "qpm_status_failed", level=logging.WARNING, error=str(exc))
+    return status, databases
 
 
 def _build_snapshot_document_impl(
@@ -316,6 +492,8 @@ def _build_snapshot_document_impl(
     ash_top_tables: int = 25,
     collect_table_ddl: bool = False,
     latency_histograms: bool = False,
+    query_plans: bool = False,
+    query_plans_per_node: int = SNAPSHOT_QUERY_PLANS_PER_NODE,
     node_parallelism: int = DEFAULT_NODE_PARALLELISM,
 ) -> dict[str, Any]:
     ash_window_sec = round((ash_end - ash_start).total_seconds(), 2)
@@ -339,6 +517,13 @@ def _build_snapshot_document_impl(
     with stage_timer("detect_capabilities", _log):
         caps = detect_capabilities(seed_dsn)
 
+    qpm_st, qpm_databases = _qpm_status_for_snapshot(seed_dsn, caps, bool(query_plans))
+    qpm_track = str(qpm_st.get("track") or "").lower()
+    # track=none means QPM records nothing, so the per-node fan-out would return
+    # empty rows on every node. Skip it rather than pay 6 round trips for nothing.
+    qpm_tracking = qpm_track in ("all", "top")
+    collect_plans = bool(query_plans) and bool(qpm_st.get("view_present")) and qpm_tracking
+
     if ensure_ycql_extension:
         with stage_timer("ensure_ycql_extension", _log):
             with connect(seed_dsn) as conn:
@@ -350,6 +535,7 @@ def _build_snapshot_document_impl(
         ash_per_node_out,
         tablets_per_node_out,
         latency_histograms_per_node_out,
+        query_plans_per_node_out,
     ) = _collect_nodes_parallel(
         seed_dsn=seed_dsn,
         nodes=nodes,
@@ -360,6 +546,8 @@ def _build_snapshot_document_impl(
         statements_per_node=statements_per_node,
         ash_per_node=ash_per_node,
         collect_latency_histograms=latency_histograms,
+        collect_query_plans=collect_plans,
+        query_plans_per_node=query_plans_per_node,
         node_parallelism=node_parallelism,
     )
 
@@ -413,6 +601,62 @@ def _build_snapshot_document_impl(
         }
     if table_schemas:
         doc["table_schemas"] = {"by_table_id": table_schemas}
+    # Always present, even when collection is off: the viewer needs `track` and the
+    # pinning prerequisites to decide between an enable button and a "fix the GUC"
+    # notice, and it only ever sees snapshots.
+    qpm_section: dict[str, Any] = {
+        "supported": bool(qpm_st.get("view_present")),
+        "collected": bool(collect_plans),
+        # Seed node's effective settings; QPM storage is per node, so a cluster with
+        # divergent tserver flags could differ elsewhere.
+        "track": qpm_track,
+        "tracking": qpm_tracking,
+        "plan_format": str(qpm_st.get("plan_format") or ""),
+        # dbid -> name. QPM rows only carry dbid; a dbid absent here is a dropped
+        # database, whose plans QPM keeps (it persists across restarts).
+        "databases": qpm_databases,
+        "verbose_plans": str(qpm_st.get("verbose_plans") or "").lower() == "on",
+        "hint_plan": {
+            "installed": bool(qpm_st.get("hint_plan_installed")),
+            "available": bool(qpm_st.get("hint_plan_available")),
+            "hint_table": bool(qpm_st.get("hint_table_present")),
+            "enable_hint_table": str(qpm_st.get("enable_hint_table") or "").lower() == "on",
+            "use_query_id_for_hinting": str(
+                qpm_st.get("use_query_id_for_hinting") or ""
+            ).lower() == "on",
+        },
+    }
+    doc["yb_pg_stat_plans"] = qpm_section
+    if collect_plans:
+        # Truncation is judged on what the DB returned, before scoping drops rows.
+        plans_truncated = any(
+            len(rows) >= query_plans_per_node for rows in query_plans_per_node_out.values()
+        )
+        with stage_timer("scope_and_dedupe_plans", _log) as st:
+            slim_plans, plan_texts = _scope_and_dedupe_plans(
+                query_plans_per_node_out,
+                keep_queryids=_statement_queryids(statements_per_node_out),
+            )
+            st.row_count = len(plan_texts)
+        qpm_section.update(
+            {
+                "limit": query_plans_per_node,
+                # Rows are restricted to the pg_stat_statements top-N queryids.
+                "scoped_to_statements": True,
+                # A node returning exactly `limit` rows may have more it did not report.
+                "truncated": plans_truncated,
+                # planid -> text is not 1:1, so rows point at a content digest instead.
+                "plans": plan_texts,
+                "per_node": slim_plans,
+            }
+        )
+        with stage_timer("hint_table_pins", _log) as st:
+            # dbid -> pinned queryids; lets the viewer mark pinned statements
+            # without a live query per row.
+            qpm_section["pinned"] = _collect_pinned_queryids(
+                seed_dsn, statements_per_node_out, qpm_databases
+            )
+            st.row_count = sum(len(v) for v in qpm_section["pinned"].values())
     if latency_histograms:
         doc["latency_histograms"] = {
             # Same top-N-by-total-time set as pg_stat_statements; empty histograms omitted.
