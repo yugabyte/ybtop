@@ -134,7 +134,7 @@ YugabyteDB 2025.2.3 and later record every plan a statement has used in **Query 
 
 **The plans column** in the statement tables counts the distinct plans QPM recorded for each statement in its database, with **P** when a hint is pinned for it. Sort by it to find the statements whose plan has changed.
 
-**The plan panel** in a statement's ASH report (click its query) has one card per plan, fastest first: average and slowest time, calls and share of calls, first and last use, the nodes that ran it, the slowest execution's parameters, and the plan tree. The headline says whether the fastest plan is the one serving the traffic — "fastest plan no longer in use · current plan 3.1× slower" is a plan regression; a "fastest" measured on fewer than 50 calls that are also under 5% of the statement's calls is marked provisional. A prepared statement's custom plan and generic plan, which QPM records under two planids, are shown as the one plan they are.
+**The plan panel** in a statement's ASH report (click its query) starts collapsed like the report's other sections, with its headline showing. It has one card per plan, fastest first: average and slowest time, calls and share of calls, first and last use, the nodes that ran it, the slowest execution's parameters, and the plan tree. The headline says whether the fastest plan is the one serving the traffic — "fastest plan no longer in use · current plan 3.1× slower" is a plan regression; a "fastest" measured on fewer than 50 calls that are also under 5% of the statement's calls is marked provisional. A prepared statement's custom plan and generic plan, which QPM records under two planids, are shown as the one plan they are.
 
 ![The plan panel for a pinned statement: all traffic on the pinned index plan, the Seq Scan it replaced no longer in use](docs/images/qpm-plans-panel.png)
 
@@ -142,7 +142,7 @@ YugabyteDB 2025.2.3 and later record every plan a statement has used in **Query 
 
 - `ALTER DATABASE` settings reach new sessions only: a connection pool keeps the old setting until its connections are recycled.
 - A pin covers one query_id — the statement exactly as the application sends it. The same SQL with literals, or with other parameter types, is another query_id and keeps its own plan.
-- Hints fix scans, joins and join order, not an aggregate's strategy, a sort, or where a filter runs; when two plans differ only there, the panel says a pin allows both.
+- Hints fix scans, joins and join order, not an aggregate's strategy, a sort, or where a filter runs; two plans that differ only there share their hints (their cards say "= same hints"), so a pin allows both.
 
 The viewer has no login, and a pin changes the plans your application gets, so pinning is off unless the collector was started with the flag, and only the viewer that `watch` starts can do it (`ybtop serve` never writes to the cluster). A request names a recorded plan and nothing else: the hint text and the database come from ybtop's own snapshot. POSTs must be same-origin JSON, so another site cannot submit one, and the Host guard above applies.
 

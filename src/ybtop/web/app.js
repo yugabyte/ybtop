@@ -1676,7 +1676,7 @@
    * Without the text, planid + plan_ref: planid ignores FROM-list and AND-clause
    * ordering, so one planid can carry two different rendered texts.
    *
-   * avg_exec_time and avg_est_cost arrive as per-node averages and are recombined
+   * avg_exec_time arrives as per-node averages and is recombined
    * call-weighted. A plain mean of means misreports any plan whose calls are
    * lopsided across nodes -- which is the normal case, since QPM is per-node.
    */
@@ -1707,7 +1707,6 @@
             nodes: [],
             calls: 0,
             _wsumAvg: 0,
-            _wsumCost: 0,
             _weight: 0,
             _variants: new Map(),
             max_exec_time: null,
@@ -1734,8 +1733,6 @@
         v.calls += calls;
         v._weight += w;
         if (isFinite(avg)) v._wsumAvg += avg * w;
-        const cost = Number(r.avg_est_cost);
-        if (isFinite(cost)) g._wsumCost += cost * w;
         const mx = Number(r.max_exec_time);
         // The parameters travel with the max: QPM records them per node, for that
         // node's slowest execution, so "slowest params" is the slowest node's.
@@ -1752,7 +1749,6 @@
     const groups = Array.from(byKey.values()).map((g) => {
       const w = g._weight > 0 ? g._weight : 1;
       g.avg_exec_time = g._wsumAvg / w;
-      g.avg_est_cost = g._wsumCost / w;
       g.variants = Array.from(g._variants.values())
         .map((v) => ({
           planid: v.planid,
@@ -1764,7 +1760,6 @@
       g.planid = g.variants[0].planid;
       g.plan_ref = g.variants[0].plan_ref;
       delete g._wsumAvg;
-      delete g._wsumCost;
       delete g._weight;
       delete g._variants;
       return g;
@@ -1985,7 +1980,7 @@
   }
 
   /** One plan: a clickable summary line plus a body that expands. */
-  function qpmPlanCard(group, verdict, texts, index, clusterNodeCount, snapshotFile, queryId) {
+  function qpmPlanCard(group, verdict, texts, index, clusterNodeCount, snapshotFile, queryId, reportDbname) {
     const isFastest = group === verdict.fastest;
     const isCurrent = verdict.current === group;
     const openByDefault = isFastest;
@@ -2044,7 +2039,6 @@
     qpmMetric(metrics, "avg", qpmFmtMs(group.avg_exec_time));
     qpmMetric(metrics, "max", qpmFmtMs(group.max_exec_time));
     qpmMetric(metrics, "calls", group.calls.toLocaleString());
-    qpmMetric(metrics, "est cost", isFinite(group.avg_est_cost) ? group.avg_est_cost.toFixed(2) : "—");
     qpmMetric(
       metrics,
       "nodes",
@@ -2056,7 +2050,8 @@
       variants.length > 1 ? "planids" : "planid",
       group.planid + (variants.length > 1 ? " + " + (variants.length - 1) + " more" : "")
     );
-    if (group.dbLabel) qpmMetric(metrics, "database", group.dbLabel);
+    // The report's banner already names its database; say it here only when it doesn't.
+    if (group.dbLabel && group.dbLabel !== reportDbname) qpmMetric(metrics, "database", group.dbLabel);
     if (group.first_used != null) {
       qpmMetric(metrics, "first used", qpmFmtStamp(group.first_used));
     }
@@ -2079,17 +2074,6 @@
         className: "qpm-note",
         textContent: qpmVariantsNote(variants, texts, (group.queryIds && group.queryIds.size) || 1),
       }));
-    }
-    if (group.sameHintsAs && group.sameHintsAs.length > 0) {
-      body.appendChild(
-        el("div", {
-          className: "qpm-note",
-          textContent:
-            "Same hints as planid " + group.sameHintsAs.join(", ") + ", with a different plan: hints"
-            + " fix scans, joins and join order, not aggregation, sorting or where a filter runs."
-            + " Pinning either one allows both.",
-        })
-      );
     }
     if (group.sameTextAs && group.sameTextAs.length > 0) {
       body.appendChild(
@@ -2814,11 +2798,7 @@
 
     const section = el("section", { className: "ybtop-section qpm-panel" });
     const head = el("div", { className: "qpm-panel-head" });
-    const toggleBtn = el("button", {
-      className: "qpm-panel-toggle",
-      type: "button",
-      textContent: "▾",
-    });
+    const toggleBtn = el("button", { className: "qpm-panel-toggle", type: "button" });
     head.appendChild(toggleBtn);
     head.appendChild(el("span", { className: "qpm-panel-title", textContent: "QUERY PLANS" }));
     head.appendChild(
@@ -2833,31 +2813,14 @@
     section.appendChild(head);
 
     const body = el("div", { className: "qpm-panel-body" });
-    if (qpm.truncated) {
-      body.appendChild(
-        el("div", {
-          className: "qpm-note qpm-note--warn",
-          textContent:
-            "A node hit the per-node QPM row cap (" +
-            qpm.limit +
-            "), so this plan set may be incomplete.",
-        })
-      );
-    }
     groups.forEach((g, i) =>
       body.appendChild(
-        qpmPlanCard(g, verdict, texts, i, clusterNodeCount, snapshotFile, queryId)
+        qpmPlanCard(g, verdict, texts, i, clusterNodeCount, snapshotFile, queryId, dbname)
       )
     );
     section.appendChild(body);
-
-    toggleBtn.addEventListener("click", () => {
-      body.hidden = !body.hidden;
-      toggleBtn.textContent = body.hidden ? "▸" : "▾";
-      toggleBtn.setAttribute("aria-expanded", body.hidden ? "false" : "true");
-    });
-    toggleBtn.setAttribute("aria-expanded", "true");
-    toggleBtn.setAttribute("aria-label", "Toggle query plans");
+    // Collapsed until opened, like the report's other sections; the headline stays visible.
+    wireSubsectionCollapse(section, "sec-qpm-plans", body, toggleBtn);
     return section;
   }
 
