@@ -44,11 +44,12 @@ const NAMES = ["qpmParseParamText", "qpmIdentChar", "qpmScanSql", "qpmPlaceholde
   "qpmStatementKind", "qpmExplainOptions", "qpmStatementText", "qpmExplainTarget", "qpmPlanSignature",
   "qpmMatchRecordedPlan", "qpmReplayPlanNote", "qpmQuoteIdent", "qpmExplainSequence", "qpmExplainSummary", "qpmClampTimeout",
   "qpmCodeOnly", "qpmSideEffectCall", "qpmSideEffectReason", "qpmNotReplayableReason",
-  "qpmAsciiLower", "qpmLockingClause", "qpmDatabaseUnknownReason",
+  "qpmAsciiLower", "qpmLockingClause", "qpmDatabaseUnknownReason", "qpmTimeoutFor",
   "qpmApplyExplainResponse", "qpmViewScopeKey", "qpmRunQueryIds",
   "qpmFmtMs", "qpmFmtClock", "qpmRatioText", "qpmExplainStripModel", "qpmExplainBannerModel"];
 const A = new Function([
   cb("QPM_PARAM_TEXT_SLOT_BYTES"), cb("QPM_EXPLAIN_DEFAULT_TIMEOUT_S"), cb("QPM_EXPLAIN_MAX_TIMEOUT_S"),
+  cb("QPM_EXPLAIN_WRITE_TIMEOUT_S"), cb("QPM_PARAMS_NOT_KEPT"),
   cb("QPM_READ_VERBS"), cb("QPM_WRITE_VERBS"), cb("QPM_SIDE_EFFECT_CALL"), cb("QPM_LOCKING_CLAUSE"),
   ...NAMES.map(fn), "return {" + NAMES.join(",") + "};"].join("\n"))();
 
@@ -69,6 +70,8 @@ out.kind = input.kind.map(([q, p]) => A.qpmStatementKind(q, p));
 out.sideEffect = input.sql.concat(input.sideEffect).map((q) => A.qpmSideEffectCall(q));
 out.notReplayable = input.kind.map(([q]) => A.qpmNotReplayableReason(q, A.qpmStatementKind(q, null).label));
 out.clamp2 = input.clamp.map((v) => A.qpmClampTimeout(v));
+out.timeoutFor = [["write", 45], ["write", ""], ["read", 45], ["read", ""], [null, 5]]
+  .map(([k, v]) => A.qpmTimeoutFor(k, v));
 out.dbReason = [A.qpmDatabaseUnknownReason({}, "5"), A.qpmDatabaseUnknownReason({ 1: "x" }, "5"),
   A.qpmDatabaseUnknownReason(null, "5")];
 { // a bulk INSERT with 130k placeholders must not throw (Math.max(...refs) did)
@@ -120,6 +123,13 @@ out.target = {
   const d = JSON.parse(JSON.stringify(doc));
   d.yb_pg_stat_plans.databases = {};
   out.target.noDbList = A.qpmExplainTarget(d, S(["7"]), S(["16640"]));
+}
+{ // taken without --allow-explain-analyze: no values, and the server's reason for it
+  const d = JSON.parse(JSON.stringify(doc));
+  d.yb_pg_stat_plans.params = false;
+  Object.values(d.yb_pg_stat_plans.per_node).forEach((rows) => rows.forEach((r) => { delete r.max_exec_time_params; }));
+  out.target.noParams = A.qpmExplainTarget(d, S(["7"]), S(["16640"]));
+  out.docNoParams = d;
 }
 { // every recorded execution unreplayable -> not ok, with the slowest one's reason
   const d = JSON.parse(JSON.stringify(doc));
@@ -274,10 +284,11 @@ const findNode = (n, pred) => {
   }
   return null;
 };
-const D_SRC = [fn("el"), fn("qpmOpenExplainDialog"), "return { qpmOpenExplainDialog };"].join("\n");
+const D_SRC = [cb("QPM_EXPLAIN_WRITE_TIMEOUT_S"), fn("qpmTimeoutFor"), fn("el"), fn("qpmOpenExplainDialog"),
+  "return { qpmOpenExplainDialog };"].join("\n");
 const TGT = { ok: true, queryid: "7", planid: "1", plan_ref: "aa", dbid: "16640", userid: "16384", node: "n1:5433",
   kind: "read", label: "SELECT", recordedMaxMs: 5, datname: "app", role: "app_user", sqlDisplay: "select 1" };
-function openDialog(active, post) {
+function openDialog(active, post, target) {
   const e = { qpmExplainActive: active, qpmExplainAvail: { available: true }, polled: 0, remembered: [],
     QPM_EXPLAIN_MAX_TIMEOUT_S: 600 };
   e.document = { createElement: fakeNode, createTextNode: (x) => ({ text: x, children: [] }), body: fakeNode("body") };
@@ -285,8 +296,8 @@ function openDialog(active, post) {
   e.qpmFmtMs = (ms) => ms + " ms";
   e.qpmFmtClock = () => "15:20:00 UTC";
   e.qpmExplainPrefs = () => ({ dist: false, debug: false, timeout_s: 30 });
-  e.qpmSaveExplainPrefs = () => {};
-  e.qpmExplainSequence = () => [];
+  e.qpmSaveExplainPrefs = (p) => { e.saved = p; };
+  e.qpmExplainSequence = (t, o, s) => { e.seqTimeout = s; return []; };
   e.qpmExplainOptions = () => ["ANALYZE"];
   e.qpmClampTimeout = () => 30;
   e.qpmRememberRun = (run) => { e.remembered.push(run); };
@@ -309,7 +320,7 @@ function openDialog(active, post) {
     await null;
     await null;
   };
-  withEnv(e, D_SRC).qpmOpenExplainDialog(TGT, "f.json", () => {});
+  withEnv(e, D_SRC).qpmOpenExplainDialog(target || TGT, "f.json", () => {});
   const dlg = e.document.body.children[0];
   e.run = findNode(dlg, (n) => /qpm-dialog-run/.test(n.className || ""));
   e.msg = findNode(dlg, (n) => n.tag === "p" && /^qpm-dialog-note/.test(n.className || ""));
@@ -348,6 +359,16 @@ async function dialogCases() {
     await e.click();
     await e.answer(null);
     r.lateAnswer = shown(e);
+  }
+  { // a write gets 1 s, fixed, and the timeout kept for next time stays the one for reads
+    let sent = null;
+    const e = openDialog(null, async (route, payload) => { sent = payload; return { run: { state: "running" } }; },
+      Object.assign({}, TGT, { kind: "write", label: "UPDATE" }));
+    await e.answer(null);
+    const tin = findNode(e.document.body.children[0], (n) => n.tag === "input" && n.attrs.type === "number");
+    await e.click();
+    r.write = { disabled: tin.disabled, value: tin.value, sent: sent && sent.timeout_s, saved: e.saved && e.saved.timeout_s,
+      shown: e.seqTimeout };
   }
   return r;
 }
@@ -527,6 +548,17 @@ class ViewerExplainTest(unittest.TestCase):
         # the 50 ms execution's database is not in the list: skipped, with the server's reason
         self.assertEqual(self.out["target"]["anyDb"]["skippedReason"],
                          X.database_unknown_reason(self.doc["yb_pg_stat_plans"]["databases"], "16385"))
+
+    def test_a_write_gets_one_second_on_both_sides(self):
+        samples = [("write", 45), ("write", ""), ("read", 45), ("read", ""), (None, 5)]
+        self.assertEqual(self.out["timeoutFor"], [X.timeout_for(k, v) for k, v in samples])
+        self.assertEqual(self.out["dialog"]["write"], {"disabled": True, "value": "1", "sent": 1, "saved": 30, "shown": 1})
+
+    def test_a_snapshot_without_values_gets_the_servers_reason(self):
+        self.assertEqual(self.out["target"]["noParams"]["reason"], X.PARAMS_NOT_KEPT)
+        server = X.resolve_target(self.out["docNoParams"], queryid="7", planid="1", plan_ref="aa",
+                                  dbid="16640", node="n1:5433", userid="16384")
+        self.assertEqual(server, (None, X.PARAMS_NOT_KEPT))
 
     def test_the_poll_follows_the_watch_as_it_is_after_the_await(self):
         self.assertEqual(self.out["poll"]["watchChanged"], {"polling": True, "next": 1})

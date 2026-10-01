@@ -2804,6 +2804,12 @@
   const QPM_PARAM_TEXT_SLOT_BYTES = 255;
   const QPM_EXPLAIN_DEFAULT_TIMEOUT_S = 30;
   const QPM_EXPLAIN_MAX_TIMEOUT_S = 600;
+  /** A write holds its row locks until it rolls back. Mirrors explain.WRITE_TIMEOUT_S. */
+  const QPM_EXPLAIN_WRITE_TIMEOUT_S = 1;
+  /** Mirrors explain.PARAMS_NOT_KEPT. */
+  const QPM_PARAMS_NOT_KEPT =
+    "this snapshot holds no parameter values: they are kept only while the collector "
+    + "runs with --allow-explain-analyze; a later snapshot has them";
   const QPM_EXPLAIN_POLL_MS = 1000;
   const QPM_READ_VERBS = ["SELECT", "WITH", "VALUES", "TABLE"];
   const QPM_WRITE_VERBS = ["INSERT", "UPDATE", "DELETE", "MERGE"];
@@ -3237,7 +3243,8 @@
    * The recorded execution EXPLAIN ANALYZE replays: the slowest one in scope that can
    * be replayed. {ok: true, ...target} or {ok: false, reason}; null when nothing in
    * scope was recorded. The server re-derives the statement and values from the
-   * snapshot for the row this names (explain.resolve_target), never from the page.
+   * snapshot for the row this names (explain.resolve_target), never from the page:
+   * the page's copies of its checks only decide what to offer, and the server is the gate.
    */
   function qpmExplainTarget(doc, queryIds, dbids) {
     const qpm = doc && doc.yb_pg_stat_plans;
@@ -3288,6 +3295,7 @@
         const fn = qpmSideEffectCall(sql);
         if (fn) why = qpmSideEffectReason(fn);
       }
+      if (!why && qpm.params === false && qpmPlaceholders(sql).size) why = QPM_PARAMS_NOT_KEPT;
       if (!why) {
         bound = qpmBindValues(sql, r.max_exec_time_params);
         if (bound.error) why = bound.error;
@@ -3461,6 +3469,11 @@
     const n = Number(text);
     if (!isFinite(n)) return QPM_EXPLAIN_DEFAULT_TIMEOUT_S;
     return Math.max(1, Math.min(QPM_EXPLAIN_MAX_TIMEOUT_S, Math.floor(n + 0.5)));
+  }
+
+  /** The statement timeout a run gets. Mirrors explain.timeout_for. */
+  function qpmTimeoutFor(kind, v) {
+    return kind === "write" ? QPM_EXPLAIN_WRITE_TIMEOUT_S : qpmClampTimeout(v);
   }
 
   /**
@@ -3709,8 +3722,8 @@
           className: "qpm-dialog-warn qpm-dialog-warn--write",
           textContent:
             target.label + ": its changes are made inside a transaction that is always rolled "
-            + "back, but it holds their row locks while it runs, and sequence values it draws "
-            + "are used up.",
+            + "back, but it holds their row locks while it runs -- so it gets "
+            + QPM_EXPLAIN_WRITE_TIMEOUT_S + " s at most -- and sequence values it draws are used up.",
         })
       );
     }
@@ -3759,6 +3772,10 @@
       value: String(prefs.timeout_s),
       "aria-label": "Statement timeout in seconds",
     });
+    if (target.kind === "write") {
+      tin.value = String(QPM_EXPLAIN_WRITE_TIMEOUT_S);
+      tin.disabled = true;
+    }
     tlab.appendChild(tin);
     tlab.appendChild(document.createTextNode("s"));
     opts.appendChild(tlab);
@@ -3805,7 +3822,7 @@
       seq.textContent = qpmExplainSequence(
         target,
         qpmExplainOptions(distBox.checked, debugBox.checked),
-        qpmClampTimeout(tin.value)
+        qpmTimeoutFor(target.kind, tin.value)
       ).join("\n");
     }
     distBox.addEventListener("change", sync);
@@ -3820,10 +3837,11 @@
       const chosen = {
         dist: distBox.checked,
         debug: debugBox.checked,
-        timeout_s: qpmClampTimeout(tin.value),
+        timeout_s: qpmTimeoutFor(target.kind, tin.value),
       };
       tin.value = String(chosen.timeout_s);
-      qpmSaveExplainPrefs(chosen);
+      // A write's fixed 1 s is not the timeout to offer next time.
+      qpmSaveExplainPrefs(target.kind === "write" ? Object.assign({}, chosen, { timeout_s: prefs.timeout_s }) : chosen);
       runBtn.disabled = true;
       runBtn.textContent = "Starting…";
       starting = true;
