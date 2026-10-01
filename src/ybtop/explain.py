@@ -94,7 +94,8 @@ _ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrst
 # anything else, a no-break space say, is part of the name. nextval() is let
 # through: like a serial or identity default in a replayed INSERT, it leaves a
 # gap in the sequence, as any rolled-back transaction does. A user-defined
-# function can still hide such an effect.
+# function can still hide such an effect; the dialog says that functions it
+# calls do run.
 _SIDE_EFFECT_CALL = re.compile(
     r'(?<![A-Za-z0-9_$\x80-\U0010ffff])"?('
     r"pg_terminate_backend|pg_cancel_backend|pg_reload_conf|pg_rotate_logfile|pg_promote"
@@ -365,7 +366,8 @@ _QUOTED_NAME = re.compile(r'"(?:[^"]|"")*"?')
 
 def locking_clause(sql: str) -> Optional[str]:
     """"UPDATE", "NO KEY UPDATE", "SHARE" or "KEY SHARE" if the statement locks rows
-    by its text; strings, comments and quoted names are not looked at."""
+    by its text; strings, comments and quoted names are not looked at. Mirrors the
+    viewer's qpmLockingClause."""
     code = _QUOTED_NAME.sub(lambda m: " " * len(m.group(0)), _code_only(sql))
     m = _LOCKING_CLAUSE.search(code.translate(_ASCII_LOWER))
     return " ".join(m.group(1).upper().split()) if m else None
@@ -422,7 +424,10 @@ _NUMBER = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?
 
 
 def clamp_timeout(value: Any) -> int:
-    """Seconds, 1..MAX_TIMEOUT_S; blank or not a plain number -> the default, never 1 s."""
+    """Seconds, 1..MAX_TIMEOUT_S; blank or not a plain number -> the default.
+
+    Same rule as the viewer's qpmClampTimeout: an emptied box must not become 1 s.
+    """
     text = str(value).strip(" \t\n\r\f\v") if value is not None and not isinstance(value, bool) else ""
     if not _NUMBER.fullmatch(text):
         return DEFAULT_TIMEOUT_S
@@ -495,7 +500,11 @@ def find_qpm_row(
 def resolve_target(
     doc: dict, *, queryid: str, planid: str, plan_ref: str, dbid: str, node: str, userid: str
 ) -> "tuple[Optional[dict], Optional[str]]":
-    """Everything a run needs, from the snapshot alone, or (None, why not)."""
+    """Everything a run needs, from the snapshot alone, or (None, why not).
+
+    The refusals are checked in the same order as the viewer's qpmExplainTarget,
+    so both report the same reason for the same row.
+    """
     row = find_qpm_row(
         doc, queryid=queryid, planid=planid, plan_ref=plan_ref, dbid=dbid, node=node, userid=userid
     )
@@ -550,7 +559,8 @@ def database_unknown_reason(databases: dict, dbid: str) -> str:
     """Why the snapshot has no name for a plan's database.
 
     The list is read once per snapshot, before the plans are; a cluster always
-    has databases, so an empty list is one that could not be read.
+    has databases, so an empty list is one that could not be read. Mirrors the
+    viewer's qpmDatabaseUnknownReason.
     """
     if not databases:
         return (
@@ -582,7 +592,7 @@ def side_effect_call(sql: str) -> Optional[str]:
 
 
 def not_replayable_reason(sql: str, label: str) -> str:
-    """Why statement_kind refused a statement."""
+    """Why statement_kind refused a statement. Mirrors the viewer's qpmNotReplayableReason."""
     if str(sql).lstrip(_SQL_SPACE).startswith("<"):
         return "pg_stat_statements does not show this statement's text to ybtop's login."
     return (
