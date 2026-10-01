@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import mimetypes
 import os
@@ -24,9 +25,6 @@ _INT64_TEXT = re.compile(r"^-?\d{1,20}$")
 
 _PLAN_REF_TEXT = re.compile(r"^[0-9a-f]{1,64}$")
 
-_LOOPBACK_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
-
-
 def _host_name(host_header: str) -> str:
     """"Host: [::1]:8765" -> "::1"; "Host: example.com:8765" -> "example.com"."""
     h = (host_header or "").strip().lower()
@@ -36,7 +34,17 @@ def _host_name(host_header: str) -> str:
 
 
 def _is_loopback(name: str) -> bool:
-    return name in _LOOPBACK_NAMES or name.startswith("127.")
+    """localhost, or a literal loopback address (127.0.0.0/8, ::1).
+
+    A name that only starts with "127." -- 127.attacker.example, 127.0.0.1.nip.io --
+    is a domain its owner can rebind to this machine, so it is not loopback here.
+    """
+    if name == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
 
 
 def host_allowed(host_header: "str | None", allowed: "frozenset[str]", bind_host: str) -> bool:
@@ -44,7 +52,7 @@ def host_allowed(host_header: "str | None", allowed: "frozenset[str]", bind_host
 
     A page on an attacker's domain whose DNS is rebound to this address becomes
     same-origin with the viewer, so it could read snapshots and drive the POST
-    endpoints. Only the Host header gives it away. Loopback names are always
+    endpoints. Only the Host header gives it away. localhost and loopback addresses are always
     allowed; a loopback-bound viewer allows nothing else unless configured. A
     viewer on another address cannot know the names it is reached by, so it
     checks only when --serve-allowed-host lists them.

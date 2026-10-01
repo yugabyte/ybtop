@@ -12,7 +12,7 @@ All notable functional changes to **ybtop** are listed here by release. Format f
 
 ### Changed
 
-- **Viewer Host check (DNS-rebinding guard):** Requests whose `Host` header is not a name the viewer is reached by are refused with 403. Loopback names always work and a loopback-bound viewer accepts only those; list other names — a proxy's public name, or the host name of a viewer bound to another address — with **`watch --serve-allowed-host`** / **`serve --allowed-host`** (repeatable). A viewer bound to a non-loopback address checks only the names it is given, so **`watch --allow-plan-pinning`** refuses to start on such a bind without any.
+- **Viewer Host check (DNS-rebinding guard):** Requests whose `Host` header is not a name the viewer is reached by are refused with 403. `localhost` and loopback addresses (`127.x.x.x`, `::1`) always work, and a loopback-bound viewer accepts only those (a domain that merely starts with `127.` does not count); list other names — a proxy's public name, or the host name of a viewer bound to another address — with **`watch --serve-allowed-host`** / **`serve --allowed-host`** (repeatable). A viewer bound to a non-loopback address checks only the names it is given, so **`watch --allow-plan-pinning`** refuses to start on such a bind without any.
 
 ## [0.1.13] — 2026-08-12
 

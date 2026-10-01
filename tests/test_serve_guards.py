@@ -33,6 +33,11 @@ class HostGuardTest(unittest.TestCase):
             ("127.0.0.1:8765", none, "127.0.0.1", True),
             ("[::1]:8765", none, "::1", True),
             ("evil.example:8765", none, "127.0.0.1", False),  # rebinding onto loopback
+            ("127.1.2.3:8765", none, "127.0.0.1", True),  # all of 127/8 is this machine
+            # domains that merely start with "127." can be rebound like any other
+            ("127.attacker.example:8765", none, "127.0.0.1", False),
+            ("127.0.0.1.nip.io:8765", none, "127.0.0.1", False),
+            ("127.attacker.example:8765", some, "0.0.0.0", False),
             ("evil.example:8765", none, "0.0.0.0", True),  # unknowable names: opt-in only
             ("evil.example:8765", some, "0.0.0.0", False),
             ("YBTOP.Example:8765", some, "0.0.0.0", True),
@@ -192,6 +197,7 @@ class UnguardedBindTest(unittest.TestCase):
         pin = ["--allow-plan-pinning"]
         self.assertIsNone(p("127.0.0.1", frozenset(), pin))
         self.assertIsNone(p("localhost", frozenset(), pin))
+        self.assertIsNotNone(p("127.0.0.1.nip.io", frozenset(), pin))  # a domain, not loopback
         self.assertIsNone(p("::1", frozenset(), pin))
         self.assertIsNone(p("0.0.0.0", frozenset(), []))  # a read-only viewer is unchanged
         self.assertIsNone(p("0.0.0.0", frozenset({"ybtop.example"}), pin))
