@@ -13,7 +13,7 @@ The inlined-literals text exists for display only.
 A run is always one transaction that is rolled back. In outline -- the catalog
 reads (the role's name and its settings) and set_config calls are left out:
 
-    SET statement_timeout = <n>s           -- first, so the reads have a deadline too
+    SET statement_timeout = <n>s           -- first, so the reads have a deadline too; 1 s for a write
     BEGIN [READ ONLY]                      -- READ ONLY unless it writes or locks rows
     SET LOCAL ROLE <role that ran it>      -- after that role's own ALTER ROLE settings
     SET LOCAL statement_timeout = <n>s     -- the client also cancels at <n>s
@@ -42,6 +42,10 @@ PARAM_TEXT_SLOT_BYTES = 255
 
 DEFAULT_TIMEOUT_S = 30
 MAX_TIMEOUT_S = 600
+# A write holds the row locks it takes until its ROLLBACK, blocking the
+# application's own writes to those rows meanwhile, so it gets this, whatever the
+# timeout asked for.
+WRITE_TIMEOUT_S = 1
 
 # A DEBUG dump of a large plan is tens of KB; past this it is a runaway, and it is
 # held in the collector's memory for every run kept (ExplainRuns.MAX_KEPT).
@@ -428,6 +432,17 @@ def clamp_timeout(value: Any) -> int:
     return max(1, min(MAX_TIMEOUT_S, int(math.floor(secs + 0.5))))
 
 
+def timeout_for(kind: Optional[str], value: Any) -> int:
+    """The statement timeout a run gets: WRITE_TIMEOUT_S for a write, else clamp_timeout."""
+    return WRITE_TIMEOUT_S if kind == "write" else clamp_timeout(value)
+
+
+PARAMS_NOT_KEPT = (
+    "this snapshot holds no parameter values: they are kept only while the collector "
+    "runs with --allow-explain-analyze; a later snapshot has them"
+)
+
+
 # ---------------------------------------------------------------------------
 # Snapshot resolution
 # ---------------------------------------------------------------------------
@@ -505,6 +520,8 @@ def resolve_target(
     if fn:
         return None, side_effect_reason(fn)
     params_text = row.get("max_exec_time_params")
+    if qpm.get("params") is False and placeholders(sql):
+        return None, PARAMS_NOT_KEPT
     values, why = bind_values(sql, params_text)
     if values is None:
         return None, why

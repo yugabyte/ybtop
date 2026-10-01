@@ -363,7 +363,7 @@ class YbtopHTTPRequestHandler(BaseHTTPRequestHandler):
         host, port = X.split_node(vals["node"])
         dsn = dsn_for_host(dsn_for_database(str(type(self).seed_dsn), target["datname"]), host, port)
         options = X.explain_options(body.get("dist") is True, body.get("debug") is True)
-        timeout_s = X.clamp_timeout(body.get("timeout_s"))
+        timeout_s = X.timeout_for(target["kind"], body.get("timeout_s"))
 
         def work(run: dict, cancel_ready: object, may_analyze: object) -> dict:
             return X.run_explain(

@@ -196,6 +196,7 @@ def run_watch(settings: Settings, *, viewer_url: Optional[str] = None) -> None:
                     latency_histograms=settings.snapshot_latency_histograms,
                     query_plans=want_query_plans,
                     query_plans_per_node=settings.snapshot_query_plans_per_node,
+                    query_plan_params=settings.allow_explain_analyze,
                     node_parallelism=settings.node_parallelism,
                 )
                     snap_path = write_snapshot_and_update_manifest(output_dir=out_dir, document=doc, compress=settings.snapshot_compress)

@@ -154,6 +154,7 @@ def build_snapshot_document(
     latency_histograms: bool = False,
     query_plans: bool = False,
     query_plans_per_node: int = SNAPSHOT_QUERY_PLANS_PER_NODE,
+    query_plan_params: bool = False,
     node_parallelism: int = DEFAULT_NODE_PARALLELISM,
 ) -> dict[str, Any]:
     with stage_timer("build_snapshot", _log, scope_total=True):
@@ -170,6 +171,7 @@ def build_snapshot_document(
                 latency_histograms=latency_histograms,
                 query_plans=query_plans,
                 query_plans_per_node=query_plans_per_node,
+                query_plan_params=query_plan_params,
                 node_parallelism=node_parallelism,
             )
 
@@ -311,6 +313,7 @@ def _collect_one_node(
     collect_latency_histograms: bool,
     collect_query_plans: bool,
     query_plans_per_node: int,
+    query_plan_params: bool = False,
 ) -> _NodeCollectResult:
     nid = node_id(node)
     dsn = dsn_for_node(seed_dsn, node)
@@ -357,6 +360,7 @@ def _collect_one_node(
                             conn,
                             query_plans_per_node,
                             [r["queryid"] for r in pg_stat if r.get("queryid") is not None],
+                            with_params=query_plan_params,
                         )
                     )
                     st.row_count = len(query_plans)
@@ -385,6 +389,7 @@ def _collect_nodes_parallel(
     collect_query_plans: bool,
     query_plans_per_node: int,
     node_parallelism: int,
+    query_plan_params: bool = False,
 ) -> tuple[
     dict[str, list[dict[str, Any]]],
     dict[str, list[dict[str, Any]]],
@@ -413,6 +418,7 @@ def _collect_nodes_parallel(
         "collect_latency_histograms": collect_latency_histograms,
         "collect_query_plans": collect_query_plans,
         "query_plans_per_node": query_plans_per_node,
+        "query_plan_params": query_plan_params,
     }
 
     def _run(node: YsqlNode) -> _NodeCollectResult:
@@ -501,6 +507,7 @@ def _build_snapshot_document_impl(
     latency_histograms: bool = False,
     query_plans: bool = False,
     query_plans_per_node: int = SNAPSHOT_QUERY_PLANS_PER_NODE,
+    query_plan_params: bool = False,
     node_parallelism: int = DEFAULT_NODE_PARALLELISM,
 ) -> dict[str, Any]:
     ash_window_sec = round((ash_end - ash_start).total_seconds(), 2)
@@ -555,6 +562,7 @@ def _build_snapshot_document_impl(
         collect_latency_histograms=latency_histograms,
         collect_query_plans=collect_plans,
         query_plans_per_node=query_plans_per_node,
+        query_plan_params=query_plan_params,
         node_parallelism=node_parallelism,
     )
 
@@ -652,6 +660,8 @@ def _build_snapshot_document_impl(
                 "scoped_to_statements": True,
                 # A node returning exactly `limit` rows may have more it did not report.
                 "truncated": plans_truncated,
+                # Whether rows carry max_exec_time_params (only with --allow-explain-analyze).
+                "params": bool(query_plan_params),
                 # planid -> text is not 1:1, so rows point at a content digest instead.
                 "plans": plan_texts,
                 "per_node": slim_plans,

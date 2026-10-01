@@ -160,6 +160,11 @@ class StatementKindTest(unittest.TestCase):
         self.assertEqual(X.explain_options(True, False), ["ANALYZE", "DIST"])
         self.assertEqual(X.explain_options(False, True), ["ANALYZE", "DIST", "DEBUG"])
 
+    def test_a_write_always_gets_one_second(self):
+        # it holds its row locks until the rollback
+        self.assertEqual([X.timeout_for("write", v) for v in (45, 600, "", None)], [1] * 4)
+        self.assertEqual((X.timeout_for("read", 45), X.timeout_for("read", "")), (45, 30))
+
     def test_timeout_is_clamped(self):
         self.assertEqual(X.clamp_timeout(None), 30)
         self.assertEqual(X.clamp_timeout("abc"), 30)
@@ -248,6 +253,17 @@ class ResolveTargetTest(unittest.TestCase):
         del doc["pg_stat_statements"]
         self.assertIn("text for this query_id", X.resolve_target(
             doc, queryid="7", planid="1", plan_ref="aa", dbid="16640", node="n1:5433", userid="16384")[1])
+
+    def test_a_snapshot_without_values_says_so(self):
+        doc = _doc()
+        doc["yb_pg_stat_plans"]["params"] = False  # collected without --allow-explain-analyze
+        for row in doc["yb_pg_stat_plans"]["per_node"]["n1:5433"]:
+            row.pop("max_exec_time_params", None)
+        args = dict(queryid="7", planid="1", plan_ref="aa", dbid="16640", node="n1:5433", userid="16384")
+        self.assertEqual(X.resolve_target(doc, **args), (None, X.PARAMS_NOT_KEPT))
+        doc["pg_stat_statements"]["per_node"]["n1:5433"][0]["query"] = "select count(*) from t"
+        t, why = X.resolve_target(doc, **args)  # nothing to bind: still replayable
+        self.assertEqual((why, t["values"]), (None, []))
 
     def test_the_row_is_the_one_named_including_its_role(self):
         # QPM keys on (database, user, queryid, planid): two roles, two rows, one identity otherwise.
@@ -735,6 +751,36 @@ class ExplainRunsTest(unittest.TestCase):
         self.assertEqual(runs.latest("16640", ["7"])["state"], "cancelled")
 
 
+class WatchKeepsValuesTest(unittest.TestCase):
+    """watch keeps parameter values in snapshots only with --allow-explain-analyze."""
+
+    def kwargs_for(self, *flags):
+        import contextlib
+        import io
+
+        from ybtop import cli
+
+        seen = {}
+
+        def capture(**kw):
+            seen.update(kw)
+            raise KeyboardInterrupt  # ends watch after the first checkpoint's call
+
+        saved = cli.build_snapshot_document
+        cli.build_snapshot_document = capture
+        try:
+            with tempfile.TemporaryDirectory() as out, contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    cli.main(["watch", "--host", "127.0.0.1", "--output-dir", out, "--no-log-file", "--no-serve", *flags])
+        finally:
+            cli.build_snapshot_document = saved
+        return seen
+
+    def test_values_only_with_replays(self):
+        self.assertFalse(self.kwargs_for()["query_plan_params"])
+        self.assertTrue(self.kwargs_for("--allow-explain-analyze")["query_plan_params"])
+
+
 class ExplainEndpointTest(unittest.TestCase):
     """The HTTP contract, through a real server; the database call is faked."""
 
@@ -827,6 +873,11 @@ class ExplainEndpointTest(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual((got["run"]["state"], got["run"]["plan_text"]), ("done", "ok"))
         self.assertIsNone(got["active"])
+
+    def test_a_write_runs_with_a_one_second_timeout(self):
+        status, body = self.post(self.row(queryid="8", planid="2", plan_ref="bb", timeout_s=45))
+        self.assertEqual(status, 202)
+        self.assertEqual((self.seen[0][1]["kind"], self.seen[0][3], body["run"]["timeout_s"]), ("write", 1, 1))
 
     def test_cross_site_posts_are_refused(self):
         host = self.base.split("//", 1)[1]

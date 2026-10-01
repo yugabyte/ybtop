@@ -462,7 +462,7 @@ def strip_hint_wrapper(hints: str) -> str:
 
 
 def yb_pg_stat_plans_rows(
-    conn: psycopg.Connection, limit: int, top_queryids: "list[str] | None" = None
+    conn: psycopg.Connection, limit: int, top_queryids: "list[str] | None" = None, with_params: bool = False
 ) -> list[dict[str, Any]]:
     """QPM plan history for this node. Requires caps.qpm_stat_plans (YB 2025.2.3+).
 
@@ -476,7 +476,9 @@ def yb_pg_stat_plans_rows(
     pg_stat_statements top N (`top_queryids`) -- the statements the snapshot is
     scoped to afterwards -- and then the most recently used. Ordering by recency
     alone let other statements' recent plans fill the budget and drop a heavy
-    statement's older plans before scoping ever saw them.
+    statement's older plans before scoping ever saw them. The slowest execution's
+    parameter values (application data) come back only `with_params`: the
+    collector asks for them only when it can replay with them.
     """
     sql = """
     SELECT
@@ -489,13 +491,13 @@ def yb_pg_stat_plans_rows(
         p.max_exec_time::float8 AS max_exec_time,
         p.avg_est_cost::float8 AS avg_est_cost,
         p.first_used AS first_used,
-        p.last_used AS last_used,
+        p.last_used AS last_used,{params}
         p.plan::text AS plan,
         p.hints::text AS hints
     FROM yb_pg_stat_plans p
     ORDER BY (p.queryid = ANY(%(top)s::bigint[])) DESC, p.last_used DESC
     LIMIT %(limit)s /* __YB_STAT_PLANS_SKIP */;
-    """
+    """.replace("{params}", "\n        p.max_exec_time_params::text AS max_exec_time_params," if with_params else "")
     return fetch_all(conn, sql, {"limit": limit, "top": [str(q) for q in (top_queryids or [])]})
 
 
