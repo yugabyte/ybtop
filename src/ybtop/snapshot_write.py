@@ -154,6 +154,7 @@ def build_snapshot_document(
     latency_histograms: bool = False,
     query_plans: bool = False,
     query_plans_per_node: int = SNAPSHOT_QUERY_PLANS_PER_NODE,
+    query_plan_params: bool = False,
     node_parallelism: int = DEFAULT_NODE_PARALLELISM,
 ) -> dict[str, Any]:
     with stage_timer("build_snapshot", _log, scope_total=True):
@@ -170,6 +171,7 @@ def build_snapshot_document(
                 latency_histograms=latency_histograms,
                 query_plans=query_plans,
                 query_plans_per_node=query_plans_per_node,
+                query_plan_params=query_plan_params,
                 node_parallelism=node_parallelism,
             )
 
@@ -194,6 +196,11 @@ def _statement_queryids(statements_per_node: dict[str, list[dict[str, Any]]]) ->
             if isinstance(r, dict) and r.get("queryid") is not None:
                 out.add(str(r["queryid"]))
     return out
+
+
+def _roles_for_rows(per_node: dict[str, list[dict[str, Any]]], names: dict[str, str]) -> dict[str, str]:
+    used = {str(r.get("userid")) for rows in per_node.values() for r in rows or [] if r.get("userid") is not None}
+    return {u: names[u] for u in sorted(used) if u in names}
 
 
 def _scope_and_dedupe_plans(
@@ -306,6 +313,7 @@ def _collect_one_node(
     collect_latency_histograms: bool,
     collect_query_plans: bool,
     query_plans_per_node: int,
+    query_plan_params: bool = False,
 ) -> _NodeCollectResult:
     nid = node_id(node)
     dsn = dsn_for_node(seed_dsn, node)
@@ -352,6 +360,7 @@ def _collect_one_node(
                             conn,
                             query_plans_per_node,
                             [r["queryid"] for r in pg_stat if r.get("queryid") is not None],
+                            with_params=query_plan_params,
                         )
                     )
                     st.row_count = len(query_plans)
@@ -380,6 +389,7 @@ def _collect_nodes_parallel(
     collect_query_plans: bool,
     query_plans_per_node: int,
     node_parallelism: int,
+    query_plan_params: bool = False,
 ) -> tuple[
     dict[str, list[dict[str, Any]]],
     dict[str, list[dict[str, Any]]],
@@ -408,6 +418,7 @@ def _collect_nodes_parallel(
         "collect_latency_histograms": collect_latency_histograms,
         "collect_query_plans": collect_query_plans,
         "query_plans_per_node": query_plans_per_node,
+        "query_plan_params": query_plan_params,
     }
 
     def _run(node: YsqlNode) -> _NodeCollectResult:
@@ -454,31 +465,33 @@ _qpm_status_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
 def _qpm_status_for_snapshot(
     seed_dsn: str, caps: Capabilities, collecting: bool
-) -> "tuple[dict[str, Any], dict[str, str]]":
-    """(QPM status, dbid -> name) for this checkpoint's yb_pg_stat_plans section.
+) -> "tuple[dict[str, Any], dict[str, str], dict[str, str]]":
+    """(QPM status, dbid -> name, userid -> role) for this checkpoint's yb_pg_stat_plans section.
 
     Read fresh every checkpoint while plans are collected: an operator can change
     yb_pg_stat_plans_track at any time and the viewer's guardrail must notice.
-    The database names are only needed with plans. A cluster without QPM is
-    never asked.
+    The database and role names are only needed with plans. A cluster without
+    QPM is never asked.
     """
     if not caps.qpm_stat_plans:
-        return {}, {}
+        return {}, {}, {}
     cached = _qpm_status_cache.get(seed_dsn)
     if not collecting and cached and time.monotonic() - cached[0] < QPM_STATUS_OFF_MAX_AGE_S:
-        return cached[1], {}
+        return cached[1], {}, {}
     status: dict[str, Any] = {}
     databases: dict[str, str] = {}
+    roles: dict[str, str] = {}
     with stage_timer("qpm_status", _log):
         try:
             with connect(seed_dsn) as conn:
                 status = Q.qpm_status(conn)
                 if collecting:
                     databases = Q.database_names(conn)
+                    roles = Q.role_names(conn)
             _qpm_status_cache[seed_dsn] = (time.monotonic(), status)
         except Exception as exc:  # noqa: BLE001 - status is advisory; never fail a snapshot
             log_event(_log, "qpm_status_failed", level=logging.WARNING, error=str(exc))
-    return status, databases
+    return status, databases, roles
 
 
 def _build_snapshot_document_impl(
@@ -494,6 +507,7 @@ def _build_snapshot_document_impl(
     latency_histograms: bool = False,
     query_plans: bool = False,
     query_plans_per_node: int = SNAPSHOT_QUERY_PLANS_PER_NODE,
+    query_plan_params: bool = False,
     node_parallelism: int = DEFAULT_NODE_PARALLELISM,
 ) -> dict[str, Any]:
     ash_window_sec = round((ash_end - ash_start).total_seconds(), 2)
@@ -517,7 +531,7 @@ def _build_snapshot_document_impl(
     with stage_timer("detect_capabilities", _log):
         caps = detect_capabilities(seed_dsn)
 
-    qpm_st, qpm_databases = _qpm_status_for_snapshot(seed_dsn, caps, bool(query_plans))
+    qpm_st, qpm_databases, qpm_roles = _qpm_status_for_snapshot(seed_dsn, caps, bool(query_plans))
     qpm_track = str(qpm_st.get("track") or "").lower()
     # track=none means QPM records nothing, so the per-node fan-out would return
     # empty rows on every node. Skip it rather than pay 6 round trips for nothing.
@@ -548,6 +562,7 @@ def _build_snapshot_document_impl(
         collect_latency_histograms=latency_histograms,
         collect_query_plans=collect_plans,
         query_plans_per_node=query_plans_per_node,
+        query_plan_params=query_plan_params,
         node_parallelism=node_parallelism,
     )
 
@@ -645,9 +660,13 @@ def _build_snapshot_document_impl(
                 "scoped_to_statements": True,
                 # A node returning exactly `limit` rows may have more it did not report.
                 "truncated": plans_truncated,
+                # Whether rows carry max_exec_time_params (only with --allow-explain-analyze).
+                "params": bool(query_plan_params),
                 # planid -> text is not 1:1, so rows point at a content digest instead.
                 "plans": plan_texts,
                 "per_node": slim_plans,
+                # userid -> role name, for the roles these rows name only.
+                "roles": _roles_for_rows(slim_plans, qpm_roles),
             }
         )
         with stage_timer("hint_table_pins", _log) as st:

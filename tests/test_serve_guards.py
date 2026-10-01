@@ -227,8 +227,15 @@ class UnguardedBindTest(unittest.TestCase):
         self.assertIsNone(p("0.0.0.0", frozenset({"ybtop.example"}), pin))
         for bind in ("0.0.0.0", "::", "10.0.0.5"):
             self.assertIn("--serve-allowed-host", p(bind, frozenset(), pin), bind)
+        both = p("0.0.0.0", frozenset(), ["--allow-plan-pinning", "--allow-explain-analyze"])
+        self.assertIn("--allow-plan-pinning and --allow-explain-analyze", both)
 
     def test_watch_refuses_to_start(self):
+        for flag in ("--allow-plan-pinning", "--allow-explain-analyze"):
+            with self.subTest(flag=flag):
+                self._refuses(flag)
+
+    def _refuses(self, flag):
         import contextlib
         import io
 
@@ -244,7 +251,7 @@ class UnguardedBindTest(unittest.TestCase):
                 err = io.StringIO()
                 with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
                     cli.main(["watch", "--host", "127.0.0.1", "--output-dir", out, "--no-log-file",
-                              "--serve-bind", "0.0.0.0", "--allow-plan-pinning"])
+                              "--serve-bind", "0.0.0.0", flag])
         finally:
             serve.start_serve_background, cli.run_watch = saved
         self.assertEqual(cm.exception.code, 2)

@@ -54,8 +54,10 @@ class QpmRowsQueryTest(unittest.TestCase):
         )
         Q.yb_pg_stat_plans_rows(_Conn(seen), 10)
         self.assertEqual(seen["params"]["top"], [])
-        # Recorded parameter values are application data; nothing here uses them.
+        # Recorded parameter values are application data: only for replays.
         self.assertNotIn("max_exec_time_params", seen["sql"])
+        Q.yb_pg_stat_plans_rows(_Conn(seen), 10, with_params=True)
+        self.assertIn("max_exec_time_params", seen["sql"])
 
     def test_collect_passes_the_nodes_top_queryids(self):
         passed = {}
@@ -66,8 +68,9 @@ class QpmRowsQueryTest(unittest.TestCase):
         def fake_connect(dsn):
             yield object()
 
-        def fake_plans(conn, limit, top_queryids=None):
+        def fake_plans(conn, limit, top_queryids=None, with_params=False):
             passed["args"] = (limit, top_queryids)
+            passed.setdefault("with_params", []).append(with_params)
             return []
 
         snapshot_write.connect = fake_connect
@@ -79,21 +82,47 @@ class QpmRowsQueryTest(unittest.TestCase):
         Q.yb_pg_stat_plans_rows = fake_plans
         try:
             now = datetime.now(timezone.utc)
-            snapshot_write._collect_one_node(
-                seed_dsn="host=seed port=5433 dbname=yugabyte user=yugabyte",
-                node=YsqlNode(host="10.0.0.5", port=5433, server_uuid="u"),
-                node_count=1,
-                caps=Capabilities(pg_stat_use_exec_time=True, yb_ash_range_function=True,
-                                  pg_stat_docdb_metrics=False, pg_stat_latency_histogram=False,
-                                  qpm_stat_plans=True),
-                ash_start=now, ash_end=now, ash_window_sec=60.0,
-                statements_per_node=200, ash_per_node=10,
-                collect_latency_histograms=False, collect_query_plans=True, query_plans_per_node=2000,
-            )
+            for keep in (False, True):
+                snapshot_write._collect_one_node(
+                    seed_dsn="host=seed port=5433 dbname=yugabyte user=yugabyte",
+                    node=YsqlNode(host="10.0.0.5", port=5433, server_uuid="u"),
+                    node_count=1,
+                    caps=Capabilities(pg_stat_use_exec_time=True, yb_ash_range_function=True,
+                                      pg_stat_docdb_metrics=False, pg_stat_latency_histogram=False,
+                                      qpm_stat_plans=True),
+                    ash_start=now, ash_end=now, ash_window_sec=60.0,
+                    statements_per_node=200, ash_per_node=10,
+                    collect_latency_histograms=False, collect_query_plans=True, query_plans_per_node=2000,
+                    query_plan_params=keep,
+                )
         finally:
             (snapshot_write.connect, Q.pg_stat_statements_top, Q.ycql_stat_statements_top,
              Q.ash_aggregated, Q.yb_local_tablets_rows, Q.yb_pg_stat_plans_rows) = saved
         self.assertEqual(passed["args"], (2000, ["11", "-22"]))
+        self.assertEqual(passed["with_params"], [False, True])
+
+
+class CollectNodesTest(unittest.TestCase):
+    def test_every_node_is_told_whether_to_keep_values(self):
+        seen = []
+
+        def fake_node(**kw):
+            seen.append(kw["query_plan_params"])
+            return snapshot_write._NodeCollectResult(kw["node"].host, [], [], [], [], [], [])
+
+        saved = snapshot_write._collect_one_node
+        snapshot_write._collect_one_node = fake_node
+        try:
+            now = datetime.now(timezone.utc)
+            for keep in (False, True):
+                snapshot_write._collect_nodes_parallel(
+                    seed_dsn="dsn", nodes=[YsqlNode(host="a", port=5433, server_uuid="u")],
+                    caps=QpmStatusTest.caps(True), ash_start=now, ash_end=now, ash_window_sec=60.0,
+                    statements_per_node=1, ash_per_node=1, collect_latency_histograms=False,
+                    collect_query_plans=True, query_plans_per_node=1, node_parallelism=1, query_plan_params=keep)
+        finally:
+            snapshot_write._collect_one_node = saved
+        self.assertEqual(seen, [False, True])
 
 
 class QpmStatusTest(unittest.TestCase):
@@ -101,7 +130,7 @@ class QpmStatusTest(unittest.TestCase):
 
     def setUp(self):
         self.calls = {"connect": 0, "status": 0, "databases": 0}
-        self.saved = (snapshot_write.connect, Q.qpm_status, Q.database_names,
+        self.saved = (snapshot_write.connect, Q.qpm_status, Q.database_names, Q.role_names,
                       snapshot_write.QPM_STATUS_OFF_MAX_AGE_S)
         snapshot_write._qpm_status_cache.clear()
 
@@ -119,9 +148,10 @@ class QpmStatusTest(unittest.TestCase):
             return {"16640": "app"}
 
         snapshot_write.connect, Q.qpm_status, Q.database_names = fake_connect, fake_status, fake_databases
+        Q.role_names = lambda conn: {"16384": "app_user"}
 
     def tearDown(self):
-        (snapshot_write.connect, Q.qpm_status, Q.database_names,
+        (snapshot_write.connect, Q.qpm_status, Q.database_names, Q.role_names,
          snapshot_write.QPM_STATUS_OFF_MAX_AGE_S) = self.saved
         snapshot_write._qpm_status_cache.clear()
 
@@ -131,19 +161,19 @@ class QpmStatusTest(unittest.TestCase):
                             pg_stat_latency_histogram=False, qpm_stat_plans=qpm)
 
     def test_a_cluster_without_qpm_is_not_asked(self):
-        self.assertEqual(snapshot_write._qpm_status_for_snapshot("dsn", self.caps(False), True), ({}, {}))
+        self.assertEqual(snapshot_write._qpm_status_for_snapshot("dsn", self.caps(False), True), ({}, {}, {}))
         self.assertEqual(self.calls["connect"], 0)
 
     def test_collecting_reads_status_and_names_every_checkpoint(self):
         for _ in range(3):
-            st, dbs = snapshot_write._qpm_status_for_snapshot("dsn", self.caps(True), True)
-        self.assertEqual((st["track"], dbs), ("all", {"16640": "app"}))
+            st, dbs, roles = snapshot_write._qpm_status_for_snapshot("dsn", self.caps(True), True)
+        self.assertEqual((st["track"], dbs, roles), ("all", {"16640": "app"}, {"16384": "app_user"}))
         self.assertEqual(self.calls, {"connect": 3, "status": 3, "databases": 3})
 
     def test_off_reads_status_now_and_then_and_never_the_names(self):
         for _ in range(3):
-            st, dbs = snapshot_write._qpm_status_for_snapshot("dsn", self.caps(True), False)
-        self.assertEqual((st["track"], dbs), ("all", {}))  # the viewer still sees track
+            st, dbs, roles = snapshot_write._qpm_status_for_snapshot("dsn", self.caps(True), False)
+        self.assertEqual((st["track"], dbs, roles), ("all", {}, {}))  # the viewer still sees track
         self.assertEqual(self.calls, {"connect": 1, "status": 1, "databases": 0})
         snapshot_write.QPM_STATUS_OFF_MAX_AGE_S = 0.0
         snapshot_write._qpm_status_for_snapshot("dsn", self.caps(True), False)

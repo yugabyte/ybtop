@@ -320,6 +320,20 @@ def database_names(conn: psycopg.Connection) -> dict[str, str]:
     return {str(r["oid"]): str(r["datname"]) for r in rows}
 
 
+def role_names(conn: psycopg.Connection) -> dict[str, str]:
+    """oid (as text) -> rolname for every role.
+
+    QPM rows carry only userid; with the names in the snapshot, an EXPLAIN
+    ANALYZE can name the role it will run as before anything connects.
+    """
+    rows = fetch_all(
+        conn,
+        "SELECT oid::text AS oid, rolname::text AS rolname FROM pg_catalog.pg_roles"
+        " /* __YB_STAT_PLANS_SKIP */",
+    )
+    return {str(r["oid"]): str(r["rolname"]) for r in rows}
+
+
 def database_name(conn: psycopg.Connection, dbid: str) -> Optional[str]:
     """datname for one database oid, or None if it no longer exists."""
     rows = fetch_all(
@@ -448,7 +462,7 @@ def strip_hint_wrapper(hints: str) -> str:
 
 
 def yb_pg_stat_plans_rows(
-    conn: psycopg.Connection, limit: int, top_queryids: "list[str] | None" = None
+    conn: psycopg.Connection, limit: int, top_queryids: "list[str] | None" = None, with_params: bool = False
 ) -> list[dict[str, Any]]:
     """QPM plan history for this node. Requires caps.qpm_stat_plans (YB 2025.2.3+).
 
@@ -462,7 +476,9 @@ def yb_pg_stat_plans_rows(
     pg_stat_statements top N (`top_queryids`) -- the statements the snapshot is
     scoped to afterwards -- and then the most recently used. Ordering by recency
     alone let other statements' recent plans fill the budget and drop a heavy
-    statement's older plans before scoping ever saw them.
+    statement's older plans before scoping ever saw them. The slowest execution's
+    parameter values (application data) come back only `with_params`: the
+    collector asks for them only when it can replay with them.
     """
     sql = """
     SELECT
@@ -475,13 +491,13 @@ def yb_pg_stat_plans_rows(
         p.max_exec_time::float8 AS max_exec_time,
         p.avg_est_cost::float8 AS avg_est_cost,
         p.first_used AS first_used,
-        p.last_used AS last_used,
+        p.last_used AS last_used,{params}
         p.plan::text AS plan,
         p.hints::text AS hints
     FROM yb_pg_stat_plans p
     ORDER BY (p.queryid = ANY(%(top)s::bigint[])) DESC, p.last_used DESC
     LIMIT %(limit)s /* __YB_STAT_PLANS_SKIP */;
-    """
+    """.replace("{params}", "\n        p.max_exec_time_params::text AS max_exec_time_params," if with_params else "")
     return fetch_all(conn, sql, {"limit": limit, "top": [str(q) for q in (top_queryids or [])]})
 
 

@@ -54,6 +54,16 @@ def dsn_for_database(seed_dsn: str, dbname: str) -> str:
     return psycopg.conninfo.make_conninfo(**info)
 
 
+def dsn_for_host(dsn: str, host: str, port: str) -> str:
+    """The DSN pointed at another node's YSQL endpoint."""
+    info = psycopg.conninfo.conninfo_to_dict(dsn)
+    # hostaddr would win over host and quietly keep us on the seed.
+    info.pop("hostaddr", None)
+    info["host"] = host
+    info["port"] = str(port)
+    return psycopg.conninfo.make_conninfo(**info)
+
+
 def fetch_all(
     conn: psycopg.Connection,
     sql: str,
