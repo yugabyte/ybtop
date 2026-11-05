@@ -1,0 +1,12 @@
+.git
+.claude
+.pytest_cache
+__pycache__
+*.egg-info
+build
+dist
+snapshots
+tests
+Dockerfile
+docker-compose*.y*ml
+.dockerignore

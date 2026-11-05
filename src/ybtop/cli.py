@@ -285,12 +285,13 @@ def run_reset_pg_stat_statements(settings: Settings) -> None:
         raise SystemExit(1)
 
 
-def _connection_args(p: argparse.ArgumentParser) -> None:
+def _connection_args(p: argparse.ArgumentParser, *, port_flag: str = "--port") -> None:
     g = p.add_argument_group("connection (any one YSQL node in the universe)")
     g.add_argument("--dsn", help="Libpq URL for one node (overrides env).")
     g.add_argument("--host", help="Seed node host/IP (alternative to --dsn).")
     g.add_argument(
-        "--port",
+        port_flag,
+        dest="db_port",
         type=int,
         default=DEFAULT_YSQL_PORT,
         help="YSQL port when using --host.",
@@ -302,6 +303,35 @@ def _connection_args(p: argparse.ArgumentParser) -> None:
         help="Password when using --host (default: YBTOP_PASSWORD env if set).",
     )
     g.add_argument("--dbname", default=DEFAULT_YSQL_DBNAME, help="Database when using --host.")
+
+
+def _mcp_args(p: argparse.ArgumentParser) -> None:
+    from ybtop.mcp_server import DEFAULT_MCP_HOST, DEFAULT_MCP_PORT, MCP_TOKEN_ENV
+
+    g = p.add_argument_group(
+        "MCP server (opt-in; read-only live query inspection over HTTP; needs the 'mcp' extra "
+        "and a YSQL connection)"
+    )
+    g.add_argument(
+        "--mcp",
+        action="store_true",
+        help="Also serve an MCP endpoint (streamable HTTP) with tools for inspecting in-flight queries.",
+    )
+    g.add_argument(
+        "--mcp-bind",
+        default=DEFAULT_MCP_HOST,
+        help="MCP listen address. Keep it on loopback unless you also set an auth token.",
+    )
+    g.add_argument("--mcp-port", type=int, default=DEFAULT_MCP_PORT, help="MCP listen port.")
+    g.add_argument(
+        "--mcp-auth-token",
+        default=None,
+        help=(
+            "Require 'Authorization: Bearer <token>' on every MCP request "
+            f"(default: ${MCP_TOKEN_ENV} if set; no auth otherwise). Prefer the env var: "
+            "command-line arguments are visible in the process list."
+        ),
+    )
 
 
 def _ash_args(p: argparse.ArgumentParser) -> None:
@@ -457,6 +487,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SERVE_PORT,
         help="HTTP listen port for the embedded viewer.",
     )
+    _mcp_args(w)
     lg = w.add_argument_group("logging")
     lg.add_argument(
         "--log-file",
@@ -522,6 +553,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SERVE_PORT,
         help="Listen port for HTTP.",
     )
+    # Connection flags are only used with --mcp
+    _connection_args(serve_p, port_flag="--db-port")
+    _mcp_args(serve_p)
     return p
 
 
@@ -534,7 +568,7 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         seed = resolve_seed_dsn(
             dsn=None,
             host=args.host,
-            port=int(args.port),
+            port=int(args.db_port),
             user=args.user,
             password=password,
             dbname=args.dbname,
@@ -581,11 +615,28 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
     )
 
 
+def _start_mcp(args: argparse.Namespace, settings: Settings) -> bool:
+    """Start the opt-in MCP HTTP server (``--mcp``) in the background."""
+    from ybtop.mcp_server import MCP_TOKEN_ENV, start_mcp_background
+
+    return start_mcp_background(
+        settings.seed_dsn,
+        bind=args.mcp_bind,
+        port=int(args.mcp_port),
+        auth_token=args.mcp_auth_token or os.environ.get(MCP_TOKEN_ENV),
+        node_parallelism=settings.node_parallelism,
+    )
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command == "serve":
         from ybtop.serve import run_serve
 
+        if args.mcp:
+            # Fail early, before the viewer starts
+            if not _start_mcp(args, _settings_from_args(args)):
+                raise SystemExit(1)
         run_serve(data_dir=args.data_dir, host=args.bind, port=args.port)
         return
 
@@ -601,6 +652,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             )
         else:
             init_logging(log_path=None)
+        if args.mcp and not _start_mcp(args, settings):
+            raise SystemExit(1)
         if not args.no_serve:
             from ybtop.serve import start_serve_background
 

@@ -81,5 +81,12 @@ def dsn_for_node(seed_dsn: str, node: YsqlNode) -> str:
     return psycopg.conninfo.make_conninfo(**info)
 
 
+def dsn_with_database(dsn: str, dbname: str) -> str:
+    """Same connection as ``dsn`` but to another database."""
+    info = psycopg.conninfo.conninfo_to_dict(dsn)
+    info["dbname"] = dbname
+    return psycopg.conninfo.make_conninfo(**info)
+
+
 def node_id(node: YsqlNode) -> str:
     return f"{node.host}:{node.port}"

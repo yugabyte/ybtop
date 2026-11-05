@@ -20,6 +20,7 @@ pip3 install '.[histogram]'
 |--------|--------|
 | **`ybtop watch`** | Live **terminal** status (iteration, last snapshot name, time, **placement/ASH summary** by cloud·region·zone) and, on every tick, a new **`ybtop.out.*.json`** in `--output-dir`, with **`ybtop.manifest.json`** updated. **By default also starts the HTTP viewer** on `127.0.0.1:8765` (same as `ybtop serve`); use **`--no-serve`** to only write files and use the TUI. Requires DB connectivity for the full run. |
 | **`ybtop serve --data-dir DIR`** | **Read-only** HTTP server: serves the static viewer and JSON from a directory that already has **`ybtop.manifest.json`** and **`ybtop.out.*.json`**. **No database** is needed—ideal for **offline** review, archives, or sharing a folder of snapshots. |
+| **`--mcp`** (on `serve` / `watch`) | Opt-in **MCP HTTP endpoint** for inspecting **in-flight queries** live (see [MCP server](#mcp-server-in-flight-queries)). |
 | **`ybtop reset_pg_stat_statements`** | Runs `pg_stat_statements_reset()` on **each** YSQL node (via the same `yb_servers()`-based fan-out). Requires appropriate privileges. |
 
 **Connection** (any subcommand that talks to the cluster): one of **`--dsn`**, **`--host`** (with `--port` default `5433`, etc.), or env **`YBTOP_DSN`** / **`DATABASE_URL`**. Optional **`YBTOP_PASSWORD`** for `--host`.
@@ -31,6 +32,73 @@ pip3 install '.[histogram]'
 **What latency multimodality finds:** Some queries have a **split personality**; most calls are fast, but a meaningful chunk are much slower (or there are several distinct speed "clusters" rather than one). Averages, and even p99s, hide this: a single number can't tell you that a query is really behaving like *two or three different queries at once*. The viewer's **Latency modes** tab reads YugabyteDB's per-statement latency histogram and looks for exactly that shape — statements whose per-call latency splits into two or more separate **speed classes** (e.g. a fast ~2 ms mode and a slow ~50 ms mode). Those are the queries worth a closer look, because the split usually has a concrete, fixable cause: tablet **leader vs. follower/local reads**, buffer **cache hit vs. miss**, **read-restart** or **lock-conflict retries**, **cross-AZ vs. same-AZ** hops, a **leader move** during the window, or the optimizer **flipping query plans**. Each flagged statement is reported with a **confidence tier**, the number of **peaks** (speed classes found), the overall latency **spread**, and the **gap** between adjacent modes; near-identical statements are collapsed into recurring **query templates** so one shared root cause shows up once instead of many times. Capture with **`--snapshot-latency-analysis`** (and `pip install 'ybtop[histogram]'`) for dip-confirmed tiers in the browser; without a sidecar the tab still runs shape-based detection and reports shape-flagged rows as **`unconfirmed`**.
 
 **Logging (`ybtop watch`):** By default writes **structured JSON lines** to **`OUTPUT_DIR/ybtop.log`** (one event per line, suitable for `jq` or log pipelines). Each checkpoint logs **`checkpoint_summary`** with nested timings: top-level stages (**`build_snapshot`**, **`write_snapshot`**, **`gc_snapshots`**), inner snapshot work under **`build_snapshot.stages_ms`**, and per-node query timings under **`build_snapshot.per_node_ms`**. Logs **rotate** at **1 MiB** (five backups: `ybtop.log.1`, …). Flags: **`--log-file`**, **`--log-level`** (`INFO` / `DEBUG`), **`--log-max-bytes`**, **`--log-backup-count`**, **`--no-log-file`**. Logging is file-only; the terminal dashboard is unchanged.
+
+## Docker
+
+`docker-compose.yaml` starts a single-node YugabyteDB (pinned image, data in a named volume) and ybtop watching it, with the viewer and the MCP endpoint enabled:
+
+```bash
+docker compose up -d --build
+open http://localhost:8765                      # viewer; a new snapshot every 30 s
+psql -h localhost -p 5433 -U yugabyte yugabyte  # YSQL, to generate some load
+docker compose down -v                          # stop and delete the data
+```
+
+- Ports are published on `127.0.0.1` only. For the MCP endpoint set a token (`YBTOP_MCP_TOKEN=... docker compose up -d`) and add TLS before exposing it further; ybtop logs a warning while it runs without one. Connect a client with `claude mcp add --transport http ybtop http://localhost:8766/mcp --header "Authorization: Bearer $YBTOP_MCP_TOKEN"`.
+- The YugabyteDB service has a fixed `hostname`, because ybtop reaches nodes by the host that `yb_servers()` reports. A tiny `yb-volume-init` job fixes volume ownership (the database runs as uid 10001).
+- To watch an existing cluster instead, drop the `yugabyte` services and set `YBTOP_DSN` (and `YBTOP_PASSWORD`) for the `ybtop` service.
+- The `Dockerfile` builds just ybtop: `docker build -t ybtop .` then `docker run --rm ybtop --help`. `--build-arg EXTRAS=mcp,histogram` adds the latency-analysis dependencies; `EXTRAS=` builds without MCP. It runs as a non-root user and keeps snapshots in the `/data` volume.
+
+## MCP server (in-flight queries)
+
+`ybtop serve --mcp` (or `ybtop watch --mcp`) additionally serves a read-only [MCP](https://modelcontextprotocol.io/) endpoint so an AI assistant can ask "what is the cluster doing right now?". It is **off by default**, runs on its own port beside the viewer, and talks to the live universe (so `serve` needs a connection when `--mcp` is on).
+
+```bash
+pip3 install '.[mcp]'                       # Python >= 3.10
+export YBTOP_MCP_TOKEN="$(openssl rand -hex 24)"
+ybtop serve --data-dir ./snapshots --mcp --host my-yb-node --user yugabyte --db-port 5433
+# MCP: http://127.0.0.1:8766/mcp   (Authorization: Bearer $YBTOP_MCP_TOKEN)
+
+claude mcp add --transport http ybtop http://127.0.0.1:8766/mcp \
+  --header "Authorization: Bearer $YBTOP_MCP_TOKEN"
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--mcp` | off | Enable the endpoint. |
+| `--mcp-bind` | `127.0.0.1` | Listen address. Anything but loopback with no token prints a warning. |
+| `--mcp-port` | `8766` | Listen port. |
+| `--mcp-auth-token` | `$YBTOP_MCP_TOKEN` | Require `Authorization: Bearer <token>`. Prefer the env var (arguments are visible in `ps`). |
+
+Results include **SQL text with literal values**, so keep the bind on loopback or set a token (and put TLS in front if it crosses a network). All sessions are read-only with a 10 s statement timeout.
+
+| Tool | Answers |
+|------|---------|
+| `active_summary` | Start here: backends by state/node/database, current wait events, longest-running queries, oldest open transactions, busiest query templates. |
+| `list_active_queries` | Running statements and open transactions, filterable (duration, database, user, application, node, `query_id`, SQL text). |
+| `backend_detail` | One backend (node + pid): state, recent ASH wait profile, lock relationships. |
+| `query_wait_profile` | Where time goes over the last 5–600 s (wait events with descriptions, tables, nodes), for one `query_id` or the whole workload. |
+| `query_stats` | Cluster-merged `pg_stat_statements` for a `query_id` plus approximate p50/p90/p99 latency. |
+| `blocking_locks` | Lock-wait chains and root blockers (from `yb_lock_status()`). |
+| `long_transactions` | Old open transactions, flagged when they block others. |
+| `recently_terminated_queries` | Server-terminated queries (`yb_terminated_queries`). |
+| `list_nodes` | Universe nodes, databases, and which features this YugabyteDB version supports. |
+
+**Why is it slow, and what do I change?** A second group of tools turns the same data into diagnoses with concrete recommendations:
+
+| Tool | Answers |
+|------|---------|
+| `cluster_bottlenecks` | What limits the cluster: lock contention, tserver CPU/thread saturation, catalog reads, read-bound load; node imbalance; single-tablet tables and hot tablets; and the queries responsible. Start here when "everything is slow". |
+| `top_queries` | Statements ranked by cost (total/mean time, calls, rows scanned, **scan ratio**) with share of cluster time, recent share of active sessions, retry/catalog flags. |
+| `find_full_scans` | Statements whose recorded plan does a **sequential scan**, ranked by time, with the unserved filter and a **candidate `CREATE INDEX`**. Says *why* an index can't be used when a function wraps the column (suggesting an expression index) or a type cast defeats it, and does *not* recommend an index when the scan keeps ≥ 10% of the table (the planner would ignore it). |
+| `diagnose_query` | One `query_id` end to end: statistics, latency percentiles, live waits, recorded plans (with the **parameters of the slowest call**), table/index context → severity-ranked findings with evidence and a recommendation. |
+| `explain_query` | The plan: generic plan + real recorded plans for a `query_id`, or for given SQL; `analyze=true` runs a SELECT (read-only session, timeout) and shows DocDB rows scanned and requests. |
+| `index_health` | **Broken** (invalid/not-ready), **duplicate**, **redundant** (leading-prefix) and **unused** indexes with sizes and recoverable space. The advice is consistent as a set: scans of a droppable index are credited to its replacement. |
+| `verify_index` | `yb_index_check`: is the index consistent with its table? (Reads the whole index; run off-peak.) |
+
+How the findings are derived: **scan ratio** is DocDB rows scanned per row delivered to the client (flagged at ≥ 50:1 and ≥ 1000 rows/call); full scans come from plans recorded in `yb_pg_stat_plans` (YugabyteDB does not maintain `pg_stat_user_tables.seq_scan`); index usage is `pg_stat_user_indexes`, which is **node-local**, so it is summed across nodes (and `index_health` warns if a node did not answer). Candidate indexes are heuristics read from the plan's filter text: check selectivity and confirm with `explain_query` before creating one.
+
+`query_id` is the same value in `pg_stat_activity`, ASH, `pg_stat_statements` and recorded plans, so it links the tools together.
 
 ## Architecture: what we query and what goes in a snapshot
 
