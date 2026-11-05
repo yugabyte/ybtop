@@ -46,6 +46,23 @@ def connect(dsn: str) -> Iterator[psycopg.Connection]:
         conn.close()
 
 
+@contextmanager
+def connect_readonly(dsn: str, *, statement_timeout_ms: int = 10_000) -> Iterator[psycopg.Connection]:
+    """Autocommit connection whose session is read-only and bounded by ``statement_timeout``.
+
+    Used by the MCP server so a tool call can never write or hold a query open indefinitely.
+    """
+    conn = _connect_with_hint(dsn)
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SET default_transaction_read_only = on")
+            cur.execute(f"SET statement_timeout = {int(statement_timeout_ms)}")
+        yield conn
+    finally:
+        conn.close()
+
+
 def fetch_all(
     conn: psycopg.Connection,
     sql: str,

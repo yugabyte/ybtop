@@ -1,0 +1,82 @@
+# ybtop demo: a single-node YugabyteDB plus ybtop watching it
+# Start: docker compose up -d --build (viewer on :8765, MCP on :8766/mcp, YSQL on :5433)
+# Stop and delete data: docker compose down -v
+# Ports are bound to 127.0.0.1, set YBTOP_MCP_TOKEN before exposing MCP
+
+name: ybtop
+
+services:
+  # One-shot job: give the volume to uid 10001, the YugabyteDB user
+  yb-volume-init:
+    image: ${YB_IMAGE:-yugabytedb/yugabyte:2026.1.2.0-b137}
+    user: "0:0"
+    entrypoint: ["chown", "-R", "10001:100", "/home/yugabyte/yb_data"]
+    volumes:
+      - yb-data:/home/yugabyte/yb_data
+
+  yugabyte:
+    image: ${YB_IMAGE:-yugabytedb/yugabyte:2026.1.2.0-b137}
+    depends_on:
+      yb-volume-init:
+        condition: service_completed_successfully
+    # Fixed hostname: yb_servers() reports it and ybtop connects by it
+    hostname: yugabyte
+    command:
+      - bin/yugabyted
+      - start
+      - --background=false
+      - --ui=false
+      - --advertise_address=yugabyte
+      - --base_dir=/home/yugabyte/yb_data
+    ports:
+      - "127.0.0.1:5433:5433" # YSQL (PostgreSQL-compatible)
+    volumes:
+      - yb-data:/home/yugabyte/yb_data
+    healthcheck:
+      test: ["CMD-SHELL", "bin/ysqlsh -h yugabyte -c 'SELECT 1' >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    restart: unless-stopped
+
+  ybtop:
+    build:
+      context: .
+      args:
+        EXTRAS: mcp # add ",histogram" for latency analysis
+    image: ybtop:local
+    depends_on:
+      yugabyte:
+        condition: service_healthy
+    environment:
+      # Seed node, the rest of the universe is found via yb_servers()
+      # No YSQL password by default, add one in the DSN or via YBTOP_PASSWORD
+      YBTOP_DSN: postgresql://yugabyte@yugabyte:5433/yugabyte
+      # Optional MCP bearer token
+      YBTOP_MCP_TOKEN: ${YBTOP_MCP_TOKEN:-}
+      TERM: dumb # plain logs, no terminal escape codes
+    command:
+      - watch
+      - --output-dir=/data
+      - --interval=30
+      - --snapshot-latency-histograms
+      - --serve-bind=0.0.0.0 # container side, the host port is on 127.0.0.1
+      - --mcp
+      - --mcp-bind=0.0.0.0
+    ports:
+      - "127.0.0.1:8765:8765" # browser viewer
+      - "127.0.0.1:8766:8766" # MCP (streamable HTTP) at /mcp
+    volumes:
+      - ybtop-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8765/', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  yb-data:
+  ybtop-data:

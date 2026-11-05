@@ -1,6 +1,6 @@
 [project]
 name = "ybtop"
-version = "0.1.13"
+version = "0.1.14"
 description = "Terminal observability for YugabyteDB (pg_stat_statements, ASH, tablet views)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -35,6 +35,13 @@ histogram = [
   "diptest>=0.5",
 ]
 
+# MCP server for --mcp
+mcp = [
+  # MCP SDK 2.x, versions 2.0.0 to 2.3.0 are tested
+  "mcp>=2,<3; python_version >= '3.10'",
+  "uvicorn>=0.30; python_version >= '3.10'",
+]
+
 [project.scripts]
 ybtop = "ybtop.cli:main"
 
@@ -47,3 +54,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 ybtop = ["web/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Test the source tree, not an installed copy
+pythonpath = ["src"]
